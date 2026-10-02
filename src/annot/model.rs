@@ -106,8 +106,19 @@ pub enum Kind {
     Ink { curve: Vec<Pt>, highlighter: bool },
     /// Text box. `origin` is the top-left corner as seen on screen, `right`/`down`
     /// are unit vectors in user space pointing right/down on screen, so text stays
-    /// upright on rotated pages. `style.width` is the font size.
-    Text { origin: Pt, right: Pt, down: Pt, text: String },
+    /// upright on rotated pages. `style.width` is the font size. With a `width`
+    /// (points, inside the padding) lines wrap to it; without, the box fits the text.
+    /// A `height` is the least the box is tall (inside the padding); more text grows it.
+    Text {
+        origin: Pt,
+        right: Pt,
+        down: Pt,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        width: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        height: Option<f32>,
+    },
     Shape { shape: ShapeKind, a: Pt, b: Pt },
     /// Quads as `[upper-left, upper-right, lower-left, lower-right]` (PDF QuadPoints order).
     Markup { markup: MarkupKind, quads: Vec<[Pt; 4]> },

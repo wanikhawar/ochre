@@ -198,16 +198,80 @@ pub const TEXT_PAD: f32 = 2.0;
 /// Baseline offset of the first line below the box top, as a fraction of the font size.
 pub const TEXT_ASCENT: f32 = 0.9;
 
+/// The lines a text box shows, as byte ranges of `text`, each with whether a line
+/// break (`\n`, not included) ends it. With a `width`, lines wrap at spaces (which
+/// stay at the end of their line), and a word longer than the width is split.
+pub fn text_lines(text: &str, size: f32, width: Option<f32>) -> Vec<(std::ops::Range<usize>, bool)> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for (n, para) in text.split('\n').enumerate() {
+        if n > 0 {
+            start += 1;
+        }
+        let end = start + para.len();
+        let hard = end < text.len();
+        let Some(width) = width else {
+            out.push((start..end, hard));
+            start = end;
+            continue;
+        };
+        let fits = |a: usize, b: usize| helv_text_width(text[a..b].trim_end_matches(' '), size) <= width;
+        let (mut line, mut i, mut split) = (start, start, false);
+        while i < end {
+            // The next word and the spaces after it.
+            let rest = &text[i..end];
+            let word = rest.find(' ').unwrap_or(rest.len());
+            let next = i + word + rest[word..].len() - rest[word..].trim_start_matches(' ').len();
+            split = false;
+            if fits(line, i + word) {
+                i = next;
+            } else if line < i {
+                out.push((line..i, false));
+                line = i;
+            } else {
+                // A word too long for a line on its own: as many characters as fit (at least one).
+                let mut cut = i + rest.chars().next().map_or(1, char::len_utf8);
+                for (k, ch) in rest[..word].char_indices().skip(1) {
+                    if !fits(line, i + k + ch.len_utf8()) {
+                        break;
+                    }
+                    cut = i + k + ch.len_utf8();
+                }
+                out.push((line..cut, false));
+                (line, i, split) = (cut, cut, true);
+            }
+        }
+        // A split that ended the paragraph already made its last line.
+        if !split {
+            out.push((line..end, hard));
+        } else if let Some(last) = out.last_mut() {
+            last.1 = hard;
+        }
+        start = end;
+    }
+    out
+}
+
 /// Size `(width, height)` of a text box in points, in its own (screen-aligned) frame.
-pub fn text_box_size(text: &str, size: f32) -> (f32, f32) {
-    let lines: Vec<&str> = text.split('\n').collect();
-    let w = lines.iter().map(|l| helv_text_width(l, size)).fold(0.0, f32::max);
-    (w + 2.0 * TEXT_PAD, lines.len() as f32 * size * TEXT_LINE_HEIGHT + 2.0 * TEXT_PAD)
+pub fn text_box_size(text: &str, size: f32, width: Option<f32>, height: Option<f32>) -> (f32, f32) {
+    let lines = text_lines(text, size, width);
+    let w = width.unwrap_or_else(|| lines.iter().map(|(r, _)| helv_text_width(&text[r.clone()], size)).fold(0.0, f32::max));
+    let h = (lines.len() as f32 * size * TEXT_LINE_HEIGHT).max(height.unwrap_or(0.0));
+    (w + 2.0 * TEXT_PAD, h + 2.0 * TEXT_PAD)
 }
 
 /// The four corners (user space) of a text annotation box.
-pub fn text_corners(origin: Pt, right: Pt, down: Pt, text: &str, size: f32) -> [Pt; 4] {
-    let (w, h) = text_box_size(text, size);
+#[allow(clippy::too_many_arguments)]
+pub fn text_corners(
+    origin: Pt,
+    right: Pt,
+    down: Pt,
+    text: &str,
+    size: f32,
+    width: Option<f32>,
+    height: Option<f32>,
+) -> [Pt; 4] {
+    let (w, h) = text_box_size(text, size, width, height);
     let r = right.scale(w);
     let d = down.scale(h);
     [origin, origin.add(r), origin.add(r).add(d), origin.add(d)]
@@ -244,8 +308,8 @@ pub fn bounds(a: &Annotation) -> [f32; 4] {
         }
         Kind::Shape { shape: ShapeKind::Check | ShapeKind::Cross, .. } => mark_lines(a).concat(),
         Kind::Ink { curve, .. } => curve.clone(),
-        Kind::Text { origin, right, down, text } => {
-            text_corners(*origin, *right, *down, text, a.style.width).to_vec()
+        Kind::Text { origin, right, down, text, width, height } => {
+            text_corners(*origin, *right, *down, text, a.style.width, *width, *height).to_vec()
         }
         Kind::Shape { shape, a: p, b: q } => {
             let mut v = vec![*p, *q];
@@ -280,8 +344,10 @@ pub fn scaled(a: &Annotation, g: &PageGeom, anchor: Pt, sx: f32, sy: f32) -> Ann
         let d = to_d.apply(p);
         to_u.apply(Pt::new(anchor.x + (d.x - anchor.x) * sx, anchor.y + (d.y - anchor.y) * sy))
     });
-    if let Kind::Text { .. } = out.kind {
+    if let Kind::Text { width, height, .. } = &mut out.kind {
         out.style.width = a.style.width * sx;
+        *width = width.map(|w| w * sx);
+        *height = height.map(|h| h * sx);
     }
     out
 }
@@ -304,8 +370,8 @@ pub fn distance(a: &Annotation, p: Pt) -> f32 {
     let half = a.style.width / 2.0;
     match &a.kind {
         Kind::Ink { curve, .. } => (dist_to_polyline(p, &flatten_bezier(curve, 8)) - half).max(0.0),
-        Kind::Text { origin, right, down, text } => {
-            let c = text_corners(*origin, *right, *down, text, a.style.width);
+        Kind::Text { origin, right, down, text, width, height } => {
+            let c = text_corners(*origin, *right, *down, text, a.style.width, *width, *height);
             if point_in_quad(p, &[c[0], c[1], c[3], c[2]]) {
                 0.0
             } else {
@@ -370,6 +436,35 @@ mod tests {
 
     fn close(a: Pt, b: Pt) -> bool {
         a.dist(b) < 1e-3
+    }
+
+    #[test]
+    fn text_wraps_at_spaces_and_splits_long_words() {
+        let shown = |text: &str, width| -> Vec<(String, bool)> {
+            text_lines(text, 10.0, width).into_iter().map(|(r, hard)| (text[r].to_string(), hard)).collect()
+        };
+        let line = |s: &str, hard| (s.to_string(), hard);
+        // Without a width only line breaks split it.
+        assert_eq!(shown("one two\nthree", None), [line("one two", true), line("three", false)]);
+        // "one two" is 35.02 points wide in 10 pt Helvetica; spaces stay at the end of their line.
+        assert_eq!(shown("one two three", Some(36.0)), [line("one two ", false), line("three", false)]);
+        assert_eq!(shown("one two three", Some(30.0)), [line("one ", false), line("two ", false), line("three", false)]);
+        // A word longer than the width is split; at least one letter goes on each line.
+        assert_eq!(shown("abcdefgh", Some(22.0)), [line("abcd", false), line("efgh", false)]);
+        assert_eq!(shown("WW", Some(1.0)), [line("W", false), line("W", false)]);
+        // Empty lines and a trailing break are kept.
+        assert_eq!(shown("a\n\nb\n", Some(50.0)), [line("a", true), line("", true), line("b", true), line("", false)]);
+        // Lines and breaks account for every byte, so the editor's cursor lines up.
+        let text = "Ünïcode wörds wrap\ntoo, even sehrlangewörter";
+        let lines = text_lines(text, 10.0, Some(40.0));
+        let joined: String = lines.iter().map(|(r, hard)| format!("{}{}", &text[r.clone()], if *hard { "\n" } else { "" })).collect();
+        assert_eq!(joined, text);
+        // The box is as wide as set, and as tall as its lines.
+        let (w, h) = text_box_size("one two three", 10.0, Some(30.0), None);
+        assert_eq!((w, h), (30.0 + 2.0 * TEXT_PAD, 3.0 * 10.0 * TEXT_LINE_HEIGHT + 2.0 * TEXT_PAD));
+        // A set height is the least it's tall: more lines still grow it.
+        assert_eq!(text_box_size("one two three", 10.0, Some(30.0), Some(100.0)).1, 100.0 + 2.0 * TEXT_PAD);
+        assert_eq!(text_box_size("one two three", 10.0, Some(30.0), Some(5.0)).1, h);
     }
 
     #[test]

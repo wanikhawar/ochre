@@ -1,6 +1,8 @@
 //! The page canvas: layout, page/overlay textures, live stroke layer and tool
 //! gestures.
 
+use std::sync::Arc;
+
 use eframe::egui::{
     self, Color32, CursorIcon, Event, FontId, Key, Modifiers, Painter, PointerButton, Pos2, Rect,
     Sense, Stroke, StrokeKind, Vec2, pos2, vec2,
@@ -44,8 +46,41 @@ pub struct TextEditState {
     pub right: Pt,
     pub down: Pt,
     pub text: String,
+    /// Wrap width (points), or None to fit the text.
+    pub width: Option<f32>,
     pub style: Style,
     focus: bool,
+    /// Height (points) the box is at least, or None to fit the text.
+    pub height: Option<f32>,
+    /// Screen positions of the size handles (last frame).
+    handles: Vec<(TextGrip, Pos2)>,
+}
+
+/// A size handle of the text box being typed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TextGrip {
+    Right,
+    Bottom,
+    Corner,
+}
+
+impl TextGrip {
+    /// Whether it sets the width, the height.
+    fn sets(self) -> (bool, bool) {
+        match self {
+            TextGrip::Right => (true, false),
+            TextGrip::Bottom => (false, true),
+            TextGrip::Corner => (true, true),
+        }
+    }
+
+    fn cursor(self) -> CursorIcon {
+        match self {
+            TextGrip::Right => CursorIcon::ResizeHorizontal,
+            TextGrip::Bottom => CursorIcon::ResizeVertical,
+            TextGrip::Corner => CursorIcon::ResizeNwSe,
+        }
+    }
 }
 
 /// A note being written for one of our annotations.
@@ -70,6 +105,9 @@ pub enum EditOp {
     ScaleBox { anchor: Pt, corner: Pt, i: usize },
     /// Rotating about `center` (user space); `start` is the pointer's initial angle.
     Rotate { center: Pt, start: f32 },
+    /// Dragging a text box's side (see [`Handle::TextSide`]): sets its width or
+    /// height. `grab` is how far (points, outwards) from that side it was pressed.
+    TextSide { side: usize, grab: f32 },
 }
 
 /// A grab point on the selected annotation.
@@ -80,6 +118,9 @@ enum Handle {
     /// Corner of a rotated box shape's box, in [`geometry::box_corners`] order.
     BoxCorner(usize),
     Endpoint(usize),
+    /// Side of a text box: left (0) or right (1) sets its width, top (2) or
+    /// bottom (3) its height.
+    TextSide(usize),
     /// The round handle above the selection that rotates it.
     Rotate,
 }
@@ -113,6 +154,11 @@ pub enum Gesture {
     /// Dragging out a text selection with the Select tool. `click` is what a plain
     /// click (no drag) selects instead, e.g. another app's highlight over the text.
     SelectText { click: Option<Selection> },
+    /// Dragging out a new text box's width with the Text tool (user space).
+    TextBox { page: usize, start: Pt, end: Pt, style: Style },
+    /// Dragging a size handle of the text box being typed; `grab` is how far
+    /// (points, right and down) from the box's edges it was pressed.
+    TextResize { grip: TextGrip, grab: Pt },
 }
 
 /// Selected page text: an inclusive range of pdfium character indices.
@@ -389,6 +435,60 @@ fn shape_box(g: &PageGeom, shape: ShapeKind, a: Pt, b: Pt, style: &Style, zoom: 
     (to_u.apply(min), to_u.apply(max))
 }
 
+/// The narrowest a text box's wrap width goes (points): about one letter, and
+/// enough to grab on screen.
+fn min_text_width(size: f32, zoom: f32) -> f32 {
+    size.max(12.0 / zoom)
+}
+
+/// The least height (points) a text box can be set to: one line.
+fn min_text_height(size: f32) -> f32 {
+    size * TEXT_LINE_HEIGHT
+}
+
+/// Which way side `side` of a text box faces (see [`Handle::TextSide`]), and
+/// whether it's the far side (right or bottom).
+fn text_side_axis(right: Pt, down: Pt, side: usize) -> (Pt, bool) {
+    match side {
+        0 => (right.scale(-1.0), false),
+        1 => (right, true),
+        2 => (down.scale(-1.0), false),
+        _ => (down, true),
+    }
+}
+
+/// How far (points) user-space point `u` is out from side `side` of text box `a`.
+fn past_text_side(a: &Annotation, side: usize, u: Pt) -> f32 {
+    let Kind::Text { origin, right, down, text, width, height } = &a.kind else { return 0.0 };
+    let (w, h) = geometry::text_box_size(text, a.style.width, *width, *height);
+    let (axis, far) = text_side_axis(*right, *down, side);
+    let along = u.sub(*origin).dot(axis);
+    if far { along - if side == 1 { w } else { h } } else { along }
+}
+
+/// Text box `before` with side `side` dragged to user-space point `u` (pressed
+/// `grab` points out from it). The opposite side stays put.
+fn text_with_side(before: &Annotation, side: usize, u: Pt, grab: f32, zoom: f32) -> Annotation {
+    let mut out = before.clone();
+    let size = before.style.width;
+    let Kind::Text { origin, right, down, text, width, height } = &mut out.kind else { return out };
+    let (w0, h0) = geometry::text_box_size(text, size, *width, *height);
+    let out_by = past_text_side(before, side, u) - grab;
+    if side < 2 {
+        *width = Some((w0 + out_by - 2.0 * TEXT_PAD).max(min_text_width(size, zoom)));
+    } else {
+        *height = Some((h0 + out_by - 2.0 * TEXT_PAD).max(min_text_height(size)));
+    }
+    // Moving the left or top side moves the box by what it actually grew.
+    let (w1, h1) = geometry::text_box_size(text, size, *width, *height);
+    match side {
+        0 => *origin = origin.sub(right.scale(w1 - w0)),
+        2 => *origin = origin.sub(down.scale(h1 - h0)),
+        _ => {}
+    }
+    out
+}
+
 /// `before` changed by a drag of `op` to user-space point `u`. Shift keeps a
 /// resized annotation's proportions and snaps a line's end to 45°.
 fn edit_annotation(before: &Annotation, g: &PageGeom, op: EditOp, u: Pt, shift: bool, zoom: f32) -> Annotation {
@@ -447,6 +547,7 @@ fn edit_annotation(before: &Annotation, g: &PageGeom, op: EditOp, u: Pt, shift: 
             }
             out
         }
+        EditOp::TextSide { side, grab } => text_with_side(before, side, u, grab, zoom),
         EditOp::Scale { anchor, corner, start } => {
             let d = g.to_display().apply(u);
             let target = corner.add(d.sub(start));
@@ -971,8 +1072,8 @@ impl App {
                 continue;
             }
             let a = self.edited(&a.id).unwrap_or(a);
-            if let Kind::Text { origin, right, down, text } = &a.kind {
-                draw_text(painter, &aff, self.view.zoom, *origin, *right, *down, text, &a.style);
+            if let Kind::Text { origin, right, down, text, width, .. } = &a.kind {
+                draw_text(painter, &aff, self.view.zoom, *origin, *right, *down, text, *width, &a.style);
             }
         }
     }
@@ -1062,6 +1163,16 @@ impl App {
                 .map(|(i, c)| (Handle::Corner(i), c))
                 .collect(),
         };
+        if let Kind::Text { origin, right, down, text, width, height } = &a.kind {
+            // Middle of each side, on the selection outline (4 px out).
+            let c = geometry::text_corners(*origin, *right, *down, text, a.style.width, *width, *height);
+            let sides = [(c[0], c[3]), (c[1], c[2]), (c[0], c[1]), (c[3], c[2])];
+            for (side, (p, q)) in sides.into_iter().enumerate() {
+                let (axis, _) = text_side_axis(*right, *down, side);
+                let out = aff.apply_vec(axis).normalized().scale(4.0);
+                handles.push((Handle::TextSide(side), pos(aff.apply(p.lerp(q, 0.5)).add(out))));
+            }
+        }
         handles.push((Handle::Rotate, pos2(outlined.center().x, outlined.top() - ROTATE_HANDLE_GAP)));
         handles
     }
@@ -1085,6 +1196,9 @@ impl App {
         let Some(g) = self.doc.as_ref().and_then(|d| d.pages.get(a.page)).copied() else { return };
         let op = match h {
             Handle::Endpoint(i) => EditOp::Endpoint(i),
+            Handle::TextSide(side) => {
+                EditOp::TextSide { side, grab: past_text_side(&a, side, self.view.to_user(&g, a.page, p)) }
+            }
             Handle::Rotate => {
                 let center = a.center();
                 let d = self.view.to_user(&g, a.page, p).sub(center);
@@ -1139,6 +1253,7 @@ impl App {
                         Handle::Endpoint(_) => {
                             painter.circle(c, HANDLE_SIZE / 2.0 + 0.5, Color32::WHITE, handle_stroke);
                         }
+                        Handle::TextSide(side) => paint_side_handle(painter, c, side < 2, handle_stroke),
                     }
                 }
                 self.view.annot_rect = Some(area);
@@ -1240,6 +1355,14 @@ impl App {
     /// exactly like the final result.
     fn paint_live(&mut self, painter: &Painter, ctx: &egui::Context, ppp: f32) {
         let Some(doc) = &self.doc else { return };
+        if let Gesture::TextBox { page, start, end, style } = &self.gesture {
+            // The new box's width, one line tall.
+            let aff = self.view.to_screen(&doc.pages[*page], *page);
+            let (a, b) = (pos(aff.apply(*start)), pos(aff.apply(*end)));
+            let h = style.width * TEXT_LINE_HEIGHT * self.view.zoom + 2.0 * TEXT_PAD * self.view.zoom;
+            let r = Rect::from_min_size(pos2(a.x.min(b.x), a.y.min(b.y)), vec2((b.x - a.x).abs(), (b.y - a.y).abs().max(h)));
+            painter.rect_stroke(r, 2.0, Stroke::new(1.0, crate::ui::theme::ACCENT), StrokeKind::Outside);
+        }
         let live: Option<Annotation> = match &self.gesture {
             Gesture::Ink { page, raw, highlighter, style, .. } if !raw.is_empty() => Some(Annotation {
                 id: String::new(),
@@ -1370,6 +1493,13 @@ impl App {
                 (Gesture::Edit { op: EditOp::Endpoint(_), .. }, _) => CursorIcon::Crosshair,
                 (Gesture::Edit { op: EditOp::Rotate { .. }, .. }, _) => CursorIcon::Grabbing,
                 (Gesture::Edit { op: EditOp::ScaleBox { .. }, .. }, _) => CursorIcon::Move,
+                (Gesture::Edit { op: EditOp::TextSide { side: 0 | 1, .. }, .. }, _) => CursorIcon::ResizeHorizontal,
+                (Gesture::Edit { op: EditOp::TextSide { .. }, .. }, _) => CursorIcon::ResizeVertical,
+                (Gesture::TextResize { grip, .. }, _) => grip.cursor(),
+                _ if resp.hover_pos().and_then(|p| self.text_grip_at(p)).is_some() => {
+                    resp.hover_pos().and_then(|p| self.text_grip_at(p)).map_or(CursorIcon::Default, |g| g.cursor())
+                }
+                (Gesture::TextBox { .. }, _) => CursorIcon::Text,
                 (Gesture::Edit { op: EditOp::Scale { anchor, corner, .. }, .. }, _) => {
                     // Same diagonal as when the drag started (screen and display axes agree).
                     if (corner.x - anchor.x) * (corner.y - anchor.y) > 0.0 {
@@ -1393,6 +1523,8 @@ impl App {
                         Some(Handle::Corner(0 | 3)) => CursorIcon::ResizeNwSe,
                         Some(Handle::Corner(_)) => CursorIcon::ResizeNeSw,
                         Some(Handle::BoxCorner(_)) => CursorIcon::Move,
+                        Some(Handle::TextSide(0 | 1)) => CursorIcon::ResizeHorizontal,
+                        Some(Handle::TextSide(_)) => CursorIcon::ResizeVertical,
                         Some(Handle::Rotate) => CursorIcon::Grab,
                         _ => CursorIcon::Crosshair,
                     },
@@ -1612,6 +1744,16 @@ impl App {
         let now = ui.input(|i| i.time);
         let double = self.view.last_press.is_some_and(|(t, at)| now - t < 0.4 && at.distance(p) < 6.0);
         self.view.last_press = if double { None } else { Some((now, p)) };
+        if let Some(grip) = self.text_grip_at(p)
+            && let Some(e) = &self.editing
+            && let Some(doc) = &self.doc
+        {
+            let u = self.view.to_user(&doc.pages[e.page], e.page, p);
+            let (w, h) = geometry::text_box_size(&e.text, e.style.width, e.width, e.height);
+            let d = u.sub(e.origin);
+            self.gesture = Gesture::TextResize { grip, grab: Pt::new(d.dot(e.right) - w, d.dot(e.down) - h) };
+            return;
+        }
         let was_editing = self.editing.is_some();
         self.commit_edits();
         // A note badge opens (ours) or selects (other apps') the annotation's note.
@@ -1687,24 +1829,8 @@ impl App {
                     Some(Selection::Ours(id)) if matches!(doc.get(&id).map(|a| &a.kind), Some(Kind::Text { .. })) => {
                         self.edit_text(&id);
                     }
-                    _ => {
-                        let inv = g.to_user();
-                        let size = style.width;
-                        // Put the click roughly at the middle of the first line.
-                        let origin = u
-                            .sub(inv.apply_vec(Pt::new(0.0, 1.0)).scale(TEXT_PAD + size * TEXT_LINE_HEIGHT / 2.0))
-                            .sub(inv.apply_vec(Pt::new(1.0, 0.0)).scale(TEXT_PAD));
-                        self.editing = Some(TextEditState {
-                            id: None,
-                            page,
-                            origin,
-                            right: inv.apply_vec(Pt::new(1.0, 0.0)),
-                            down: inv.apply_vec(Pt::new(0.0, 1.0)),
-                            text: String::new(),
-                            style,
-                            focus: true,
-                        });
-                    }
+                    // A click starts a box that fits its text; a drag sets its width.
+                    _ => self.gesture = Gesture::TextBox { page, start: u, end: u, style },
                 }
             }
             Tool::Eraser => {
@@ -1848,6 +1974,20 @@ impl App {
             }
             Gesture::Erase { .. } => self.erase_at(p),
             Gesture::Link { .. } => {}
+            Gesture::TextBox { page, end, .. } => *end = self.view.to_user(&doc.pages[*page], *page, p),
+            Gesture::TextResize { grip, grab } => {
+                if let Some(e) = &mut self.editing {
+                    let u = self.view.to_user(&doc.pages[e.page], e.page, p);
+                    let d = u.sub(e.origin);
+                    let (sets_w, sets_h) = grip.sets();
+                    if sets_w {
+                        e.width = Some((d.dot(e.right) - grab.x - 2.0 * TEXT_PAD).max(min_text_width(e.style.width, zoom)));
+                    }
+                    if sets_h {
+                        e.height = Some((d.dot(e.down) - grab.y - 2.0 * TEXT_PAD).max(min_text_height(e.style.width)));
+                    }
+                }
+            }
             Gesture::Edit { before, current, op } => {
                 let Some(first) = before.first() else { return };
                 let g = doc.pages[first.page];
@@ -1939,6 +2079,12 @@ impl App {
                 }
             }
             Gesture::Link { target, .. } => self.follow(ctx, &target),
+            Gesture::TextBox { page, start, end, style } => self.start_text_box(page, start, end, style),
+            Gesture::TextResize { .. } => {
+                if let Some(e) = &mut self.editing {
+                    e.focus = true;
+                }
+            }
             Gesture::Pan { .. } | Gesture::None => {}
         }
     }
@@ -1965,7 +2111,7 @@ impl App {
 
     pub fn edit_text(&mut self, id: &str) {
         let Some(a) = self.doc.as_ref().and_then(|d| d.get(id)) else { return };
-        if let Kind::Text { origin, right, down, text } = &a.kind {
+        if let Kind::Text { origin, right, down, text, width, height } = &a.kind {
             self.editing = Some(TextEditState {
                 id: Some(a.id.clone()),
                 page: a.page,
@@ -1973,11 +2119,57 @@ impl App {
                 right: *right,
                 down: *down,
                 text: text.clone(),
+                width: *width,
+                height: *height,
                 style: a.style,
                 focus: true,
+                handles: Vec::new(),
             });
             self.selection = Some(Selection::Ours(a.id.clone()));
         }
+    }
+
+    /// The size handle of the text box being typed under screen point `p`.
+    fn text_grip_at(&self, p: Pos2) -> Option<TextGrip> {
+        let e = self.editing.as_ref()?;
+        e.handles
+            .iter()
+            .filter(|(_, c)| c.distance(p) <= HANDLE_SIZE)
+            .min_by(|a, b| a.1.distance(p).total_cmp(&b.1.distance(p)))
+            .map(|(g, _)| *g)
+    }
+
+    /// Opens the editor for a new text box dragged from `start` to `end` (user
+    /// space). A click (no real drag) makes a box that fits its text, with the click
+    /// in the middle of its first line; a drag sets its size.
+    fn start_text_box(&mut self, page: usize, start: Pt, end: Pt, style: Style) {
+        let Some(g) = self.doc.as_ref().and_then(|d| d.pages.get(page)).copied() else { return };
+        let zoom = self.view.zoom;
+        let (to_d, inv) = (g.to_display(), g.to_user());
+        let (ds, de) = (to_d.apply(start), to_d.apply(end));
+        let size = style.width;
+        let dragged = |a: f32, b: f32| (b - a).abs() * zoom >= 8.0;
+        let (origin, width, height) = if !dragged(ds.x, de.x) && !dragged(ds.y, de.y) {
+            let origin = Pt::new(ds.x - TEXT_PAD, ds.y - TEXT_PAD - size * TEXT_LINE_HEIGHT / 2.0);
+            (origin, None, None)
+        } else {
+            let width = ((de.x - ds.x).abs() - 2.0 * TEXT_PAD).max(min_text_width(size, zoom));
+            let height = dragged(ds.y, de.y).then(|| ((de.y - ds.y).abs() - 2.0 * TEXT_PAD).max(min_text_height(size)));
+            (Pt::new(ds.x.min(de.x), ds.y.min(de.y)), Some(width), height)
+        };
+        self.editing = Some(TextEditState {
+            id: None,
+            page,
+            origin: inv.apply(origin),
+            right: inv.apply_vec(Pt::new(1.0, 0.0)),
+            down: inv.apply_vec(Pt::new(0.0, 1.0)),
+            text: String::new(),
+            width,
+            height,
+            style,
+            focus: true,
+            handles: Vec::new(),
+        });
     }
 
     /// Finishes any text box or note being typed.
@@ -2011,7 +2203,8 @@ impl App {
         let Some(e) = self.editing.take() else { return };
         let Some(doc) = &self.doc else { return };
         let text = e.text.trim_end().to_string();
-        let kind = Kind::Text { origin: e.origin, right: e.right, down: e.down, text: text.clone() };
+        let kind =
+            Kind::Text { origin: e.origin, right: e.right, down: e.down, text: text.clone(), width: e.width, height: e.height };
         let cmd = match &e.id {
             Some(id) => {
                 let Some(index) = doc.index_of(id) else { return };
@@ -2040,15 +2233,29 @@ impl App {
         }
         let aff = self.view.to_screen(&doc.pages[e.page], e.page);
         let top_left = aff.apply(e.origin.add(e.right.scale(TEXT_PAD)).add(e.down.scale(TEXT_PAD)));
-        let size = e.style.width * zoom;
-        let longest = e.text.split('\n').map(|l| geometry::helv_text_width(l, e.style.width)).fold(0.0, f32::max);
-        let width = (longest * zoom + size).max(size * 4.0);
-        let font = FontId::new(size, egui::FontFamily::Name("annot".into()));
+        let size = e.style.width;
+        // A box that fits its text keeps room for the next letter.
+        let inner = match e.width {
+            Some(w) => w * zoom,
+            None => {
+                let (outer, _) = geometry::text_box_size(&e.text, size, None, None);
+                ((outer - 2.0 * TEXT_PAD + size) * zoom).max(size * 4.0 * zoom)
+            }
+        };
+        let font = FontId::new(size * zoom, egui::FontFamily::Name("annot".into()));
+        let (col, wrap) = (color(&e.style), e.width);
+        // Laid out exactly as it's drawn once done (and saved).
+        let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, _wrap_width: f32| {
+            text_galley(ui.painter(), buf.as_str(), &font, col, size, zoom, wrap)
+        };
         let mut escape = false;
         let area = egui::Area::new(egui::Id::new("text-annot-editor"))
             .fixed_pos(pos(top_left))
             .order(egui::Order::Foreground)
             .show(ui.ctx(), |ui| {
+                // The area would otherwise keep last frame's size, wrapping text that
+                // just made the box wider.
+                ui.set_max_width(inner);
                 let id = egui::Id::new("text-annot-edit");
                 if e.focus {
                     // Before adding the widget, so keys typed this frame already go into it.
@@ -2058,12 +2265,13 @@ impl App {
                 }
                 let edit = egui::TextEdit::multiline(&mut e.text)
                     .id(id)
-                    .font(font)
-                    .text_color(color(&e.style))
+                    .layouter(&mut layouter)
                     .frame(egui::Frame::NONE)
                     .margin(egui::Margin::ZERO)
-                    .desired_width(width)
-                    .desired_rows(1);
+                    .desired_width(inner)
+                    .desired_rows(1)
+                    // Clicks anywhere in a taller box place the cursor.
+                    .min_size(vec2(inner, e.height.unwrap_or(0.0) * zoom));
                 let r = ui.add(edit);
                 if r.has_focus() && !ui.input(|i| i.pointer.any_down() || i.pointer.any_released()) {
                     e.focus = false;
@@ -2079,44 +2287,97 @@ impl App {
                 r.rect
             });
         let box_rect = area.inner.expand(TEXT_PAD * zoom);
-        ui.painter().rect_stroke(
-            box_rect,
-            2.0,
-            Stroke::new(1.0, ui.visuals().selection.stroke.color),
-            StrokeKind::Outside,
-        );
+        let stroke = Stroke::new(1.0, ui.visuals().selection.stroke.color);
+        ui.painter().rect_stroke(box_rect, 2.0, stroke, StrokeKind::Outside);
+        // The right side sets the width (the text wraps to it), the bottom the
+        // height, and the corner both.
+        let accent = Stroke::new(1.25, crate::ui::theme::ACCENT);
+        e.handles = vec![
+            (TextGrip::Right, box_rect.right_center()),
+            (TextGrip::Bottom, box_rect.center_bottom()),
+            (TextGrip::Corner, box_rect.right_bottom()),
+        ];
+        let painter = ui.painter();
+        paint_side_handle(painter, box_rect.right_center(), true, accent);
+        paint_side_handle(painter, box_rect.center_bottom(), false, accent);
+        let corner = Rect::from_center_size(box_rect.right_bottom(), Vec2::splat(HANDLE_SIZE));
+        painter.rect_filled(corner, 1.5, Color32::WHITE);
+        painter.rect_stroke(corner, 1.5, accent, StrokeKind::Middle);
         if escape {
             self.commit_edits();
         }
     }
 }
 
+/// The pill-shaped handle on a text box's side that sets its width (on a
+/// `vertical` side) or height.
+fn paint_side_handle(painter: &Painter, c: Pos2, vertical: bool, stroke: Stroke) {
+    let (thin, long) = (HANDLE_SIZE * 0.6, HANDLE_SIZE * 1.6);
+    let r = Rect::from_center_size(c, if vertical { vec2(thin, long) } else { vec2(long, thin) });
+    painter.rect_filled(r, 2.5, Color32::WHITE);
+    painter.rect_stroke(r, 2.5, stroke, StrokeKind::Middle);
+}
+
+/// `text` laid out in the lines [`geometry::text_lines`] gives, spaced and placed
+/// as the saved PDF has them (at `zoom`, top-left at the box's padding). The editor
+/// and the finished text box both use it, so typing shows the result.
+fn text_galley(
+    painter: &Painter,
+    text: &str,
+    font: &FontId,
+    col: Color32,
+    size: f32,
+    zoom: f32,
+    width: Option<f32>,
+) -> Arc<egui::Galley> {
+    let lines = geometry::text_lines(text, size, width);
+    let galleys: Vec<Arc<egui::Galley>> =
+        lines.iter().map(|(r, _)| painter.layout_no_wrap(text[r.clone()].to_owned(), font.clone(), col)).collect();
+    let ascent = galleys
+        .iter()
+        .find_map(|g| g.rows.first()?.glyphs.first().map(|gl| gl.font_ascent))
+        .unwrap_or(size * zoom * TEXT_ASCENT);
+    let job = Arc::new(egui::text::LayoutJob::simple(text.to_owned(), font.clone(), col, f32::INFINITY));
+    let mut galley = egui::Galley::concat(job, &galleys, painter.pixels_per_point());
+    // One row per line: breaks we made aren't newlines in the text, and rows sit at
+    // the PDF's line spacing with the first baseline where the PDF puts it.
+    let line_h = size * TEXT_LINE_HEIGHT * zoom;
+    let mut w = 0.0f32;
+    for (i, (row, (_, hard))) in galley.rows.iter_mut().zip(&lines).enumerate() {
+        row.ends_with_newline = *hard;
+        row.pos.y = i as f32 * line_h + size * zoom * TEXT_ASCENT - ascent;
+        w = w.max(row.size.x);
+    }
+    // A wrapped line's trailing space doesn't widen the box.
+    let w = width.map_or(w, |width| width * zoom);
+    galley.rect = Rect::from_min_size(Pos2::ZERO, vec2(w, lines.len() as f32 * line_h));
+    galley.mesh_bounds = galley.rect.expand(line_h);
+    Arc::new(galley)
+}
+
 #[allow(clippy::too_many_arguments)]
-fn draw_text(painter: &Painter, aff: &Affine, zoom: f32, origin: Pt, right: Pt, down: Pt, text: &str, style: &Style) {
+fn draw_text(
+    painter: &Painter,
+    aff: &Affine,
+    zoom: f32,
+    origin: Pt,
+    right: Pt,
+    down: Pt,
+    text: &str,
+    width: Option<f32>,
+    style: &Style,
+) {
     let size = style.width;
     let font = FontId::new(size * zoom, egui::FontFamily::Name("annot".into()));
-    // Direction of the text on screen (a rotated text box is drawn at an angle).
-    let screen_right = aff.apply_vec(right).normalized();
-    let screen_down = Pt::new(-screen_right.y, screen_right.x);
+    let galley = text_galley(painter, text, &font, color(style), size, zoom, width);
+    let top_left = aff.apply(origin.add(right.scale(TEXT_PAD)).add(down.scale(TEXT_PAD)));
+    // A rotated text box is drawn at an angle.
+    let screen_right = aff.apply_vec(right);
     let angle = screen_right.y.atan2(screen_right.x);
-    for (i, line) in text.split('\n').enumerate() {
-        let base = origin
-            .add(right.scale(TEXT_PAD))
-            .add(down.scale(TEXT_PAD + TEXT_ASCENT * size + i as f32 * TEXT_LINE_HEIGHT * size));
-        let base = aff.apply(base);
-        let galley = painter.layout_no_wrap(line.to_owned(), font.clone(), color(style));
-        let ascent = galley
-            .rows
-            .first()
-            .and_then(|r| r.glyphs.first())
-            .map(|g| g.font_ascent)
-            .unwrap_or(size * zoom * TEXT_ASCENT);
-        let top_left = base.sub(screen_down.scale(ascent));
-        if angle.abs() < 1e-4 {
-            painter.galley(pos(top_left), galley, color(style));
-        } else {
-            painter.add(egui::epaint::TextShape::new(pos(top_left), galley, color(style)).with_angle(angle));
-        }
+    if angle.abs() < 1e-4 {
+        painter.galley(pos(top_left), galley, color(style));
+    } else {
+        painter.add(egui::epaint::TextShape::new(pos(top_left), galley, color(style)).with_angle(angle));
     }
 }
 
@@ -2354,6 +2615,160 @@ mod tests {
         assert_eq!(kept.page, 4);
         assert!((kx - x0 - 24.0).abs() < 1e-3 && (ky - y0 + 24.0).abs() < 1e-3, "{:?}", geometry::bounds(&kept));
         assert!(on_screen(&h, &kept));
+    }
+
+    #[test]
+    fn text_box_width_wraps_and_resizes() {
+        let dir = std::env::temp_dir().join(format!("ochre-textwidth-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("text.pdf");
+        reading_pdf(&path);
+        let ctx = egui::Context::default();
+        let app = App::new(&ctx, Some(path.clone()));
+        if app.worker.is_none() {
+            eprintln!("pdfium not available, skipping: {:?}", app.worker_error);
+            return;
+        }
+        let mut h = Harness { ctx, app, t: 0.0, mods: Modifiers::NONE, size: vec2(1000.0, 900.0) };
+        h.wait_until("pages", |a| a.doc.as_ref().is_some_and(|d| !d.pages.is_empty()));
+        h.frame(vec![]);
+        let zoom = h.app.view.zoom;
+        let text_of = |h: &Harness| h.doc().annots.iter().rev().find(|a| matches!(a.kind, Kind::Text { .. })).cloned().unwrap();
+        let width_of = |a: &Annotation| match a.kind {
+            Kind::Text { width, .. } => width,
+            _ => panic!(),
+        };
+        let height_of = |a: &Annotation| match a.kind {
+            Kind::Text { height, .. } => height,
+            _ => panic!(),
+        };
+        let grip = |h: &Harness, which| h.app.editing.as_ref().unwrap().handles.iter().find(|x| x.0 == which).unwrap().1;
+        // The editor shows as many lines as the finished box: its height is theirs.
+        let editor_lines = |h: &Harness| {
+            let e = h.app.editing.as_ref().unwrap();
+            let r = h.ctx.memory(|m| m.area_rect(egui::Id::new("text-annot-editor"))).unwrap();
+            let lines = geometry::text_lines(&e.text, e.style.width, e.width).len();
+            let line_h = e.style.width * TEXT_LINE_HEIGHT * zoom;
+            ((r.height() / line_h).round() as usize, lines)
+        };
+
+        // A click makes a box that fits its text.
+        h.app.set_tool(Tool::Text);
+        h.click(h.at(100.0, 700.0));
+        assert_eq!(h.app.editing.as_ref().unwrap().width, None);
+        h.frame(vec![]);
+        let long = "The quick brown fox jumps over the lazy dog";
+        h.frame(vec![Event::Text(long.into())]);
+        h.frame(vec![]);
+        assert_eq!(editor_lines(&h), (1, 1), "one line while typing, as when done");
+        h.click(h.at(450.0, 420.0));
+        assert_eq!(width_of(&text_of(&h)), None);
+
+        // Dragging sets the width (and a height, if dragged down too); long text
+        // wraps the same while typing and after.
+        h.drag(&[h.at(100.0, 600.0), h.at(150.0, 600.0), h.at(220.0, 600.0)]);
+        let e = h.app.editing.as_ref().unwrap();
+        assert!((e.width.unwrap() - (120.0 - 2.0 * TEXT_PAD)).abs() < 1.0, "{:?}", e.width);
+        assert_eq!(e.height, None);
+        h.frame(vec![]);
+        h.frame(vec![Event::Text(long.into())]);
+        h.frame(vec![]);
+        let (shown, lines) = editor_lines(&h);
+        assert!(lines > 1);
+        assert_eq!(shown, lines);
+        // Its width handle makes it wider while typing.
+        let r = grip(&h, TextGrip::Right);
+        h.drag(&[r, r + vec2(40.0, 0.0), r + vec2(80.0, 0.0)]);
+        let e = h.app.editing.as_ref().expect("still typing");
+        assert!((e.width.unwrap() - (116.0 + 80.0 / zoom)).abs() < 1.0, "{:?}", e.width);
+        h.frame(vec![]);
+        let (shown, wider) = editor_lines(&h);
+        assert!(wider < lines);
+        assert_eq!(shown, wider);
+        h.frame(vec![Event::Text("!".into())]);
+        assert!(h.app.editing.as_ref().unwrap().text.ends_with("dog!"), "typing goes on after resizing");
+        // The bottom handle makes it taller than its text (the editor too), and the
+        // corner sets both.
+        let size = h.app.editing.as_ref().unwrap().style.width;
+        let text_h = wider as f32 * size * TEXT_LINE_HEIGHT;
+        let b = grip(&h, TextGrip::Bottom);
+        h.drag(&[b, b + vec2(0.0, 30.0), b + vec2(0.0, 60.0)]);
+        let e = h.app.editing.as_ref().unwrap();
+        assert!((e.height.unwrap() - (text_h + 60.0 / zoom)).abs() < 1.0, "{:?}", e.height);
+        let w_before = e.width.unwrap();
+        h.frame(vec![]);
+        let shown = h.ctx.memory(|m| m.area_rect(egui::Id::new("text-annot-editor"))).unwrap();
+        assert!((shown.height() - (text_h * zoom + 60.0)).abs() < 2.0, "editor is as tall: {shown:?}");
+        let c = grip(&h, TextGrip::Corner);
+        h.drag(&[c, c + vec2(-5.0, -5.0), c + vec2(-10.0, -10.0)]);
+        let e = h.app.editing.as_ref().unwrap();
+        assert!((e.width.unwrap() - (w_before - 10.0 / zoom)).abs() < 1.0);
+        assert!((e.height.unwrap() - (text_h + 50.0 / zoom)).abs() < 1.0);
+        let set_h = e.height.unwrap();
+        h.click(h.at(450.0, 420.0));
+        let boxed = text_of(&h);
+        assert!((width_of(&boxed).unwrap() - (116.0 + 70.0 / zoom)).abs() < 1.0);
+        assert_eq!(height_of(&boxed), Some(set_h));
+        let [_, y0, _, y1] = geometry::bounds(&boxed);
+        assert!((y1 - y0 - (set_h + 2.0 * TEXT_PAD)).abs() < 0.5, "as tall as set");
+
+        // Selected, its sides set the width: the right one keeps the left edge, and
+        // the left one the right edge.
+        h.app.set_tool(Tool::Select);
+        h.app.select(Some(Selection::Ours(boxed.id.clone())));
+        h.frame(vec![]);
+        let side = |h: &Harness, i| h.app.handles(&text_of(h)).into_iter().find(|x| x.0 == Handle::TextSide(i)).unwrap().1;
+        let w0 = width_of(&boxed).unwrap();
+        let r = side(&h, 1);
+        h.drag(&[r, r - vec2(20.0, 0.0), r - vec2(40.0, 0.0)]);
+        let narrower = text_of(&h);
+        assert!((width_of(&narrower).unwrap() - (w0 - 40.0 / zoom)).abs() < 0.5);
+        assert_eq!(geometry::bounds(&narrower)[0], geometry::bounds(&boxed)[0]);
+        let l = side(&h, 0);
+        h.drag(&[l, l + vec2(10.0, 0.0), l + vec2(20.0, 0.0)]);
+        let moved = text_of(&h);
+        assert!((width_of(&moved).unwrap() - (w0 - 60.0 / zoom)).abs() < 0.5);
+        assert!((geometry::bounds(&moved)[2] - geometry::bounds(&narrower)[2]).abs() < 0.01, "right edge stays");
+        // The bottom sets the height and keeps the top; the top keeps the bottom.
+        let b = side(&h, 3);
+        h.drag(&[b, b + vec2(0.0, 10.0), b + vec2(0.0, 20.0)]);
+        let taller = text_of(&h);
+        assert!((height_of(&taller).unwrap() - (set_h + 20.0 / zoom)).abs() < 0.5);
+        assert!((geometry::bounds(&taller)[3] - geometry::bounds(&moved)[3]).abs() < 0.01, "top stays");
+        let t = side(&h, 2);
+        h.drag(&[t, t + vec2(0.0, 10.0), t + vec2(0.0, 20.0)]);
+        let lowered = text_of(&h);
+        assert!((height_of(&lowered).unwrap() - set_h).abs() < 0.5);
+        assert!((geometry::bounds(&lowered)[1] - geometry::bounds(&taller)[1]).abs() < 0.01, "bottom stays");
+        // Never shorter than its text: the top stops there, and the text stays put.
+        let t = side(&h, 2);
+        h.drag(&[t, t + vec2(0.0, 200.0), t + vec2(0.0, 400.0)]);
+        let least = text_of(&h);
+        assert!((geometry::bounds(&least)[3] - geometry::bounds(&lowered)[3]).abs() > 1.0);
+        let [_, y0, _, y1] = geometry::bounds(&least);
+        let Kind::Text { text, width, .. } = &least.kind else { panic!() };
+        let fits = geometry::text_box_size(text, size, *width, None).1;
+        assert!((y1 - y0 - fits).abs() < 0.5, "{} vs {fits}", y1 - y0);
+        // Each resize is one undo step.
+        for _ in 0..5 {
+            h.key(Key::Z, Modifiers::COMMAND);
+        }
+        assert_eq!(text_of(&h), boxed);
+
+        // The saved file has the same lines, and reopens with the width.
+        h.app.doc.as_mut().unwrap().save_to(&path).unwrap();
+        let reopened = Doc::open(&path).unwrap();
+        let again = reopened.annots.iter().find(|a| a.id == boxed.id).unwrap();
+        assert_eq!((width_of(again), height_of(again)), (width_of(&boxed), height_of(&boxed)));
+        let d = lopdf::Document::load(&path).unwrap();
+        let shows = d
+            .objects
+            .values()
+            .filter_map(|o| o.as_stream().ok())
+            .map(|st| String::from_utf8_lossy(&st.decompressed_content().unwrap_or_else(|_| st.content.clone())).matches(" Tj").count())
+            .max()
+            .unwrap();
+        assert_eq!(shows, wider, "one text line per shown line");
     }
 
     #[test]

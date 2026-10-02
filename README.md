@@ -17,9 +17,10 @@ A fast, lightweight PDF reader and annotator for Linux, written in Rust (egui + 
   - Shapes: tick, cross, rectangle, ellipse, line and arrow.
   - A tick or cross is placed with a single click.
   - Rectangles and ellipses can be filled, with a separate fill opacity.
+  - A text box fits its text when you click to place it. Drag instead to set its size: lines wrap to the width, and the box grows taller if the text needs more room. While typing, drag the handles on its right side, bottom or corner to change the size.
 - **Tool settings** in a popup from the status bar's settings button: palette, custom color picker with hex input, and width, size and opacity that you can drag or type.
 - **Select**, move, resize, restyle and delete annotations, plus an eraser and undo/redo.
-  - Drag a corner handle to resize (Shift keeps the proportions). Resizing a text box changes its font size.
+  - Drag a corner handle to resize (Shift keeps the proportions). Resizing a text box by a corner changes its font size; its side handles change its width and height.
   - Drag either end of a line or arrow.
   - Rotate with the round handle above the selection (Shift snaps to 15°). Text markup follows the page text, so it doesn't rotate.
   - Select several at once: drag a box from empty space (Shift+drag adds to the selection, and also works over text), Shift+click to add or remove one, or Ctrl+A for everything on the page. A group moves, restyles (color, width, opacity, fill) and deletes together.

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::annot::geometry::{
     TEXT_ASCENT, TEXT_LINE_HEIGHT, TEXT_PAD, arrow_head, bounds, box_corners, flatten_bezier, mark_lines,
-    mark_strokes,
+    mark_strokes, text_lines,
 };
 use crate::annot::model::{Annotation, Kind, MarkupKind, Pt, ShapeKind};
 use crate::annot::raster::{markup_line, markup_thickness};
@@ -409,7 +409,7 @@ pub fn add_annotation(doc: &mut Document, a: &Annotation, page: ObjectId) -> Obj
                 ops.push_str("S\n");
             }
         }
-        Kind::Text { origin, right, down, text } => {
+        Kind::Text { origin, right, down, text, width, .. } => {
             font = true;
             annot.set("Subtype", "FreeText");
             annot.set("Contents", text_string(text));
@@ -433,11 +433,11 @@ pub fn add_annotation(doc: &mut Document, a: &Annotation, page: ObjectId) -> Obj
                 num(base.y)
             );
             let mut bytes = ops.into_bytes();
-            for (i, line) in text.split('\n').enumerate() {
+            for (i, (line, _)) in text_lines(text, w, *width).into_iter().enumerate() {
                 if i > 0 {
                     bytes.extend(format!("0 {} Td ", num(-w * TEXT_LINE_HEIGHT)).bytes());
                 }
-                bytes.extend(pdf_literal(line));
+                bytes.extend(pdf_literal(text[line].trim_end_matches(' ')));
                 bytes.extend(b" Tj\n");
             }
             bytes.extend(b"ET\n");

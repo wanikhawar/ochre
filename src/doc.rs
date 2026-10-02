@@ -861,6 +861,8 @@ mod tests {
                     right: Pt::new(1.0, 0.0),
                     down: Pt::new(0.0, -1.0),
                     text: "Hello (world)\nÜnïcode ✓".into(),
+                    width: None,
+                    height: None,
                 },
             ),
             Annotation::new(0, s, Kind::Shape { shape: ShapeKind::Rect, a: Pt::new(1.0, 2.0), b: Pt::new(30.0, 40.0) }),
@@ -868,6 +870,18 @@ mod tests {
             Annotation::new(0, s, Kind::Shape { shape: ShapeKind::Arrow, a: Pt::new(1.0, 2.0), b: Pt::new(30.0, 40.0) }),
             Annotation::new(0, s, Kind::Shape { shape: ShapeKind::Check, a: Pt::new(50.0, 70.0), b: Pt::new(66.0, 54.0) }),
             Annotation::new(0, s, Kind::Shape { shape: ShapeKind::Cross, a: Pt::new(80.0, 70.0), b: Pt::new(96.0, 54.0) }),
+            Annotation::new(
+                0,
+                Style::new([0.0; 3], 12.0, 1.0),
+                Kind::Text {
+                    origin: Pt::new(300.0, 700.0),
+                    right: Pt::new(1.0, 0.0),
+                    down: Pt::new(0.0, -1.0),
+                    text: "A box with a set width wraps its lines".into(),
+                    width: Some(90.0),
+                    height: Some(60.0),
+                },
+            ),
             Annotation::new(
                 0,
                 s,
@@ -1715,7 +1729,7 @@ mod rotated_sample {
         let text = Annotation::new(
             0,
             Style::new([0.1, 0.35, 0.9], 18.0, 1.0),
-            Kind::Text { origin: Pt::new(100.0, 400.0), right: Pt::new(1.0, 0.0), down: Pt::new(0.0, -1.0), text: "Rotated text".into() },
+            Kind::Text { origin: Pt::new(100.0, 400.0), right: Pt::new(1.0, 0.0), down: Pt::new(0.0, -1.0), text: "Rotated text".into(), width: None, height: None },
         );
         let text = text.rotated(text.center(), 0.5);
         cmds.push(Cmd::Add(text));
@@ -1817,6 +1831,8 @@ mod visual {
                     right: inv.apply_vec(Pt::new(1.0, 0.0)),
                     down: inv.apply_vec(Pt::new(0.0, 1.0)),
                     text: format!("Typed note on page {} (rotation {})\nSecond line: café — “quotes”", page + 1, g.rotation),
+                    width: None,
+                    height: None,
                 },
             )));
             for (i, shape) in [ShapeKind::Check, ShapeKind::Cross].into_iter().enumerate() {

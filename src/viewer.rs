@@ -12,11 +12,11 @@ use crate::annot::raster;
 use crate::annot::smoothing::{LazyBrush, catmull_rom, finish_stroke};
 use crate::app::{App, Selection, Tool};
 use crate::doc::Cmd;
-use crate::pdf::worker::TextChar;
+use crate::pdf::worker::{Target, TextChar};
 
 const MARGIN: f32 = 24.0;
 /// Room above the first page and below the last for the floating bars.
-const TOP_MARGIN: f32 = 24.0;
+pub const TOP_MARGIN: f32 = 24.0;
 const BOTTOM_MARGIN: f32 = 56.0;
 const GAP: f32 = 16.0;
 /// Max pixels per page texture (~64 MB RGBA).
@@ -33,7 +33,7 @@ pub struct Overlay {
     tex: egui::TextureHandle,
     scale: f32,
     rev: u64,
-    exclude: Option<String>,
+    exclude: Vec<String>,
 }
 
 pub struct TextEditState {
@@ -65,6 +65,11 @@ pub enum EditOp {
     Scale { anchor: Pt, corner: Pt, start: Pt },
     /// Dragging one end (0 = `a`, 1 = `b`) of a line or arrow.
     Endpoint(usize),
+    /// Dragging a corner of a rotated box shape (user space): `anchor` is the
+    /// opposite corner, `corner` the dragged one (index `i` in box order).
+    ScaleBox { anchor: Pt, corner: Pt, i: usize },
+    /// Rotating about `center` (user space); `start` is the pointer's initial angle.
+    Rotate { center: Pt, start: f32 },
 }
 
 /// A grab point on the selected annotation.
@@ -72,10 +77,16 @@ pub enum EditOp {
 enum Handle {
     /// Corner of the bounding box, in screen order: top-left, top-right, bottom-left, bottom-right.
     Corner(usize),
+    /// Corner of a rotated box shape's box, in [`geometry::box_corners`] order.
+    BoxCorner(usize),
     Endpoint(usize),
+    /// The round handle above the selection that rotates it.
+    Rotate,
 }
 
 const HANDLE_SIZE: f32 = 8.0;
+/// How far above the selection outline the rotate handle sits.
+const ROTATE_HANDLE_GAP: f32 = 22.0;
 const NOTE_BADGE_RADIUS: f32 = 8.0;
 
 /// Where the note badge of an annotation with screen bounds `r` goes: just right of
@@ -90,8 +101,15 @@ pub enum Gesture {
     Shape { page: usize, shape: ShapeKind, a: Pt, b: Pt, style: Style },
     Markup { page: usize, markup: MarkupKind, start: usize, end: usize, style: Style },
     Erase { removed: Vec<Cmd> },
-    Edit { before: Box<Annotation>, current: Annotation, op: EditOp },
+    /// Dragging the selection: several annotations when moving a group, one otherwise.
+    Edit { before: Vec<Annotation>, current: Vec<Annotation>, op: EditOp },
+    /// Dragging a selection box (user space of `page`). With `add`, what it touches
+    /// is added to `base`, the selection it started with.
+    Marquee { page: usize, start: Pt, end: Pt, add: bool, base: Vec<String> },
     Pan { last: Pos2 },
+    /// Pressed on a link: a click follows it; dragging instead selects text from
+    /// `char` (Select tool) or pans (Hand tool).
+    Link { target: Target, start: Pos2, page: usize, char: Option<usize> },
     /// Dragging out a text selection with the Select tool. `click` is what a plain
     /// click (no drag) selects instead, e.g. another app's highlight over the text.
     SelectText { click: Option<Selection> },
@@ -116,11 +134,24 @@ pub enum Motion {
     HalfUp,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Fit {
     Width,
     Page,
 }
+
+/// A scroll to a spot on a page: `y` is display points from the page top, and the
+/// spot ends up `margin` pixels below the window top.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Jump {
+    pub page: usize,
+    pub y: f32,
+    pub margin: f32,
+    pub animate: bool,
+}
+
+/// How many positions the Back history keeps.
+const MAX_BACK: usize = 50;
 
 pub struct View {
     pub zoom: f32,
@@ -138,6 +169,9 @@ pub struct View {
     /// Time and place of the last primary press, for double clicks.
     last_press: Option<(f64, Pos2)>,
     pub goto_page: Option<usize>,
+    pub jump: Option<Jump>,
+    /// Positions to return to with Back (page, display y), oldest first.
+    pub back: Vec<(usize, f32)>,
     /// Scroll so this point (user space) of a page is visible.
     pub reveal: Option<(usize, Pt)>,
     pub current_page: usize,
@@ -163,6 +197,8 @@ impl Default for View {
             annot_rect: None,
             last_press: None,
             goto_page: None,
+            jump: None,
+            back: Vec::new(),
             reveal: None,
             current_page: 0,
             pending_zoom: None,
@@ -195,6 +231,25 @@ impl View {
     fn to_display(&self, i: usize, p: Pos2) -> Pt {
         let r = self.page_rects[i];
         Pt::new((p.x - r.min.x) / self.zoom, (p.y - r.min.y) / self.zoom)
+    }
+
+    /// Page at the top of the window and how far down it is (display points). The
+    /// gap above a page counts as part of it (`y` is then negative).
+    pub fn position(&self) -> Option<(usize, f32)> {
+        let top = self.viewport.top();
+        let page =
+            self.page_rects.iter().position(|r| r.bottom() > top + TOP_MARGIN).or(self.page_rects.len().checked_sub(1))?;
+        Some((page, (top - self.page_rects[page].top()) / self.zoom))
+    }
+
+    /// Remembers the current position for Back.
+    pub fn push_back(&mut self) {
+        if let Some(pos) = self.position() {
+            self.back.push(pos);
+            if self.back.len() > MAX_BACK {
+                self.back.remove(0);
+            }
+        }
     }
 
     /// Page under (or nearest to, vertically) a screen position.
@@ -322,6 +377,47 @@ fn edit_annotation(before: &Annotation, g: &PageGeom, op: EditOp, u: Pt, shift: 
             if let Kind::Shape { shape, a, b } = &mut out.kind {
                 let (fixed, end) = if i == 0 { (*b, a) } else { (*a, b) };
                 *end = if shift { shift_constrain(*shape, fixed, u) } else { u };
+            }
+            out
+        }
+        EditOp::Rotate { center, start } => {
+            let d = u.sub(center);
+            let mut delta = d.y.atan2(d.x) - start;
+            if shift {
+                // Snap the resulting angle to 15° steps.
+                let step = 15f32.to_radians();
+                let base = before.angle;
+                delta = ((base + delta) / step).round() * step - base;
+            }
+            before.rotated(center, delta)
+        }
+        EditOp::ScaleBox { anchor, corner, i } => {
+            // Work in the box's own frame, where it is upright.
+            let angle = before.angle;
+            let local = |v: Pt| v.sub(anchor).rotate(-angle);
+            let (d0, d) = (local(corner), local(u));
+            let min = 6.0 / zoom;
+            let keep_side = |v: f32, v0: f32| if v0 >= 0.0 { v.max(min) } else { v.min(-min) };
+            let (mut dx, mut dy) = (keep_side(d.x, d0.x), keep_side(d.y, d0.y));
+            if shift && d0.x.abs() > 1e-3 && d0.y.abs() > 1e-3 {
+                let s = (dx / d0.x).max(dy / d0.y);
+                (dx, dy) = (d0.x * s, d0.y * s);
+            }
+            let moved = anchor.add(Pt::new(dx, dy).rotate(angle));
+            let c = anchor.lerp(moved, 0.5);
+            // Back to the unrotated box: corners `i` and the opposite one are known.
+            let (ui, uo) = (moved.rotate_about(c, -angle), anchor.rotate_about(c, -angle));
+            let (p, q) = match i {
+                0 => (ui, uo),
+                2 => (uo, ui),
+                _ => {
+                    let (c1, c3) = if i == 1 { (ui, uo) } else { (uo, ui) };
+                    (Pt::new(c3.x, c1.y), Pt::new(c1.x, c3.y))
+                }
+            };
+            let mut out = before.clone();
+            if let Kind::Shape { a, b, .. } = &mut out.kind {
+                (*a, *b) = (p, q);
             }
             out
         }
@@ -531,6 +627,15 @@ impl App {
         if let Some(p) = self.view.goto_page.take().filter(|p| *p < pages.len()) {
             target = Some(vec2(base.x, page_top(p)));
         }
+        if let Some(j) = self.view.jump.take().filter(|j| j.page < pages.len()) {
+            let t = vec2(base.x, lay.origins[j.page].y + j.y * self.view.zoom - j.margin);
+            if j.animate {
+                target = Some(t);
+            } else {
+                self.view.set_offset = Some(clamp(t));
+                self.view.scroll_target = None;
+            }
+        }
         if let Some((p, u)) = self.view.reveal.take()
             && let (Some(o), Some(g)) = (lay.origins.get(p), pages.get(p))
         {
@@ -655,9 +760,9 @@ impl App {
         if !settled {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(160));
         }
-        let exclude = match &self.gesture {
-            Gesture::Edit { before, .. } => Some(before.id.clone()),
-            _ => None,
+        let exclude: Vec<String> = match &self.gesture {
+            Gesture::Edit { before, .. } => before.iter().map(|a| a.id.clone()).collect(),
+            _ => Vec::new(),
         };
 
         for &i in &visible {
@@ -676,7 +781,7 @@ impl App {
             if need {
                 self.request_render(i, want);
             }
-            self.paint_overlay(&painter, i, rect, want, settled, exclude.as_deref(), ui.ctx());
+            self.paint_overlay(&painter, i, rect, want, settled, &exclude, ui.ctx());
             self.paint_texts(&painter, i);
             self.paint_note_badges(&painter, i);
             self.paint_search(&painter, i, &self.view.to_screen(&pages[i], i));
@@ -691,6 +796,7 @@ impl App {
 
         self.handle_input(ui, resp);
         self.paint_selection(&painter);
+        self.paint_marquee(&painter);
         self.paint_live(&painter, ui.ctx(), ppp);
         self.text_editor(ui);
     }
@@ -703,14 +809,14 @@ impl App {
         rect: Rect,
         want: f32,
         settled: bool,
-        exclude: Option<&str>,
+        exclude: &[String],
         ctx: &egui::Context,
     ) {
         let Some(doc) = &self.doc else { return };
         let annots: Vec<&Annotation> = doc
             .annots
             .iter()
-            .filter(|a| a.page == page && Some(a.id.as_str()) != exclude && !matches!(a.kind, Kind::Text { .. }))
+            .filter(|a| a.page == page && !exclude.contains(&a.id) && !matches!(a.kind, Kind::Text { .. }))
             .collect();
         if annots.is_empty() {
             self.overlay.remove(&page);
@@ -718,7 +824,7 @@ impl App {
         }
         let rev = doc.page_rev.get(page).copied().unwrap_or(0);
         let fresh = self.overlay.get(&page).is_some_and(|o| {
-            o.rev == rev && o.exclude.as_deref() == exclude && ((o.scale - want).abs() < 0.005 || !settled)
+            o.rev == rev && o.exclude == exclude && ((o.scale - want).abs() < 0.005 || !settled)
         });
         if !fresh {
             let g = &doc.pages[page];
@@ -736,11 +842,11 @@ impl App {
                         o.tex.set(image, opts);
                         o.scale = want;
                         o.rev = rev;
-                        o.exclude = exclude.map(str::to_owned);
+                        o.exclude = exclude.to_vec();
                     }
                     None => {
                         let tex = ctx.load_texture(format!("overlay{page}"), image, opts);
-                        self.overlay.insert(page, Overlay { tex, scale: want, rev, exclude: exclude.map(str::to_owned) });
+                        self.overlay.insert(page, Overlay { tex, scale: want, rev, exclude: exclude.to_vec() });
                     }
                 }
             }
@@ -756,33 +862,69 @@ impl App {
         let g = &doc.pages[page];
         let aff = self.view.to_screen(g, page);
         let editing = self.editing.as_ref().and_then(|e| e.id.as_deref());
-        let moving = self.edited();
+
         for a in doc.annots.iter().filter(|a| a.page == page) {
             if Some(a.id.as_str()) == editing {
                 continue;
             }
-            let a = match moving {
-                Some(m) if m.id == a.id => m,
-                _ => a,
-            };
+            let a = self.edited(&a.id).unwrap_or(a);
             if let Kind::Text { origin, right, down, text } = &a.kind {
                 draw_text(painter, &aff, self.view.zoom, *origin, *right, *down, text, &a.style);
             }
         }
     }
 
-    /// The annotation being dragged, as it currently looks.
-    fn edited(&self) -> Option<&Annotation> {
+    /// Annotation `id` as it currently looks while being dragged, if it is.
+    fn edited(&self, id: &str) -> Option<&Annotation> {
         match &self.gesture {
-            Gesture::Edit { current, .. } => Some(current),
+            Gesture::Edit { current, .. } => current.iter().find(|a| a.id == id),
             _ => None,
         }
     }
 
-    /// Our selected annotation (as currently dragged, if it is).
+    /// Annotation `id` as currently shown (dragged or not).
+    fn shown(&self, id: &str) -> Option<&Annotation> {
+        self.edited(id).or_else(|| self.doc.as_ref()?.get(id))
+    }
+
+    /// Our selected annotation, when exactly one is selected.
     fn selected_ours(&self) -> Option<&Annotation> {
         let Some(Selection::Ours(id)) = &self.selection else { return None };
-        self.edited().filter(|a| a.id == *id).or_else(|| self.doc.as_ref()?.get(id))
+        self.shown(id)
+    }
+
+    /// Ids of all our selected annotations.
+    pub fn selected_ids(&self) -> Vec<String> {
+        match &self.selection {
+            Some(Selection::Ours(id)) => vec![id.clone()],
+            Some(Selection::Many(ids)) => ids.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Selects our annotations `ids`: none, one (with handles and note), or a group.
+    pub fn select_ids(&mut self, mut ids: Vec<String>) {
+        ids.dedup();
+        self.select(match ids.len() {
+            0 => None,
+            1 => ids.pop().map(Selection::Ours),
+            _ => Some(Selection::Many(ids)),
+        });
+    }
+
+    /// Our annotations touched by the box `a`-`b` on `page` (user space).
+    fn in_box(&self, page: usize, a: Pt, b: Pt) -> Vec<String> {
+        let Some(doc) = &self.doc else { return Vec::new() };
+        let (x0, y0, x1, y1) = (a.x.min(b.x), a.y.min(b.y), a.x.max(b.x), a.y.max(b.y));
+        doc.annots
+            .iter()
+            .filter(|an| an.page == page)
+            .filter(|an| {
+                let [ax0, ay0, ax1, ay1] = geometry::bounds(an);
+                ax0 <= x1 && ax1 >= x0 && ay0 <= y1 && ay1 >= y0
+            })
+            .map(|an| an.id.clone())
+            .collect()
     }
 
     /// Screen bounds of a foreign annotation.
@@ -799,20 +941,25 @@ impl App {
     fn handles(&self, a: &Annotation) -> Vec<(Handle, Pos2)> {
         let Some(doc) = &self.doc else { return Vec::new() };
         let aff = self.view.to_screen(&doc.pages[a.page], a.page);
-        match &a.kind {
-            Kind::Markup { .. } => Vec::new(),
+        let outlined = screen_bounds(a, &aff).expand(4.0);
+        let mut handles: Vec<(Handle, Pos2)> = match &a.kind {
+            Kind::Markup { .. } => return Vec::new(),
             Kind::Shape { shape: ShapeKind::Line | ShapeKind::Arrow, a: p, b: q, .. } => {
                 vec![(Handle::Endpoint(0), pos(aff.apply(*p))), (Handle::Endpoint(1), pos(aff.apply(*q)))]
             }
-            _ => {
-                let r = screen_bounds(a, &aff).expand(4.0);
-                [r.left_top(), r.right_top(), r.left_bottom(), r.right_bottom()]
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, c)| (Handle::Corner(i), c))
-                    .collect()
-            }
-        }
+            _ if a.is_box() && a.angle != 0.0 => geometry::box_corners(a)
+                .into_iter()
+                .enumerate()
+                .map(|(i, c)| (Handle::BoxCorner(i), pos(aff.apply(c))))
+                .collect(),
+            _ => [outlined.left_top(), outlined.right_top(), outlined.left_bottom(), outlined.right_bottom()]
+                .into_iter()
+                .enumerate()
+                .map(|(i, c)| (Handle::Corner(i), c))
+                .collect(),
+        };
+        handles.push((Handle::Rotate, pos2(outlined.center().x, outlined.top() - ROTATE_HANDLE_GAP)));
+        handles
     }
 
     /// Handle of the selected annotation under a screen point (Select tool only).
@@ -831,8 +978,18 @@ impl App {
 
     /// Starts dragging handle `h` of `a`, pressed at screen point `p`.
     fn start_handle_drag(&mut self, a: Annotation, h: Handle, p: Pos2) {
+        let Some(g) = self.doc.as_ref().and_then(|d| d.pages.get(a.page)).copied() else { return };
         let op = match h {
             Handle::Endpoint(i) => EditOp::Endpoint(i),
+            Handle::Rotate => {
+                let center = a.center();
+                let d = self.view.to_user(&g, a.page, p).sub(center);
+                EditOp::Rotate { center, start: d.y.atan2(d.x) }
+            }
+            Handle::BoxCorner(i) => {
+                let corners = geometry::box_corners(&a);
+                EditOp::ScaleBox { anchor: corners[(i + 2) % 4], corner: corners[i], i }
+            }
             Handle::Corner(i) => {
                 let Some(doc) = &self.doc else { return };
                 let r = screen_bounds(&a, &self.view.to_screen(&doc.pages[a.page], a.page));
@@ -841,7 +998,7 @@ impl App {
                 EditOp::Scale { anchor: disp(corners[3 - i]), corner: disp(corners[i]), start: disp(p) }
             }
         };
-        self.gesture = Gesture::Edit { before: Box::new(a.clone()), current: a, op };
+        self.gesture = Gesture::Edit { before: vec![a.clone()], current: vec![a], op };
     }
 
     fn paint_selection(&mut self, painter: &Painter) {
@@ -851,15 +1008,26 @@ impl App {
             Some(Selection::Ours(_)) => {
                 let Some(a) = self.selected_ours() else { return };
                 let Some(doc) = &self.doc else { return };
-                let r = screen_bounds(a, &self.view.to_screen(&doc.pages[a.page], a.page));
-                let outlined = r.expand(4.0);
+                let aff = self.view.to_screen(&doc.pages[a.page], a.page);
+                let outlined = screen_bounds(a, &aff).expand(4.0);
                 let is_line = matches!(a.kind, Kind::Shape { shape: ShapeKind::Line | ShapeKind::Arrow, .. });
-                if !is_line {
+                if a.is_box() && a.angle != 0.0 {
+                    // The rotated box itself.
+                    let mut pts: Vec<Pos2> = geometry::box_corners(a).iter().map(|c| pos(aff.apply(*c))).collect();
+                    pts.push(pts[0]);
+                    painter.line(pts, handle_stroke);
+                } else if !is_line {
                     painter.rect_stroke(outlined, 2.0, handle_stroke, StrokeKind::Middle);
                 }
+                let mut area = outlined;
                 for (h, c) in self.handles(a) {
                     match h {
-                        Handle::Corner(_) => {
+                        Handle::Rotate => {
+                            painter.line_segment([pos2(c.x, outlined.top()), c], Stroke::new(1.0, accent));
+                            painter.circle(c, HANDLE_SIZE / 2.0 + 1.0, Color32::WHITE, handle_stroke);
+                            area = area.union(Rect::from_center_size(c, Vec2::splat(HANDLE_SIZE)));
+                        }
+                        Handle::Corner(_) | Handle::BoxCorner(_) => {
                             let hr = Rect::from_center_size(c, Vec2::splat(HANDLE_SIZE));
                             painter.rect_filled(hr, 1.5, Color32::WHITE);
                             painter.rect_stroke(hr, 1.5, handle_stroke, StrokeKind::Middle);
@@ -869,7 +1037,18 @@ impl App {
                         }
                     }
                 }
-                self.view.annot_rect = Some(outlined);
+                self.view.annot_rect = Some(area);
+            }
+            Some(Selection::Many(ids)) => {
+                // A group: each one outlined, no handles (groups are moved, not resized).
+                let Some(doc) = &self.doc else { return };
+                let mut all: Option<Rect> = None;
+                for a in ids.iter().filter_map(|id| self.shown(id)) {
+                    let r = screen_bounds(a, &self.view.to_screen(&doc.pages[a.page], a.page)).expand(3.0);
+                    painter.rect_stroke(r, 2.0, handle_stroke, StrokeKind::Middle);
+                    all = Some(all.map_or(r, |u| u.union(r)));
+                }
+                self.view.annot_rect = all.map(|r| r.expand(1.0));
             }
             Some(Selection::Foreign(i)) => {
                 // Other apps' annotations: dashed, without handles (they can't be changed).
@@ -883,13 +1062,21 @@ impl App {
         }
     }
 
+    fn paint_marquee(&self, painter: &Painter) {
+        let (Gesture::Marquee { page, start, end, .. }, Some(doc)) = (&self.gesture, &self.doc) else { return };
+        let aff = self.view.to_screen(&doc.pages[*page], *page);
+        let r = Rect::from_two_pos(pos(aff.apply(*start)), pos(aff.apply(*end)));
+        let accent = crate::ui::theme::ACCENT;
+        painter.rect_filled(r, 0.0, accent.gamma_multiply(0.08));
+        painter.rect_stroke(r, 0.0, Stroke::new(1.0, accent.gamma_multiply(0.9)), StrokeKind::Middle);
+    }
+
     /// Note badges on one page: ours and other apps' annotations that carry a note.
     fn note_badges(&self, page: usize) -> Vec<(Pos2, Selection, String)> {
         let Some(doc) = &self.doc else { return Vec::new() };
         let aff = self.view.to_screen(&doc.pages[page], page);
-        let edited = self.edited();
         let ours = doc.annots.iter().filter(|a| a.page == page && !a.note.is_empty()).map(|a| {
-            let a = edited.filter(|e| e.id == a.id).unwrap_or(a);
+            let a = self.edited(&a.id).unwrap_or(a);
             (badge_center(screen_bounds(a, &aff)), Selection::Ours(a.id.clone()), a.note.clone())
         });
         let foreign = doc.foreign.iter().enumerate().filter_map(|(i, f)| {
@@ -940,6 +1127,7 @@ impl App {
         match self.hit(p)? {
             Selection::Ours(id) => Some(doc.get(&id)?.note.clone()).filter(|n| !n.is_empty()),
             Selection::Foreign(i) => doc.foreign.get(i)?.note.clone(),
+            Selection::Many(_) => None,
         }
     }
 
@@ -954,6 +1142,7 @@ impl App {
                 style: *style,
                 kind: Kind::Ink { curve: catmull_rom(raw), highlighter: *highlighter },
                 note: String::new(),
+                angle: 0.0,
             }),
             Gesture::Shape { page, shape, a, b, style } => {
                 let (a, b) = shape_box(&doc.pages[*page], *shape, *a, *b, style, self.view.zoom);
@@ -963,6 +1152,7 @@ impl App {
                     style: *style,
                     kind: Kind::Shape { shape: *shape, a, b },
                     note: String::new(),
+                    angle: 0.0,
                 })
             }
             Gesture::Markup { page, markup, start, end, style } => {
@@ -974,28 +1164,39 @@ impl App {
                     style: *style,
                     kind: Kind::Markup { markup: *markup, quads },
                     note: String::new(),
+                    angle: 0.0,
                 })
             }
-            Gesture::Edit { current, .. } if !matches!(current.kind, Kind::Text { .. }) => Some(current.clone()),
             _ => None,
         };
-        let Some(a) = live else { return };
-        let aff = self.view.to_screen(&doc.pages[a.page], a.page);
-        let bbox = screen_bounds(&a, &aff).expand(2.0).intersect(painter.clip_rect());
+        // Everything being drawn or dragged, rasterized together into one texture.
+        let live: Vec<Annotation> = match &self.gesture {
+            Gesture::Edit { current, .. } => {
+                current.iter().filter(|a| !matches!(a.kind, Kind::Text { .. })).cloned().collect()
+            }
+            _ => live.into_iter().collect(),
+        };
+        let affs: Vec<Affine> = live.iter().map(|a| self.view.to_screen(&doc.pages[a.page], a.page)).collect();
+        let Some(bounds) = live.iter().zip(&affs).map(|(a, aff)| screen_bounds(a, aff)).reduce(|x, y| x.union(y)) else {
+            return;
+        };
+        let bbox = bounds.expand(2.0).intersect(painter.clip_rect());
         if !bbox.is_positive() {
             return;
         }
         let (pw, ph) = ((bbox.width() * ppp).ceil() as u32, (bbox.height() * ppp).ceil() as u32);
         let Some(mut pm) = tiny_skia::Pixmap::new(pw.max(1), ph.max(1)) else { return };
-        let t = Affine {
-            a: aff.a * ppp,
-            b: aff.b * ppp,
-            c: aff.c * ppp,
-            d: aff.d * ppp,
-            e: (aff.e - bbox.min.x) * ppp,
-            f: (aff.f - bbox.min.y) * ppp,
-        };
-        raster::draw(&mut pm.as_mut(), &a, t.to_skia());
+        for (a, aff) in live.iter().zip(&affs) {
+            let t = Affine {
+                a: aff.a * ppp,
+                b: aff.b * ppp,
+                c: aff.c * ppp,
+                d: aff.d * ppp,
+                e: (aff.e - bbox.min.x) * ppp,
+                f: (aff.f - bbox.min.y) * ppp,
+            };
+            raster::draw(&mut pm.as_mut(), a, t.to_skia());
+        }
         let image = egui::ColorImage::from_rgba_premultiplied([pw as usize, ph as usize], pm.data());
         let opts = egui::TextureOptions::LINEAR;
         let tex = match &mut self.live_tex {
@@ -1020,7 +1221,14 @@ impl App {
         for ev in events {
             match ev {
                 Event::PointerButton { pos, button, pressed: true, modifiers } if hovered => {
-                    if button == PointerButton::Middle || (button == PointerButton::Primary && (panning_key || self.tool == Tool::Hand)) {
+                    if button == PointerButton::Extra1 {
+                        self.go_back();
+                    } else if button == PointerButton::Primary && !panning_key && self.tool == Tool::Hand
+                        && let Some((target, page)) = self.link_at(pos)
+                    {
+                        self.commit_edits();
+                        self.gesture = Gesture::Link { target, start: pos, page, char: None };
+                    } else if button == PointerButton::Middle || (button == PointerButton::Primary && (panning_key || self.tool == Tool::Hand)) {
                         self.commit_edits();
                         self.gesture = Gesture::Pan { last: pos };
                     } else if button == PointerButton::Primary {
@@ -1028,8 +1236,14 @@ impl App {
                     }
                 }
                 Event::PointerMoved(pos) => self.on_move(pos, ctx.input(|i| i.modifiers)),
-                Event::PointerButton { pos, pressed: false, .. } => self.on_release(pos),
-                Event::PointerGone => self.on_release(Pos2::ZERO),
+                Event::PointerButton { pos, pressed: false, .. } => self.on_release(ctx, pos),
+                Event::PointerGone => {
+                    // Leaving the window is not a click on a link.
+                    if matches!(self.gesture, Gesture::Link { .. }) {
+                        self.gesture = Gesture::None;
+                    }
+                    self.on_release(ctx, Pos2::ZERO)
+                }
                 _ => {}
             }
         }
@@ -1041,9 +1255,16 @@ impl App {
         if hovered || !matches!(self.gesture, Gesture::None) {
             let icon = match (&self.gesture, self.tool) {
                 (Gesture::Pan { .. }, _) => CursorIcon::Grabbing,
+                (Gesture::Link { .. }, _) => CursorIcon::PointingHand,
+                (Gesture::Marquee { .. }, _) => CursorIcon::Crosshair,
+                (Gesture::None, Tool::Hand) if !panning_key && resp.hover_pos().is_some_and(|p| self.link_at(p).is_some()) => {
+                    CursorIcon::PointingHand
+                }
                 _ if panning_key || self.tool == Tool::Hand => CursorIcon::Grab,
                 (Gesture::Edit { op: EditOp::Move { .. }, .. }, _) => CursorIcon::Grabbing,
                 (Gesture::Edit { op: EditOp::Endpoint(_), .. }, _) => CursorIcon::Crosshair,
+                (Gesture::Edit { op: EditOp::Rotate { .. }, .. }, _) => CursorIcon::Grabbing,
+                (Gesture::Edit { op: EditOp::ScaleBox { .. }, .. }, _) => CursorIcon::Move,
                 (Gesture::Edit { op: EditOp::Scale { anchor, corner, .. }, .. }, _) => {
                     // Same diagonal as when the drag started (screen and display axes agree).
                     if (corner.x - anchor.x) * (corner.y - anchor.y) > 0.0 {
@@ -1066,9 +1287,12 @@ impl App {
                     Some(p) if self.handle_at(p).is_some() => match self.handle_at(p).map(|(_, h)| h) {
                         Some(Handle::Corner(0 | 3)) => CursorIcon::ResizeNwSe,
                         Some(Handle::Corner(_)) => CursorIcon::ResizeNeSw,
+                        Some(Handle::BoxCorner(_)) => CursorIcon::Move,
+                        Some(Handle::Rotate) => CursorIcon::Grab,
                         _ => CursorIcon::Crosshair,
                     },
                     Some(p) if self.hit(p).is_some() => CursorIcon::Move,
+                    Some(p) if self.link_at(p).is_some() => CursorIcon::PointingHand,
                     Some(p) if self.over_text(p) => CursorIcon::Text,
                     _ => CursorIcon::Default,
                 },
@@ -1085,16 +1309,35 @@ impl App {
             && let Some(p) = resp.hover_pos().and_then(|p| self.view.page_at(p, true)) {
                 self.request_text(p);
             }
-        // Hovering a note badge (or, with Select, an annotation with a note) shows the note.
-        if matches!(self.gesture, Gesture::None)
-            && self.note_edit.is_none()
-            && let Some(note) = resp.hover_pos().and_then(|p| self.note_at(p))
-        {
+        // Hovering a note badge (or, with Select, an annotation with a note) shows the
+        // note; hovering a link shows where it goes.
+        let tip = resp.hover_pos().filter(|_| matches!(self.gesture, Gesture::None) && self.note_edit.is_none()).and_then(|p| {
+            self.note_at(p).or_else(|| {
+                let follows = matches!(self.tool, Tool::Select | Tool::Hand) && (self.tool == Tool::Hand || self.hit(p).is_none());
+                self.link_at(p).filter(|_| follows && !panning_key).map(|(t, _)| match t {
+                    Target::Page { page, .. } => format!("Go to page {}", page + 1),
+                    Target::Uri(uri) => uri,
+                })
+            })
+        });
+        if let Some(note) = tip {
             resp.clone().on_hover_ui_at_pointer(|ui| {
                 ui.set_max_width(320.0);
                 ui.label(note);
             });
         }
+    }
+
+    /// The link under a screen point, and its page.
+    fn link_at(&self, p: Pos2) -> Option<(Target, usize)> {
+        let doc = self.doc.as_ref()?;
+        let page = self.view.page_at(p, true)?;
+        let u = self.view.to_user(&doc.pages[page], page, p);
+        doc.links
+            .get(page)?
+            .iter()
+            .find(|l| u.x >= l.rect[0] && u.x <= l.rect[2] && u.y >= l.rect[1] && u.y <= l.rect[3])
+            .map(|l| (l.target.clone(), page))
     }
 
     fn over_text(&self, p: Pos2) -> bool {
@@ -1276,6 +1519,59 @@ impl App {
                 }
                 let hit = self.hit(p);
                 self.text_sel = None;
+                // Shift+click adds an annotation to the selection, or takes it out.
+                if modifiers.shift
+                    && let Some(Selection::Ours(id)) = &hit
+                {
+                    let mut ids = self.selected_ids();
+                    match ids.iter().position(|x| x == id) {
+                        Some(k) => {
+                            ids.remove(k);
+                        }
+                        None => ids.push(id.clone()),
+                    }
+                    self.select_ids(ids);
+                    return;
+                }
+                // Grabbing one of a selected group moves the whole group (text markup stays put).
+                if let (Some(Selection::Ours(id)), Some(Selection::Many(ids))) = (&hit, &self.selection)
+                    && ids.contains(id)
+                    && !double
+                {
+                    let mut group: Vec<Annotation> = ids
+                        .iter()
+                        .filter_map(|i| doc.get(i))
+                        .filter(|a| !matches!(a.kind, Kind::Markup { .. }))
+                        .cloned()
+                        .collect();
+                    // The grabbed one first: the drag is measured on its page.
+                    if let Some(k) = group.iter().position(|a| a.id == *id) {
+                        group.swap(0, k);
+                        let op = EditOp::Move { start: u };
+                        self.gesture = Gesture::Edit { before: group.clone(), current: group, op };
+                        return;
+                    }
+                }
+                // Dragging from empty space (or anywhere with Shift) draws a selection box.
+                let on_text = self.text_chars.get(&page).is_some_and(|c| char_at(c, u, 8.0 / self.view.zoom).is_some());
+                if (hit.is_none() || modifiers.shift) && (modifiers.shift || !on_text) && self.link_at(p).is_none() {
+                    let base = if modifiers.shift { self.selected_ids() } else { Vec::new() };
+                    if !modifiers.shift {
+                        self.select(None);
+                    }
+                    self.request_text(page);
+                    self.gesture = Gesture::Marquee { page, start: u, end: u, add: modifiers.shift, base };
+                    return;
+                }
+                if hit.is_none()
+                    && !double
+                    && let Some((target, link_page)) = self.link_at(p)
+                {
+                    let char = self.text_chars.get(&link_page).and_then(|c| char_at(c, u, 8.0 / self.view.zoom));
+                    self.gesture = Gesture::Link { target, start: p, page: link_page, char };
+                    self.select(None);
+                    return;
+                }
                 // Text markup sits on the text: dragging over it selects text, and a
                 // plain click selects the markup. Other annotations move when dragged.
                 let movable = match &hit {
@@ -1290,7 +1586,7 @@ impl App {
                         return;
                     } else {
                         let op = EditOp::Move { start: u };
-                        self.gesture = Gesture::Edit { before: Box::new(a.clone()), current: a.clone(), op };
+                        self.gesture = Gesture::Edit { before: vec![a.clone()], current: vec![a.clone()], op };
                     }
                 }
                 if movable.is_none() {
@@ -1316,6 +1612,21 @@ impl App {
     }
 
     fn on_move(&mut self, p: Pos2, modifiers: Modifiers) {
+        // Dragging from a link selects text (Select) or pans (Hand) instead of following it.
+        if let Gesture::Link { start, page, char, .. } = self.gesture
+            && start.distance(p) > 5.0
+        {
+            self.gesture = if self.tool == Tool::Hand {
+                let base = self.view.set_offset.unwrap_or(self.view.offset);
+                self.view.set_offset = Some(base - (p - start));
+                Gesture::Pan { last: p }
+            } else if let Some(i) = char {
+                self.text_sel = Some(TextSel { page, start: i, end: i });
+                Gesture::SelectText { click: None }
+            } else {
+                Gesture::None
+            };
+        }
         let Some(doc) = &self.doc else { return };
         let zoom = self.view.zoom;
         match &mut self.gesture {
@@ -1337,10 +1648,28 @@ impl App {
                 }
             }
             Gesture::Erase { .. } => self.erase_at(p),
+            Gesture::Link { .. } => {}
             Gesture::Edit { before, current, op } => {
-                let g = doc.pages[before.page];
-                let u = self.view.to_user(&g, before.page, p);
-                *current = edit_annotation(before, &g, *op, u, modifiers.shift, zoom);
+                let Some(first) = before.first() else { return };
+                let g = doc.pages[first.page];
+                let u = self.view.to_user(&g, first.page, p);
+                *current = before
+                    .iter()
+                    .map(|b| edit_annotation(b, &doc.pages[b.page], *op, u, modifiers.shift, zoom))
+                    .collect();
+            }
+            Gesture::Marquee { page, end, .. } => {
+                *end = self.view.to_user(&doc.pages[*page], *page, p);
+                // Selects live, so you see what the box catches.
+                if let Gesture::Marquee { page, start, end, add, base } = &self.gesture {
+                    let mut ids = if *add { base.clone() } else { Vec::new() };
+                    for id in self.in_box(*page, *start, *end) {
+                        if !ids.contains(&id) {
+                            ids.push(id);
+                        }
+                    }
+                    self.select_ids(ids);
+                }
             }
             Gesture::SelectText { .. } => {
                 if let Some(sel) = &mut self.text_sel {
@@ -1361,7 +1690,7 @@ impl App {
         }
     }
 
-    fn on_release(&mut self, _p: Pos2) {
+    fn on_release(&mut self, ctx: &egui::Context, _p: Pos2) {
         let gesture = std::mem::replace(&mut self.gesture, Gesture::None);
         let zoom = self.view.zoom;
         match gesture {
@@ -1394,10 +1723,15 @@ impl App {
                 }
             }
             Gesture::Edit { before, current, .. } => {
-                if *before != current {
-                    self.exec(vec![Cmd::Modify { before: *before, after: current }]);
-                }
+                let cmds: Vec<Cmd> = before
+                    .into_iter()
+                    .zip(current)
+                    .filter(|(b, a)| b != a)
+                    .map(|(before, after)| Cmd::Modify { before, after })
+                    .collect();
+                self.exec(cmds);
             }
+            Gesture::Marquee { .. } => {}
             Gesture::SelectText { click } => {
                 // A plain click (no drag) selects no text, but whatever annotation was clicked.
                 if self.text_sel.is_some_and(|s| s.start == s.end) {
@@ -1405,6 +1739,7 @@ impl App {
                     self.select(click);
                 }
             }
+            Gesture::Link { target, .. } => self.follow(ctx, &target),
             Gesture::Pan { .. } | Gesture::None => {}
         }
     }
@@ -1561,6 +1896,10 @@ impl App {
 fn draw_text(painter: &Painter, aff: &Affine, zoom: f32, origin: Pt, right: Pt, down: Pt, text: &str, style: &Style) {
     let size = style.width;
     let font = FontId::new(size * zoom, egui::FontFamily::Name("annot".into()));
+    // Direction of the text on screen (a rotated text box is drawn at an angle).
+    let screen_right = aff.apply_vec(right).normalized();
+    let screen_down = Pt::new(-screen_right.y, screen_right.x);
+    let angle = screen_right.y.atan2(screen_right.x);
     for (i, line) in text.split('\n').enumerate() {
         let base = origin
             .add(right.scale(TEXT_PAD))
@@ -1573,7 +1912,12 @@ fn draw_text(painter: &Painter, aff: &Affine, zoom: f32, origin: Pt, right: Pt, 
             .and_then(|r| r.glyphs.first())
             .map(|g| g.font_ascent)
             .unwrap_or(size * zoom * TEXT_ASCENT);
-        painter.galley(pos2(base.x, base.y - ascent), galley, color(style));
+        let top_left = base.sub(screen_down.scale(ascent));
+        if angle.abs() < 1e-4 {
+            painter.galley(pos(top_left), galley, color(style));
+        } else {
+            painter.add(egui::epaint::TextShape::new(pos(top_left), galley, color(style)).with_angle(angle));
+        }
     }
 }
 
@@ -1642,7 +1986,8 @@ mod tests {
             let input = RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 1500.0))),
                 time: Some(self.t),
-                events,
+                // Held modifiers, as a real window reports them.
+                events: [vec![Event::ModifiersChanged(self.mods)], events].concat(),
                 ..Default::default()
             };
             let app = &mut self.app;
@@ -1693,6 +2038,489 @@ mod tests {
         }
     }
 
+    /// Six text pages with a table of contents and a link on page 1 to page 3.
+    fn reading_pdf(path: &std::path::Path) {
+        use lopdf::{Object, Stream, dictionary};
+        let mut doc = lopdf::Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let font = doc.add_object(dictionary! {
+            "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica",
+        });
+        let content = doc.add_object(Stream::new(dictionary! {}, b"BT /F1 14 Tf 72 700 Td (Some text) Tj ET".to_vec()));
+        let page_ids: Vec<_> = (0..6).map(|_| doc.new_object_id()).collect();
+        let xyz = |page: usize, y: i64| vec![page_ids[page].into(), "XYZ".into(), Object::Null, y.into(), Object::Null];
+        let link = doc.add_object(dictionary! {
+            "Type" => "Annot", "Subtype" => "Link",
+            "Rect" => vec![450.into(), 600.into(), 550.into(), 620.into()],
+            "Dest" => xyz(2, 400),
+        });
+        for (i, id) in page_ids.iter().enumerate() {
+            let mut page = dictionary! {
+                "Type" => "Page", "Parent" => pages_id, "Contents" => content,
+                "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                "Resources" => dictionary! { "Font" => dictionary! { "F1" => font } },
+            };
+            if i == 0 {
+                page.set("Annots", vec![link.into()]);
+            }
+            doc.objects.insert(*id, Object::Dictionary(page));
+        }
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages", "Kids" => page_ids.iter().map(|&id| id.into()).collect::<Vec<Object>>(), "Count" => 6,
+            }),
+        );
+        // Outlines: Intro (page 1), Chapter (page 3) with a child Section (page 3, y 400).
+        let [outlines, intro, chapter, section] = [(); 4].map(|_| doc.new_object_id());
+        let title = |t: &str| Object::string_literal(t);
+        doc.objects.insert(outlines, Object::Dictionary(dictionary! {
+            "Type" => "Outlines", "First" => intro, "Last" => chapter, "Count" => 3,
+        }));
+        doc.objects.insert(intro, Object::Dictionary(dictionary! {
+            "Title" => title("Intro"), "Parent" => outlines, "Next" => chapter, "Dest" => xyz(0, 792),
+        }));
+        doc.objects.insert(chapter, Object::Dictionary(dictionary! {
+            "Title" => title("Chapter"), "Parent" => outlines, "Prev" => intro,
+            "First" => section, "Last" => section, "Count" => 1, "Dest" => xyz(2, 792),
+        }));
+        doc.objects.insert(section, Object::Dictionary(dictionary! {
+            "Title" => title("Section"), "Parent" => chapter, "Dest" => xyz(2, 400),
+        }));
+        let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id, "Outlines" => outlines });
+        doc.trailer.set("Root", catalog);
+        doc.save(path).unwrap();
+    }
+
+    #[test]
+    fn contents_links_and_reading_position() {
+        use crate::pdf::worker::{Link, OutlineItem};
+        let dir = std::env::temp_dir().join(format!("ochre-reading-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("reading.pdf");
+        reading_pdf(&path);
+
+        let ctx = egui::Context::default();
+        let app = App::new(&ctx, Some(path.clone()));
+        if app.worker.is_none() {
+            eprintln!("pdfium not available, skipping: {:?}", app.worker_error);
+            return;
+        }
+        let mut h = Harness { ctx, app, t: 0.0, mods: Modifiers::NONE };
+        h.wait_until("pages", |a| a.doc.as_ref().is_some_and(|d| !d.pages.is_empty()));
+        h.frame(vec![]);
+
+        let page = |p: usize, y: f32| Some(Target::Page { page: p, x: None, y: Some(y) });
+        let item = |title: &str, level, target| OutlineItem { title: title.into(), level, target };
+        assert_eq!(
+            h.doc().outline,
+            [item("Intro", 0, page(0, 792.0)), item("Chapter", 0, page(2, 792.0)), item("Section", 1, page(2, 400.0))]
+        );
+        assert_eq!(h.doc().links[0], [Link { rect: [450.0, 600.0, 550.0, 620.0], target: page(2, 400.0).unwrap() }]);
+        assert!(h.doc().links[1].is_empty());
+
+        let pos = |h: &Harness| h.app.view.position().unwrap();
+        let settle = |h: &mut Harness| {
+            h.frame(vec![]);
+            h.wait_until("scroll settles", |a| a.view.scroll_target.is_none());
+            h.frame(vec![]);
+        };
+        let start = pos(&h);
+        assert_eq!(start.0, 0);
+
+        // Clicking the link (Select tool) goes to the spot on page 3, a little below the top.
+        h.app.set_tool(Tool::Select);
+        h.click(h.at(500.0, 610.0));
+        settle(&mut h);
+        let (p, y) = pos(&h);
+        let zoom = h.app.view.zoom;
+        assert_eq!(p, 2);
+        assert!((y - (792.0 - 400.0 - 12.0 / zoom)).abs() < 1.0, "y {y}");
+        // The contents highlight the section being read.
+        assert_eq!(h.app.current_outline_item(), Some(2));
+
+        // Alt+Left goes back.
+        h.key(Key::ArrowLeft, Modifiers::ALT);
+        settle(&mut h);
+        assert_eq!(pos(&h).0, 0);
+        assert!((pos(&h).1 - start.1).abs() < 1.0);
+        assert!(h.app.view.back.is_empty());
+        assert_eq!(h.app.current_outline_item(), Some(0));
+
+        // With the Hand tool a click follows the link too, while a drag pans.
+        h.app.set_tool(Tool::Hand);
+        let at = h.at(500.0, 610.0);
+        h.drag(&[at, at - vec2(0.0, 20.0), at - vec2(0.0, 40.0)]);
+        h.frame(vec![]);
+        assert!(h.app.view.back.is_empty(), "a drag doesn't follow the link");
+        assert_eq!(pos(&h).0, 0);
+        h.key(Key::G, Modifiers::NONE);
+        h.key(Key::G, Modifiers::NONE);
+        settle(&mut h);
+        h.click(h.at(500.0, 610.0));
+        settle(&mut h);
+        assert_eq!(pos(&h).0, 2);
+
+        // A contents entry without a y goes to the top of its page.
+        let chapter = h.doc().outline[1].target.clone().unwrap();
+        let ctx = h.ctx.clone();
+        h.app.follow(&ctx, &Target::Page { page: 1, x: None, y: None });
+        settle(&mut h);
+        assert_eq!(pos(&h).0, 1);
+        h.app.follow(&ctx, &chapter);
+        settle(&mut h);
+        assert_eq!(pos(&h).0, 2);
+        assert_eq!(h.app.current_outline_item(), Some(1));
+
+        // Only web and mail links are opened.
+        h.app.follow(&ctx, &Target::Uri("file:///etc/passwd".into()));
+        assert!(h.app.status.as_ref().is_some_and(|(m, _, err)| *err && m.starts_with("Not opening")));
+
+        // Closing the tab and opening the file again returns to the same place and zoom.
+        h.app.view.zoom_by(1.25);
+        h.frame(vec![]);
+        h.frame(vec![]);
+        let (zoom, before) = (h.app.view.zoom, pos(&h));
+        h.key(Key::W, Modifiers::COMMAND);
+        assert!(h.app.doc.is_none() && h.app.tabs.is_empty());
+        h.app.request_open(Some(path.clone()));
+        assert!(h.app.view.position().is_none(), "fresh view");
+        h.wait_until("pages again", |a| a.doc.as_ref().is_some_and(|d| !d.pages.is_empty()));
+        h.frame(vec![]);
+        h.frame(vec![]);
+        assert_eq!(h.app.view.zoom, zoom);
+        let after = pos(&h);
+        assert_eq!(after.0, before.0);
+        assert!((after.1 - before.1).abs() < 1.0, "{before:?} -> {after:?}");
+    }
+
+    #[test]
+    fn tabs() {
+        let dir = std::env::temp_dir().join(format!("ochre-tabs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("a.pdf"), dir.join("b.pdf"));
+        text_pdf(&a);
+        reading_pdf(&b);
+
+        let ctx = egui::Context::default();
+        let app = App::new(&ctx, [a.clone(), b.clone()]);
+        if app.worker.is_none() {
+            eprintln!("pdfium not available, skipping: {:?}", app.worker_error);
+            return;
+        }
+        let mut h = Harness { ctx, app, t: 0.0, mods: Modifiers::NONE };
+        let name = |h: &Harness| h.doc().name();
+        let loaded = |a: &App| a.doc.as_ref().is_some_and(|d| !d.pages.is_empty());
+        // Both files open in tabs; the last one is active.
+        assert_eq!(h.app.tabs.len(), 2);
+        assert_eq!((h.app.active, name(&h).as_str()), (1, "b.pdf"));
+        h.wait_until("b loads", loaded);
+        assert_eq!(h.doc().pages.len(), 6);
+        assert_eq!(h.doc().outline.len(), 3);
+
+        // Ctrl+Shift+Tab goes to the previous tab, which loads when shown.
+        h.key(Key::Tab, Modifiers::CTRL | Modifiers::SHIFT);
+        assert_eq!((h.app.active, name(&h).as_str()), (0, "a.pdf"));
+        h.wait_until("a loads", loaded);
+        h.wait_until("a renders", |a| !a.tex.is_empty());
+        assert_eq!(h.doc().pages.len(), 3);
+        assert!(h.doc().outline.is_empty());
+
+        // Each tab keeps its own state: annotations, selection, zoom.
+        h.app.set_tool(Tool::Shape(ShapeKind::Rect));
+        h.drag(&[h.at(100.0, 300.0), h.at(150.0, 325.0), h.at(200.0, 350.0)]);
+        let rect = h.doc().annots[0].id.clone();
+        h.app.set_tool(Tool::Select);
+        h.click(h.at(100.0, 325.0));
+        assert_eq!(h.app.selection, Some(Selection::Ours(rect.clone())));
+        h.app.view.zoom_by(1.25);
+        h.frame(vec![]);
+        let zoom_a = h.app.view.zoom;
+        assert!(h.doc().is_dirty());
+
+        h.key(Key::Tab, Modifiers::CTRL);
+        assert_eq!(name(&h), "b.pdf");
+        h.frame(vec![]);
+        assert!(h.doc().annots.is_empty() && h.app.selection.is_none());
+        assert_ne!(h.app.view.zoom, zoom_a);
+
+        // Opening a file that's already open switches to its tab.
+        h.app.request_open(Some(a.clone()));
+        assert_eq!((h.app.tabs.len(), h.app.active), (2, 0));
+        assert_eq!(h.app.selection, Some(Selection::Ours(rect)));
+        assert_eq!(h.app.view.zoom, zoom_a);
+        h.frame(vec![]);
+        h.wait_until("a renders again", |a| !a.tex.is_empty());
+
+        // Closing a tab with unsaved changes asks first; Esc cancels.
+        h.key(Key::W, Modifiers::COMMAND);
+        assert!(h.app.pending.is_some());
+        h.key(Key::Escape, Modifiers::NONE);
+        assert!(h.app.pending.is_none());
+        assert_eq!(h.app.tabs.len(), 2);
+        // Don't save: the tab closes and its neighbour becomes active.
+        h.app.pending = None;
+        h.app.close_active_tab();
+        assert_eq!((h.app.tabs.len(), h.app.active, name(&h).as_str()), (1, 0, "b.pdf"));
+        h.frame(vec![]);
+        h.wait_until("b renders", |a| !a.tex.is_empty());
+
+        // Closing the last tab goes back to the welcome screen.
+        h.key(Key::W, Modifiers::COMMAND);
+        assert!(h.app.doc.is_none() && h.app.tabs.is_empty());
+        h.frame(vec![]);
+    }
+
+    #[test]
+    fn rotate_restyle_clipboard_and_undo_after_save() {
+        let dir = std::env::temp_dir().join(format!("ochre-edit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("edit.pdf");
+        text_pdf(&path);
+        let ctx = egui::Context::default();
+        let app = App::new(&ctx, Some(path.clone()));
+        if app.worker.is_none() {
+            eprintln!("pdfium not available, skipping: {:?}", app.worker_error);
+            return;
+        }
+        let mut h = Harness { ctx, app, t: 0.0, mods: Modifiers::NONE };
+        h.wait_until("pages", |a| a.doc.as_ref().is_some_and(|d| !d.pages.is_empty()));
+        h.frame(vec![]);
+        h.app.set_tool(Tool::Shape(ShapeKind::Rect));
+        h.drag(&[h.at(100.0, 300.0), h.at(150.0, 325.0), h.at(200.0, 350.0)]);
+        h.app.set_tool(Tool::Pen);
+        h.drag(&(0..30).map(|i| h.at(300.0 + i as f32 * 3.0, 200.0)).collect::<Vec<_>>());
+        let (rect, ink) = (h.doc().annots[0].id.clone(), h.doc().annots[1].id.clone());
+        let get = |h: &Harness, id: &str| h.doc().get(id).unwrap().clone();
+
+        // Rotate the rectangle a quarter turn clockwise with the rotate handle (Shift snaps).
+        h.app.set_tool(Tool::Select);
+        h.app.select(Some(Selection::Ours(rect.clone())));
+        h.frame(vec![]);
+        let handle = h.app.handles(&get(&h, &rect)).into_iter().find(|x| x.0 == Handle::Rotate).unwrap().1;
+        let right_of_center = h.at(240.0, 325.0);
+        h.mods = Modifiers::SHIFT;
+        h.drag(&[handle, h.at(200.0, 380.0), right_of_center + vec2(0.0, 3.0)]);
+        h.mods = Modifiers::NONE;
+        let r = get(&h, &rect);
+        assert!((r.angle + std::f32::consts::FRAC_PI_2).abs() < 1e-4, "angle {}", r.angle);
+        let [x0, y0, x1, y1] = geometry::bounds(&r);
+        // Now 50 wide and 100 tall about the same center, plus the 2 pt stroke padding.
+        let pad = r.style.width / 2.0 + 1.0;
+        let expect = [125.0 - pad, 275.0 - pad, 175.0 + pad, 375.0 + pad];
+        assert!([x0, y0, x1, y1].iter().zip(expect).all(|(v, e)| (v - e).abs() < 0.5), "{:?}", [x0, y0, x1, y1]);
+        // It's hit where it now is, not where it was.
+        assert_eq!(geometry::distance(&r, Pt::new(150.0, 375.0)), 0.0);
+        assert!(geometry::distance(&r, Pt::new(200.0, 325.0)) > 10.0);
+        // A rotated box is resized along its own sides.
+        let corners = h.app.handles(&r);
+        let (_, c0) = corners.iter().find(|x| x.0 == Handle::BoxCorner(0)).copied().unwrap();
+        // Corner 0 is now at the top left on screen; dragging it up and left grows the box.
+        h.drag(&[c0, c0 + vec2(-5.0, -10.0), c0 + vec2(-10.0, -20.0)]);
+        let grown = get(&h, &rect);
+        let Kind::Shape { a, b, .. } = grown.kind else { panic!() };
+        assert!((b.x - a.x).abs() > 105.0, "long side grew: {a:?} {b:?}");
+        assert_eq!(grown.angle, r.angle);
+        h.key(Key::Z, Modifiers::COMMAND);
+
+        // A group's color, width and opacity change together, in one undo step.
+        let before = (get(&h, &rect), get(&h, &ink));
+        h.app.select_ids(vec![rect.clone(), ink.clone()]);
+        let g = h.app.group_style().unwrap();
+        assert_eq!((g.count, g.width_label), (2, Some("Width")));
+        let mut s = g.style;
+        s.color = [0.9, 0.1, 0.1];
+        h.app.apply_style(s);
+        s.width = 6.0;
+        h.app.apply_style(s);
+        s.opacity = 0.5;
+        h.app.apply_style(s);
+        for id in [&rect, &ink] {
+            let st = get(&h, id).style;
+            assert_eq!((st.color, st.width, st.opacity), ([0.9, 0.1, 0.1], 6.0, 0.5));
+        }
+        h.key(Key::Z, Modifiers::COMMAND);
+        assert_eq!((get(&h, &rect), get(&h, &ink)), before);
+
+        // Copy and paste: each paste lands a little further along; Ctrl+D duplicates.
+        h.app.select(Some(Selection::Ours(rect.clone())));
+        let (clip, n) = h.app.clip_text().unwrap();
+        assert_eq!(n, 1);
+        let left = |a: &Annotation| match a.kind {
+            Kind::Shape { a, .. } => a.x,
+            _ => panic!(),
+        };
+        let x = left(&get(&h, &rect));
+        for k in 1..=2 {
+            h.frame(vec![Event::Paste(clip.clone())]);
+            let pasted = h.doc().annots.last().unwrap().clone();
+            assert_ne!(pasted.id, rect);
+            assert!((left(&pasted) - x - 12.0 * k as f32).abs() < 1e-3);
+            assert_eq!(h.app.selection, Some(Selection::Ours(pasted.id.clone())));
+        }
+        h.key(Key::D, Modifiers::COMMAND);
+        assert!((left(h.doc().annots.last().unwrap()) - x - 36.0).abs() < 1e-3);
+        assert_eq!(h.doc().annots.len(), 5);
+        // Cut removes it.
+        h.frame(vec![Event::Cut]);
+        assert_eq!(h.doc().annots.len(), 4);
+
+        // Arrow keys nudge (Shift: 10); a quick run of nudges is one undo step.
+        h.app.select(Some(Selection::Ours(rect.clone())));
+        let start = get(&h, &rect);
+        for _ in 0..3 {
+            h.key(Key::ArrowRight, Modifiers::NONE);
+        }
+        h.key(Key::ArrowDown, Modifiers::SHIFT);
+        let Kind::Shape { a: moved, .. } = get(&h, &rect).kind else { panic!() };
+        let Kind::Shape { a: orig, .. } = start.kind else { panic!() };
+        assert!((moved.x - orig.x - 3.0).abs() < 1e-3 && (moved.y - orig.y + 10.0).abs() < 1e-3, "{orig:?} -> {moved:?}");
+        h.key(Key::Z, Modifiers::COMMAND);
+        assert_eq!(get(&h, &rect), start);
+
+        // Rotate again and save: the angle survives, written as a polygon; and undo
+        // still works after saving.
+        let rotated = get(&h, &rect).rotated(get(&h, &rect).center(), 0.5);
+        h.app.exec(vec![Cmd::Modify { before: get(&h, &rect), after: rotated.clone() }]);
+        let ctx = h.ctx.clone();
+        assert!(h.app.save(&ctx, false));
+        assert_eq!(get(&h, &rect), rotated);
+        let d = lopdf::Document::load(&path).unwrap();
+        assert!(d.objects.values().filter_map(|o| o.as_dict().ok()).any(|d| {
+            d.get(b"Subtype").and_then(|s| s.as_name()).ok() == Some(b"Polygon")
+        }));
+        assert!(h.doc().can_undo(), "history kept after saving");
+        h.key(Key::Z, Modifiers::COMMAND);
+        assert_eq!(get(&h, &rect).angle, start.angle);
+        assert!(h.doc().is_dirty());
+        h.wait_until("reload after save", |a| a.sent_generation == a.doc.as_ref().unwrap().generation);
+        h.frame(vec![]);
+    }
+
+    #[test]
+    fn file_dialogs_dont_block_the_window() {
+        use crate::app::FileDialog;
+        let dir = std::env::temp_dir().join(format!("ochre-dialog-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b, copy) = (dir.join("a.pdf"), dir.join("b.pdf"), dir.join("a-copy.pdf"));
+        text_pdf(&a);
+        reading_pdf(&b);
+        let ctx = egui::Context::default();
+        let app = App::new(&ctx, Some(a.clone()));
+        if app.worker.is_none() {
+            eprintln!("pdfium not available, skipping: {:?}", app.worker_error);
+            return;
+        }
+        let mut h = Harness { ctx, app, t: 0.0, mods: Modifiers::NONE };
+        h.wait_until("pages", |a| a.doc.as_ref().is_some_and(|d| !d.pages.is_empty()));
+
+        // A dialog that takes a while to answer: frames keep coming meanwhile.
+        let picked = b.clone();
+        h.app.show_dialog(FileDialog::Open, move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            vec![picked]
+        });
+        let start = std::time::Instant::now();
+        h.frame(vec![]);
+        assert!(start.elapsed() < std::time::Duration::from_millis(100), "a frame didn't wait for the dialog");
+        assert_eq!(h.app.tabs.len(), 1);
+        h.wait_until("the picked file opens", |a| a.tabs.len() == 2);
+        assert_eq!(h.doc().name(), "b.pdf");
+
+        // Save As for a.pdf, while b.pdf's tab is active when the answer comes.
+        h.app.switch_tab(0);
+        h.app.set_tool(Tool::Pen);
+        h.drag(&[h.at(100.0, 500.0), h.at(150.0, 520.0), h.at(200.0, 500.0)]);
+        let target = copy.clone();
+        h.app.show_dialog(FileDialog::SaveAs(a.clone()), move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            vec![target]
+        });
+        h.app.switch_tab(1);
+        h.wait_until("saved as", |a| !a.dialog_open() && a.doc.as_ref().is_some_and(|d| d.path == copy));
+        assert_eq!(Doc::open(&copy).unwrap().annots.len(), 1);
+        // Cancelling (no file picked) does nothing.
+        h.app.show_dialog(FileDialog::Open, Vec::new);
+        h.wait_until("cancelled", |a| !a.dialog_open());
+        assert_eq!(h.app.tabs.len(), 2);
+    }
+
+    #[test]
+    fn box_selection() {
+        let dir = std::env::temp_dir().join(format!("ochre-box-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("box.pdf");
+        text_pdf(&path);
+        let ctx = egui::Context::default();
+        let app = App::new(&ctx, Some(path));
+        if app.worker.is_none() {
+            eprintln!("pdfium not available, skipping: {:?}", app.worker_error);
+            return;
+        }
+        let mut h = Harness { ctx, app, t: 0.0, mods: Modifiers::NONE };
+        h.wait_until("pages", |a| a.doc.as_ref().is_some_and(|d| !d.pages.is_empty()));
+        h.frame(vec![]);
+
+        // Three rectangles, and a highlight on the first text line.
+        h.app.set_tool(Tool::Shape(ShapeKind::Rect));
+        for (x, y) in [(100.0, 300.0), (200.0, 300.0), (100.0, 150.0)] {
+            h.drag(&[h.at(x, y), h.at(x + 25.0, y + 20.0), h.at(x + 50.0, y + 40.0)]);
+        }
+        h.app.set_tool(Tool::Markup(MarkupKind::Highlight));
+        h.frame(vec![Event::PointerMoved(h.at(80.0, 705.0))]);
+        h.wait_until("text chars", |a| a.text_chars.contains_key(&0));
+        h.drag(&[h.at(73.0, 705.0), h.at(200.0, 705.0)]);
+        let ids: Vec<String> = h.doc().annots.iter().map(|a| a.id.clone()).collect();
+        assert_eq!(ids.len(), 4);
+        let original = h.doc().annots.clone();
+
+        // A box from empty space catches what it touches.
+        h.app.set_tool(Tool::Select);
+        h.drag(&[h.at(80.0, 360.0), h.at(150.0, 320.0), h.at(220.0, 320.0)]);
+        assert_eq!(h.app.selection, Some(Selection::Many(vec![ids[0].clone(), ids[1].clone()])));
+        assert!(h.app.view.annot_rect.is_some(), "group outline and action bar");
+
+        // Dragging one of them moves both, as one undo step.
+        h.drag(&[h.at(100.0, 320.0), h.at(110.0, 320.0), h.at(120.0, 320.0)]);
+        let left = |h: &Harness, i: usize| match h.doc().annots[i].kind {
+            Kind::Shape { a, .. } => a.x,
+            _ => panic!(),
+        };
+        assert!((left(&h, 0) - 120.0).abs() < 1.0 && (left(&h, 1) - 220.0).abs() < 1.0);
+        assert!((left(&h, 2) - 100.0).abs() < 1e-3, "unselected stays");
+        h.key(Key::Z, Modifiers::COMMAND);
+        assert_eq!(h.doc().annots, original);
+
+        // Shift+click adds the third, and takes it out again.
+        h.mods = Modifiers::SHIFT;
+        h.click(h.at(100.0, 170.0));
+        assert_eq!(h.app.selected_ids(), [ids[0].clone(), ids[1].clone(), ids[2].clone()]);
+        h.click(h.at(100.0, 170.0));
+        assert_eq!(h.app.selected_ids().len(), 2);
+        // Shift+drag adds a box's catch to the selection, even starting over text.
+        h.drag(&[h.at(90.0, 710.0), h.at(95.0, 700.0), h.at(100.0, 700.0)]);
+        assert_eq!(h.app.selected_ids(), [ids[0].clone(), ids[1].clone(), ids[3].clone()]);
+        h.mods = Modifiers::NONE;
+
+        // Without Shift, dragging over text still selects text.
+        h.drag(&[h.at(73.0, 685.0), h.at(150.0, 685.0)]);
+        assert!(h.app.text_sel.is_some());
+        assert_eq!(h.app.selection, None);
+
+        // Ctrl+A selects everything on the page; Delete removes it all, one undo brings it back.
+        h.key(Key::A, Modifiers::COMMAND);
+        assert_eq!(h.app.selected_ids(), ids);
+        h.key(Key::Delete, Modifiers::NONE);
+        assert!(h.doc().annots.is_empty());
+        h.key(Key::Z, Modifiers::COMMAND);
+        assert_eq!(h.doc().annots, original);
+
+        // A click on empty space clears the selection.
+        h.key(Key::A, Modifiers::COMMAND);
+        h.click(h.at(450.0, 250.0));
+        assert_eq!(h.app.selection, None);
+    }
+
     #[test]
     fn tools_end_to_end() {
         let dir = std::env::temp_dir().join(format!("ochre-ui-{}", std::process::id()));
@@ -1703,7 +2531,7 @@ mod tests {
         let ctx = egui::Context::default();
         let app = App::new(&ctx, Some(path.clone()));
         if app.worker.is_none() {
-            eprintln!("pdfium not available, skipping");
+            eprintln!("pdfium not available, skipping: {:?}", app.worker_error);
             return;
         }
         let mut h = Harness { ctx, app, t: 0.0, mods: Modifiers::NONE };
@@ -1971,7 +2799,10 @@ mod tests {
         h.app.select(Some(Selection::Ours(arrow.id.clone())));
         h.frame(vec![]);
         let handles = h.app.handles(&arrow);
-        assert_eq!(handles.iter().map(|x| x.0).collect::<Vec<_>>(), [Handle::Endpoint(0), Handle::Endpoint(1)]);
+        assert_eq!(
+            handles.iter().map(|x| x.0).collect::<Vec<_>>(),
+            [Handle::Endpoint(0), Handle::Endpoint(1), Handle::Rotate]
+        );
         h.drag(&[handles[1].1, h.at(400.0, 230.0), h.at(400.0, 200.0)]);
         let Kind::Shape { a, b, .. } = h.doc().get(&arrow.id).unwrap().kind else { panic!() };
         assert!(a.dist(Pt::new(300.0, 250.0)) < 1.0 && b.dist(Pt::new(400.0, 200.0)) < 1.0, "{a:?} {b:?}");
@@ -1986,3 +2817,4 @@ mod tests {
         h.frame(vec![]);
     }
 }
+

@@ -45,6 +45,14 @@ impl Pt {
     pub fn lerp(self, o: Pt, t: f32) -> Pt {
         self.add(o.sub(self).scale(t))
     }
+    /// Rotated counter-clockwise (y up) by `angle` radians about the origin.
+    pub fn rotate(self, angle: f32) -> Pt {
+        let (s, c) = angle.sin_cos();
+        Pt::new(self.x * c - self.y * s, self.x * s + self.y * c)
+    }
+    pub fn rotate_about(self, center: Pt, angle: f32) -> Pt {
+        self.sub(center).rotate(angle).add(center)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -114,11 +122,20 @@ pub struct Annotation {
     /// Comment attached to the annotation (written as `/Contents`). Unused for text boxes.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub note: String,
+    /// Rotation (radians, counter-clockwise on screen) of a rectangle, ellipse, tick or
+    /// cross about the center of its box `a`-`b`. Other kinds are rotated by moving
+    /// their points instead, so it stays 0 for them.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub angle: f32,
+}
+
+fn is_zero(v: &f32) -> bool {
+    *v == 0.0
 }
 
 impl Annotation {
     pub fn new(page: usize, style: Style, kind: Kind) -> Self {
-        Self { id: new_id(), page, style, kind, note: String::new() }
+        Self { id: new_id(), page, style, kind, note: String::new(), angle: 0.0 }
     }
 
     /// Applies `f` to every point. Direction vectors (a text box's `right`/`down`) are kept.
@@ -137,6 +154,48 @@ impl Annotation {
 
     pub fn translate(&mut self, d: Pt) {
         self.map_points(|p| p.add(d));
+    }
+
+    /// Whether this is a box shape that rotates with [`Annotation::angle`].
+    pub fn is_box(&self) -> bool {
+        matches!(
+            self.kind,
+            Kind::Shape { shape: ShapeKind::Rect | ShapeKind::Ellipse | ShapeKind::Check | ShapeKind::Cross, .. }
+        )
+    }
+
+    /// Center of rotation: the middle of a box shape's box, else of the bounds.
+    pub fn center(&self) -> Pt {
+        match &self.kind {
+            Kind::Shape { a, b, .. } => a.lerp(*b, 0.5),
+            _ => {
+                let [x0, y0, x1, y1] = crate::annot::geometry::bounds(self);
+                Pt::new((x0 + x1) / 2.0, (y0 + y1) / 2.0)
+            }
+        }
+    }
+
+    /// Rotated by `delta` radians about `c`. Box shapes change their angle; other
+    /// kinds have their points (and a text box its direction) rotated. Text markup
+    /// follows the page text and isn't rotated.
+    pub fn rotated(&self, c: Pt, delta: f32) -> Annotation {
+        let mut out = self.clone();
+        if matches!(self.kind, Kind::Markup { .. }) {
+            return out;
+        }
+        if self.is_box() {
+            // The box keeps its shape; its center moves around `c` and it turns.
+            let center = self.center();
+            out.translate(center.rotate_about(c, delta).sub(center));
+            out.angle = self.angle + delta;
+        } else {
+            out.map_points(|p| p.rotate_about(c, delta));
+        }
+        if let Kind::Text { right, down, .. } = &mut out.kind {
+            *right = right.rotate(delta);
+            *down = down.rotate(delta);
+        }
+        out
     }
 
     /// Whether a note can be attached (text boxes are text already).
@@ -172,4 +231,11 @@ pub struct Foreign {
     pub selectable: bool,
     /// Its `/Contents` comment, shown read-only.
     pub note: Option<String>,
+    /// Its object number (and those of its popups), which stay the same across
+    /// our saves. None if it's written inline in the page's `/Annots` array.
+    pub obj: Option<(u32, u16)>,
+    pub popup_objs: Vec<(u32, u16)>,
+    /// Whether it's in the page's `/Annots` in the loaded file. A deleted one stays
+    /// known, detached, after saving, so undo can put it back.
+    pub attached: bool,
 }

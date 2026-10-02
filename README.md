@@ -18,12 +18,19 @@ A fast, lightweight PDF reader and annotator for Linux, written in Rust (egui + 
 - **Select**, move, resize, restyle and delete annotations, plus an eraser and undo/redo.
   - Drag a corner handle to resize (Shift keeps the proportions). Resizing a text box changes its font size.
   - Drag either end of a line or arrow.
+  - Rotate with the round handle above the selection (Shift snaps to 15°). Text markup follows the page text, so it doesn't rotate.
+  - Select several at once: drag a box from empty space (Shift+drag adds to the selection, and also works over text), Shift+click to add or remove one, or Ctrl+A for everything on the page. A group moves, restyles (color, width, opacity, fill) and deletes together.
+  - Copy, cut and paste annotations (also between tabs and Ochre windows), duplicate them with Ctrl+D, and nudge them with the arrow keys.
   - The Select tool also selects page text: drag, or double-click a word.
   - Copy selected text with Ctrl+C, or turn it into a highlight, underline or strike-out.
 - **Notes** on any annotation: select it and choose "Add note", press Enter, or double-click it.
   - Annotations with a note show a badge; hover over it to read the note.
   - Notes are saved as standard `/Contents` comments, so Acrobat, Okular and others show them too. Notes on other apps' annotations are shown read-only.
 - **Vim-style navigation** and `/` search (smartcase, n / N).
+- **Contents sidebar** (F9) showing the PDF's table of contents, with the section you're reading highlighted.
+- **Links** inside the document work with the Select and Hand tools. Web and email links open in your browser or mail app. Alt+← or the Back button returns to where you were.
+- **Tabs:** every file opens in its own tab, from the Open dialog, Recent files, drag and drop (several at once), or the command line (`ochre a.pdf b.pdf`). Opening a file that's already open switches to its tab. Each tab keeps its own zoom, position, selection and search.
+- **Remembers your place:** each file reopens at the page and zoom where you left it.
 - Zoom (fit width / fit page / Ctrl+wheel), recent files, and light and dark themes that follow the system.
 
 ## Annotations are standard PDF annotations
@@ -33,7 +40,7 @@ Saving writes regular `/Ink`, `/FreeText`, `/Square`, `/Circle`, `/Line`, `/High
 Annotations made by other software are preserved:
 
 - Saving appends an **incremental update**: the original file bytes are kept unchanged and only the changes are added after them.
-- Other apps' annotations are never rewritten. They can be removed only by selecting one and pressing Delete, and that deletion can be undone.
+- Other apps' annotations are never rewritten, and saving or undoing never removes them. They can be removed only by selecting one and pressing Delete, and that deletion can be undone, even after saving (the next save puts it back).
 - Ochre's annotations are tagged with a `/NM` starting with `ochre-` (older ones with `inkpdf-`). If another app later edits one of them, it's treated as that app's annotation and left alone.
 
 ## Install
@@ -102,10 +109,19 @@ Vim-style navigation works whenever you're not typing in a text field.
 | Double-click an annotation, or Enter (Select tool) | Add or edit its note |
 | Ctrl+Enter, Esc | Finish the note |
 | Shift while resizing | Keep proportions / 45° line ends |
+| Drag on empty space, Shift+drag, Shift+click (Select tool) | Box-select, add to selection, add/remove one |
+| Ctrl+A (Select tool) | Select every annotation on the page |
+| Ctrl+C / Ctrl+X / Ctrl+V | Copy / cut / paste annotations (Ctrl+C copies page text when text is selected) |
+| Ctrl+D (with annotations selected) | Duplicate them (otherwise half a page down) |
+| Arrow keys, Shift+arrows (with annotations selected) | Nudge 1 pt / 10 pt |
 | Delete | Delete selection |
 | Ctrl+Z, Ctrl+Shift+Z / Ctrl+Y | Undo, redo |
 | Ctrl+S, Ctrl+Shift+S | Save, save as |
 | Ctrl+O, Ctrl+F | Open, search (keeps the last query) |
+| F9 | Show or hide the contents sidebar |
+| Ctrl+Tab / Ctrl+Shift+Tab, Ctrl+PageDown / Ctrl+PageUp | Next / previous tab |
+| Ctrl+W, middle-click a tab | Close the tab |
+| Alt+←, mouse back button | Back (after following a link or a contents entry) |
 | Ctrl+wheel, Ctrl+= / Ctrl+-, Ctrl+0 | Zoom, fit width |
 | PageUp / PageDown / Home / End | Scroll |
 
@@ -135,7 +151,6 @@ pdftoppm -png /tmp/out/annotated.pdf /tmp/out/poppler   # how Okular renders it
 
 - Password-protected or encrypted PDFs open read-only (no annotating).
 - Text boxes use the standard Helvetica font in the PDF. Characters outside Latin-1 display in Ochre but appear as `?` in other viewers.
-- Undo history is cleared after saving.
 
 ## License
 

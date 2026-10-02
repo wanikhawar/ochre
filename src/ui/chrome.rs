@@ -13,7 +13,11 @@ use super::theme::{self, ACCENT, WARN};
 use crate::annot::model::{MarkupKind, ShapeKind};
 use crate::app::{App, PALETTE, Selection, Tool, rgb};
 use crate::doc::Doc;
+use crate::pdf::worker::Target;
 use crate::viewer::{Fit, Gesture};
+
+/// Vertical padding of the app bar; tabs extend over it to fill the bar's height.
+const APP_BAR_MARGIN_Y: f32 = 3.0;
 
 const SHAPES: [ShapeKind; 6] =
     [ShapeKind::Check, ShapeKind::Cross, ShapeKind::Rect, ShapeKind::Ellipse, ShapeKind::Line, ShapeKind::Arrow];
@@ -88,7 +92,7 @@ impl App {
         let ctx = ui.ctx().clone();
         let p = theme::current(&ctx);
         egui::Panel::top("appbar")
-            .frame(egui::Frame::new().fill(p.bar).inner_margin(egui::Margin::symmetric(6, 3)))
+            .frame(egui::Frame::new().fill(p.bar).inner_margin(egui::Margin::symmetric(6, APP_BAR_MARGIN_Y as i8)))
             .show(ui, |ui| {
                 let bar = ui.max_rect();
                 let mut left_end = bar.left();
@@ -109,6 +113,12 @@ impl App {
                     }
                     if icon_button(ui, ph::FILE_ARROW_DOWN, "Save as… (Ctrl+Shift+S)", has_doc, false, 28.0).clicked() {
                         self.save(&ctx, true);
+                    }
+                    ui.add_space(4.0);
+                    ui.separator();
+                    let shown = has_doc && self.cfg.show_outline;
+                    if icon_button(ui, ph::SIDEBAR_SIMPLE, "Contents (F9)", has_doc, shown, 28.0).clicked() {
+                        self.cfg.show_outline = !self.cfg.show_outline;
                     }
                     left_end = ui.min_rect().right();
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -132,24 +142,135 @@ impl App {
                         right_start = ui.min_rect().left();
                     });
                 });
-                // Document name, centered in the free space between the button groups.
-                if let Some(doc) = &self.doc {
-                    let room = right_start - left_end - 32.0;
-                    if room > 60.0 {
-                        let mut job = egui::text::LayoutJob::default();
-                        job.append(&doc.name(), 0.0, egui::TextFormat::simple(FontId::proportional(14.0), p.text));
-                        if doc.is_dirty() {
-                            job.append("  •  Edited", 0.0, egui::TextFormat::simple(FontId::proportional(12.5), p.weak));
-                        }
-                        job.wrap = egui::text::TextWrapping::truncate_at_width(room);
-                        let galley = ui.painter().layout_job(job);
-                        let w = galley.size().x;
-                        let cx = bar.center().x.clamp(left_end + 16.0 + w / 2.0, right_start - 16.0 - w / 2.0);
-                        let pos = pos2(cx - w / 2.0, bar.center().y - galley.size().y / 2.0);
-                        ui.painter().galley(pos, galley, p.text);
+                // Tabs fill the space between the button groups, top to bottom of the bar
+                // (past the frame's margin).
+                if !self.tabs.is_empty() {
+                    let full = bar.expand2(vec2(0.0, APP_BAR_MARGIN_Y));
+                    let strip = Rect::from_x_y_ranges(left_end + 10.0..=right_start - 10.0, full.y_range());
+                    if strip.width() > 60.0 {
+                        self.tab_strip(ui, strip);
                     }
                 }
             });
+    }
+
+    /// One flat tab per open file, filling `strip`: click to switch, × or
+    /// middle-click to close. The active tab is lighter, with a glowing accent bar
+    /// along its top; a dot marks unsaved changes. Scrolls with the wheel when
+    /// the tabs don't fit.
+    fn tab_strip(&mut self, ui: &mut egui::Ui, strip: Rect) {
+        let p = theme::current(ui.ctx());
+        let n = self.tabs.len();
+        let width = (strip.width() / n as f32).clamp(120.0, 220.0);
+        let overflow = (width * n as f32 - strip.width()).max(0.0);
+        if self.reveal_tab {
+            // Bring the active tab into view.
+            let (l, r) = (self.active as f32 * width, (self.active + 1) as f32 * width);
+            self.tab_scroll = self.tab_scroll.min(l).max(r - strip.width());
+            self.reveal_tab = false;
+        }
+        if ui.rect_contains_pointer(strip) {
+            let d = ui.input(|i| i.smooth_scroll_delta);
+            self.tab_scroll -= if d.x != 0.0 { d.x } else { d.y };
+        }
+        self.tab_scroll = self.tab_scroll.clamp(0.0, overflow);
+
+        let painter = ui.painter().with_clip_rect(strip);
+        let mut switch_to = None;
+        let mut close = None;
+        for i in 0..n {
+            let Some(doc) = self.tab_doc(i) else { continue };
+            let (name, dirty, path) = (doc.name(), doc.is_dirty(), doc.path.display().to_string());
+            let active = i == self.active;
+            let rect = Rect::from_min_size(
+                pos2(strip.left() + i as f32 * width - self.tab_scroll, strip.top()),
+                vec2(width, strip.height()),
+            );
+            let visible = rect.intersect(strip);
+            if !visible.is_positive() {
+                continue;
+            }
+            let resp = ui.interact(visible, Id::new(("tab", i)), Sense::click());
+            let hovered = resp.hovered();
+            let close_rect = Rect::from_center_size(pos2(rect.right() - 16.0, rect.center().y), Vec2::splat(20.0));
+            let on_close = hovered && resp.hover_pos().is_some_and(|q| close_rect.contains(q));
+
+            if active {
+                painter.rect_filled(rect, 0.0, p.hover);
+                // Accent bar with a soft glow fading down into the tab.
+                let bar = Rect::from_min_size(rect.min, vec2(rect.width(), 2.5));
+                let glow = Rect::from_min_max(pos2(rect.left(), bar.bottom()), pos2(rect.right(), bar.bottom() + 10.0));
+                let mut mesh = egui::Mesh::default();
+                let (top, bottom) = (ACCENT.gamma_multiply(0.18), Color32::TRANSPARENT);
+                let base = mesh.vertices.len() as u32;
+                for (pos, color) in [
+                    (glow.left_top(), top),
+                    (glow.right_top(), top),
+                    (glow.right_bottom(), bottom),
+                    (glow.left_bottom(), bottom),
+                ] {
+                    mesh.colored_vertex(pos, color);
+                }
+                mesh.add_triangle(base, base + 1, base + 2);
+                mesh.add_triangle(base, base + 2, base + 3);
+                painter.add(mesh);
+                painter.rect_filled(bar, 0.0, ACCENT);
+            } else {
+                if hovered {
+                    painter.rect_filled(rect, 0.0, p.hover.gamma_multiply(0.6));
+                }
+                // Divider between two inactive tabs.
+                if i + 1 < n && i + 1 != self.active {
+                    let x = rect.right() - 0.5;
+                    painter.vline(x, rect.y_range().shrink(9.0), Stroke::new(1.0, p.border));
+                }
+            }
+
+            let text_color = if active { p.text } else { p.weak };
+            let clip = Rect::from_min_max(pos2(rect.left() + 12.0, rect.top()), pos2(close_rect.left() - 2.0, rect.bottom()));
+            let mut job = egui::text::LayoutJob::simple_singleline(name, FontId::proportional(13.0), text_color);
+            job.wrap = egui::text::TextWrapping::truncate_at_width(clip.width());
+            let galley = painter.layout_job(job);
+            let at = pos2(clip.left(), rect.center().y - galley.size().y / 2.0);
+            painter.with_clip_rect(clip.intersect(strip)).galley(at, galley, text_color);
+            // The close button; an unsaved tab shows a dot there until hovered.
+            if on_close {
+                painter.rect_filled(close_rect, 4.0, p.pressed);
+            }
+            if hovered || (active && !dirty) {
+                painter.text(close_rect.center(), Align2::CENTER_CENTER, ph::X, FontId::proportional(12.0), p.weak);
+            } else if dirty {
+                painter.circle_filled(close_rect.center(), 3.5, if active { ACCENT } else { p.weak });
+            }
+            let tip = if dirty { format!("{path}\nUnsaved changes") } else { path };
+            let resp = resp.on_hover_text(tip);
+            if resp.middle_clicked() || (resp.clicked() && on_close) {
+                close = Some(i);
+            } else if resp.clicked() {
+                switch_to = Some(i);
+            }
+        }
+        // Fade the edges when tabs are scrolled out of view.
+        for (edge, shown) in [(strip.left(), self.tab_scroll > 0.5), (strip.right(), self.tab_scroll < overflow - 0.5)] {
+            if shown && overflow > 0.0 {
+                let dir = if edge == strip.left() { 1.0 } else { -1.0 };
+                let fade = Rect::from_two_pos(pos2(edge, strip.top()), pos2(edge + dir * 16.0, strip.bottom()));
+                let mut mesh = egui::Mesh::default();
+                let (solid, clear) = (p.bar, p.bar.gamma_multiply(0.0));
+                let (l, r) = if dir > 0.0 { (solid, clear) } else { (clear, solid) };
+                for (pos, color) in [(fade.left_top(), l), (fade.right_top(), r), (fade.right_bottom(), r), (fade.left_bottom(), l)] {
+                    mesh.colored_vertex(pos, color);
+                }
+                mesh.add_triangle(0, 1, 2);
+                mesh.add_triangle(0, 2, 3);
+                painter.add(mesh);
+            }
+        }
+        if let Some(i) = close {
+            self.close_tab(i);
+        } else if let Some(i) = switch_to {
+            self.switch_tab(i);
+        }
     }
 
     fn recent_list(&mut self, ui: &mut egui::Ui, menu: bool) {
@@ -260,6 +381,135 @@ impl App {
             });
     }
 
+    // ------------------------------------------------------------ contents
+
+    /// Sidebar with the document's table of contents. The entry for the part being
+    /// read is highlighted; top-level entries start expanded.
+    pub fn outline_panel(&mut self, ui: &mut egui::Ui) {
+        let p = theme::current(ui.ctx());
+        let ctx = ui.ctx().clone();
+        egui::Panel::left("outline")
+            .resizable(true)
+            .default_size(260.0)
+            .size_range(160.0..=520.0)
+            .frame(egui::Frame::new().fill(p.bar).inner_margin(egui::Margin::symmetric(6, 8)))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("Contents").strong());
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if icon_button(ui, ph::X, "Close (F9)", true, false, 22.0).clicked() {
+                            self.cfg.show_outline = false;
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+                let Some(doc) = &self.doc else { return };
+                if doc.outline.is_empty() {
+                    ui.add_space(8.0);
+                    ui.vertical_centered(|ui| ui.label(weak(ui, "This PDF has no table of contents.")));
+                    return;
+                }
+                let items = doc.outline.clone();
+                let current = self.current_outline_item();
+                let mut clicked: Option<usize> = None;
+                let mut toggled: Option<usize> = None;
+                egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 1.0;
+                    // Entries below a collapsed one are skipped until the level comes back up.
+                    let mut hidden_below: Option<usize> = None;
+                    for (i, item) in items.iter().enumerate() {
+                        if hidden_below.is_some_and(|l| item.level > l) {
+                            continue;
+                        }
+                        hidden_below = None;
+                        let has_children = items.get(i + 1).is_some_and(|n| n.level > item.level);
+                        let open = has_children && ((item.level == 0) != self.outline_toggled.contains(&i));
+                        if has_children && !open {
+                            hidden_below = Some(item.level);
+                        }
+                        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::click());
+                        // A collapsed entry stands in for the current entry hidden inside it.
+                        let contains_current = current.is_some_and(|c| {
+                            c > i && items[i + 1..=c].iter().all(|n| n.level > item.level)
+                        });
+                        let active = current == Some(i) || (has_children && !open && contains_current);
+                        let bg = if active {
+                            p.accent_tint
+                        } else if resp.hovered() {
+                            p.hover
+                        } else {
+                            Color32::TRANSPARENT
+                        };
+                        ui.painter().rect_filled(rect, 5.0, bg);
+                        let x = rect.left() + 4.0 + item.level as f32 * 14.0;
+                        let caret = Rect::from_min_size(pos2(x, rect.top()), vec2(16.0, rect.height()));
+                        if has_children {
+                            let icon = if open { ph::CARET_DOWN } else { ph::CARET_RIGHT };
+                            ui.painter().text(caret.center(), Align2::CENTER_CENTER, icon, FontId::proportional(11.0), p.weak);
+                        }
+                        let text_x = caret.right() + 2.0;
+                        let page = match &item.target {
+                            Some(Target::Page { page, .. }) => format!("{}", page + 1),
+                            _ => String::new(),
+                        };
+                        let painter = ui.painter();
+                        let page_w = painter
+                            .text(rect.right_center() - vec2(6.0, 0.0), Align2::RIGHT_CENTER, &page, FontId::proportional(11.5), p.weak)
+                            .width();
+                        let title_clip = Rect::from_min_max(pos2(text_x, rect.top()), pos2(rect.right() - page_w - 12.0, rect.bottom()));
+                        let color = if active { ACCENT } else { p.text };
+                        let galley = painter.layout_no_wrap(item.title.clone(), FontId::proportional(13.0), color);
+                        let truncated = galley.size().x > title_clip.width();
+                        painter.with_clip_rect(title_clip).galley(
+                            pos2(text_x, rect.center().y - galley.size().y / 2.0),
+                            galley,
+                            color,
+                        );
+                        let resp = if truncated { resp.on_hover_text(&item.title) } else { resp };
+                        if resp.clicked() {
+                            let on_caret = resp.interact_pointer_pos().is_some_and(|q| caret.contains(q));
+                            if has_children && (on_caret || item.target.is_none()) {
+                                toggled = Some(i);
+                            } else {
+                                clicked = Some(i);
+                            }
+                        }
+                    }
+                });
+                if let Some(i) = toggled
+                    && !self.outline_toggled.remove(&i)
+                {
+                    self.outline_toggled.insert(i);
+                }
+                if let Some(t) = clicked.and_then(|i| items[i].target.clone()) {
+                    self.follow(&ctx, &t);
+                }
+            });
+    }
+
+    /// The outline entry for the part being read: the last one starting at or above
+    /// the top of the window.
+    pub(crate) fn current_outline_item(&self) -> Option<usize> {
+        let doc = self.doc.as_ref()?;
+        let (page, y) = self.view.position()?;
+        let here = (page, y + 40.0 / self.view.zoom);
+        doc.outline
+            .iter()
+            .enumerate()
+            .filter_map(|(i, item)| match &item.target {
+                Some(Target::Page { page, x, y }) => {
+                    let g = doc.pages.get(*page)?;
+                    let top = y.map_or(0.0, |y| g.to_display().apply(crate::annot::model::Pt::new(x.unwrap_or(g.bbox[0]), y)).y);
+                    Some((i, (*page, top)))
+                }
+                _ => None,
+            })
+            .filter(|(_, at)| at.0 < here.0 || (at.0 == here.0 && at.1 <= here.1))
+            .max_by(|a, b| a.1.0.cmp(&b.1.0).then(a.1.1.total_cmp(&b.1.1)).then(a.0.cmp(&b.0)))
+            .map(|(i, _)| i)
+    }
+
     // ------------------------------------------------------------ floating UI
 
     /// Pills and toast drawn over the page canvas.
@@ -345,6 +595,14 @@ impl App {
 
     /// Action bar of our selected annotation: note and delete.
     fn annot_actions(&mut self, ui: &mut egui::Ui) {
+        if let Some(Selection::Many(ids)) = &self.selection {
+            ui.label(RichText::new(format!("{} annotations", ids.len())).size(13.0));
+            ui.separator();
+            if icon_button(ui, ph::TRASH, "Delete all (Del)", true, false, 24.0).clicked() {
+                self.delete_selection();
+            }
+            return;
+        }
         let Some(Selection::Ours(id)) = self.selection.clone() else { return };
         let Some(a) = self.doc.as_ref().and_then(|d| d.get(&id)) else { return };
         if a.takes_note() {
@@ -516,10 +774,19 @@ impl App {
         let (mut style, sel_tool) = self.shown_style();
         let tool = sel_tool.unwrap_or(self.tool);
         let original = style;
+        let group = self.group_style();
 
         ui.horizontal(|ui| {
-            ui.label(RichText::new(tool_icon(tool)).size(15.0).color(ACCENT));
-            ui.label(RichText::new(tool.label()).strong());
+            match &group {
+                Some(g) => {
+                    ui.label(RichText::new(ph::SELECTION_ALL).size(15.0).color(ACCENT));
+                    ui.label(RichText::new(format!("{} annotations", g.count)).strong());
+                }
+                None => {
+                    ui.label(RichText::new(tool_icon(tool)).size(15.0).color(ACCENT));
+                    ui.label(RichText::new(tool.label()).strong());
+                }
+            }
             if sel_tool.is_some() {
                 ui.label(weak(ui, "· selected").small());
             }
@@ -535,7 +802,9 @@ impl App {
             ui.add_space(4.0);
             ui.separator();
         }
-        let fillable = matches!(tool, Tool::Shape(ShapeKind::Rect | ShapeKind::Ellipse));
+        let fillable = group.as_ref().map_or(matches!(tool, Tool::Shape(ShapeKind::Rect | ShapeKind::Ellipse)), |g| g.fillable);
+        let width_label = group.as_ref().map_or(tool.width_label(), |g| g.width_label);
+        let text_size = tool == Tool::Text || group.as_ref().is_some_and(|g| g.text_size);
         if fillable {
             ui.label(weak(ui, "Fill"));
             color::fill_presets(ui, &mut style.fill, style.color, &PALETTE);
@@ -550,10 +819,10 @@ impl App {
         w.inactive.bg_stroke = Stroke::new(1.0, p.border);
         w.hovered.bg_stroke = Stroke::new(1.0, p.weak);
         egui::Grid::new("tool-settings").num_columns(3).spacing(vec2(8.0, 6.0)).show(ui, |ui| {
-            if let Some(label) = tool.width_label() {
+            if let Some(label) = width_label {
                 let range = match tool {
-                    Tool::Text => 4.0..=144.0,
-                    Tool::Highlighter => 2.0..=60.0,
+                    _ if text_size => 4.0..=144.0,
+                    Tool::Highlighter if group.is_none() => 2.0..=60.0,
                     Tool::Eraser => 4.0..=80.0,
                     _ => 0.1..=40.0,
                 };
@@ -584,6 +853,13 @@ impl App {
     fn nav(&mut self, ui: &mut egui::Ui) {
         let Some(n) = self.doc.as_ref().map(|d| d.pages.len()) else { return };
         let cur = self.view.current_page + 1;
+        if let Some(&(page, _)) = self.view.back.last() {
+            let tip = format!("Back to page {} (Alt+←)", page + 1);
+            if icon_button(ui, ph::ARROW_BEND_UP_LEFT, &tip, true, false, 22.0).clicked() {
+                self.go_back();
+            }
+            ui.separator();
+        }
         if icon_button(ui, ph::CARET_LEFT, "Previous page", cur > 1, false, 22.0).clicked() {
             self.view.goto_page = Some(cur - 2);
         }

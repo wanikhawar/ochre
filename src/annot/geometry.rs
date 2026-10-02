@@ -213,9 +213,36 @@ pub fn text_corners(origin: Pt, right: Pt, down: Pt, text: &str, size: f32) -> [
     [origin, origin.add(r), origin.add(r).add(d), origin.add(d)]
 }
 
+/// Corners of a box shape's (rotated) box, in order around it.
+pub fn box_corners(a: &Annotation) -> [Pt; 4] {
+    let (p, q) = match a.kind {
+        Kind::Shape { a, b, .. } => (a, b),
+        _ => (Pt::default(), Pt::default()),
+    };
+    let c = p.lerp(q, 0.5);
+    [p, Pt::new(q.x, p.y), q, Pt::new(p.x, q.y)].map(|v| v.rotate_about(c, a.angle))
+}
+
+/// The strokes of a tick or cross, rotated with the annotation.
+pub fn mark_lines(a: &Annotation) -> Vec<Vec<Pt>> {
+    let Kind::Shape { shape, a: p, b: q } = a.kind else { return Vec::new() };
+    let c = p.lerp(q, 0.5);
+    mark_strokes(shape, p, q).into_iter().map(|l| l.into_iter().map(|v| v.rotate_about(c, a.angle)).collect()).collect()
+}
+
 /// Axis-aligned bounds `[x0, y0, x1, y1]` (user space) including stroke width.
 pub fn bounds(a: &Annotation) -> [f32; 4] {
     let pts: Vec<Pt> = match &a.kind {
+        Kind::Shape { shape: ShapeKind::Rect, .. } => box_corners(a).to_vec(),
+        Kind::Shape { shape: ShapeKind::Ellipse, a: p, b: q } => {
+            // Exact extent of the rotated ellipse.
+            let c = p.lerp(*q, 0.5);
+            let (rx, ry) = ((q.x - p.x).abs() / 2.0, (q.y - p.y).abs() / 2.0);
+            let (s, co) = a.angle.sin_cos();
+            let (hx, hy) = ((rx * co).hypot(ry * s), (rx * s).hypot(ry * co));
+            vec![Pt::new(c.x - hx, c.y - hy), Pt::new(c.x + hx, c.y + hy)]
+        }
+        Kind::Shape { shape: ShapeKind::Check | ShapeKind::Cross, .. } => mark_lines(a).concat(),
         Kind::Ink { curve, .. } => curve.clone(),
         Kind::Text { origin, right, down, text } => {
             text_corners(*origin, *right, *down, text, a.style.width).to_vec()
@@ -284,6 +311,12 @@ pub fn distance(a: &Annotation, p: Pt) -> f32 {
             } else {
                 dist_to_polyline(p, &[c[0], c[1], c[2], c[3], c[0]])
             }
+        }
+        Kind::Shape { a: s, b: e, .. } if a.angle != 0.0 && a.is_box() => {
+            // Measure in the shape's own (unrotated) frame.
+            let c = s.lerp(*e, 0.5);
+            let upright = Annotation { angle: 0.0, ..a.clone() };
+            distance(&upright, p.rotate_about(c, -a.angle))
         }
         Kind::Shape { shape, a: s, b: e } => {
             let filled = a.style.fill.is_some();

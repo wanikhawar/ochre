@@ -17,6 +17,8 @@ pub enum Req {
     Load { generation: u64, bytes: Arc<Vec<u8>>, hide: Vec<Vec<usize>> },
     Render { generation: u64, page: usize, scale: f32 },
     Text { generation: u64, page: usize },
+    /// Forget a loaded document (its tab was closed or it was reloaded).
+    Close { generation: u64 },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -26,45 +28,102 @@ pub struct TextChar {
     pub rect: [f32; 4],
 }
 
+/// Where a link or table-of-contents entry leads.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Target {
+    /// A page, optionally scrolled to a point (user space; either coordinate may be unknown).
+    Page { page: usize, x: Option<f32>, y: Option<f32> },
+    /// A web address or other URI.
+    Uri(String),
+}
+
+/// One entry of the document outline (table of contents), flattened depth-first.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OutlineItem {
+    pub title: String,
+    pub level: usize,
+    pub target: Option<Target>,
+}
+
+/// A link area on a page.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Link {
+    /// `[x0, y0, x1, y1]` in user space.
+    pub rect: [f32; 4],
+    pub target: Target,
+}
+
 pub enum Resp {
-    Loaded { generation: u64, pages: Vec<PageGeom> },
+    Loaded { generation: u64, pages: Vec<PageGeom>, outline: Vec<OutlineItem>, links: Vec<Vec<Link>> },
     Failed { generation: u64, message: String },
     Rendered { generation: u64, page: usize, scale: f32, image: egui::ColorImage },
     Text { generation: u64, page: usize, chars: Vec<TextChar> },
 }
 
+impl Resp {
+    pub fn generation(&self) -> u64 {
+        match self {
+            Resp::Loaded { generation, .. }
+            | Resp::Failed { generation, .. }
+            | Resp::Rendered { generation, .. }
+            | Resp::Text { generation, .. } => *generation,
+        }
+    }
+}
+
+/// A request, with where its answer goes.
+struct Job {
+    req: Req,
+    reply: Sender<Resp>,
+    ctx: egui::Context,
+}
+
+/// The one pdfium thread of the process (pdfium-render can bind the library only
+/// once per process), started on first use. Its documents are keyed by generation,
+/// which is unique across the process, so several clients can share it.
+static SERVICE: std::sync::OnceLock<Result<Sender<Job>, String>> = std::sync::OnceLock::new();
+
+/// A client of the pdfium thread with its own answer channel.
 pub struct Worker {
-    tx: Sender<Req>,
+    tx: Sender<Job>,
+    reply: Sender<Resp>,
     pub rx: Receiver<Resp>,
+    ctx: egui::Context,
 }
 
 impl Worker {
     pub fn send(&self, req: Req) {
-        let _ = self.tx.send(req);
+        let _ = self.tx.send(Job { req, reply: self.reply.clone(), ctx: self.ctx.clone() });
     }
 
     pub fn spawn(ctx: egui::Context) -> Result<Worker> {
-        let (tx, req_rx) = unbounded::<Req>();
-        let (resp_tx, rx) = unbounded::<Resp>();
-        let (init_tx, init_rx) = crossbeam_channel::bounded::<Result<(), String>>(1);
-        std::thread::Builder::new()
-            .name("pdfium".into())
-            .spawn(move || {
-                let pdfium = match bind_pdfium() {
-                    Ok(p) => {
-                        let _ = init_tx.send(Ok(()));
-                        p
-                    }
-                    Err(e) => {
-                        let _ = init_tx.send(Err(e.to_string()));
-                        return;
-                    }
-                };
-                run(&pdfium, req_rx, resp_tx, ctx);
-            })?;
-        init_rx.recv()?.map_err(|e| anyhow!(e))?;
-        Ok(Worker { tx, rx })
+        let tx = SERVICE.get_or_init(start_service).clone().map_err(|e| anyhow!(e))?;
+        let (reply, rx) = unbounded::<Resp>();
+        Ok(Worker { tx, reply, rx, ctx })
     }
+}
+
+fn start_service() -> Result<Sender<Job>, String> {
+    let (tx, jobs) = unbounded::<Job>();
+    let (init_tx, init_rx) = crossbeam_channel::bounded::<Result<(), String>>(1);
+    std::thread::Builder::new()
+        .name("pdfium".into())
+        .spawn(move || {
+            let pdfium = match bind_pdfium() {
+                Ok(p) => {
+                    let _ = init_tx.send(Ok(()));
+                    p
+                }
+                Err(e) => {
+                    let _ = init_tx.send(Err(e.to_string()));
+                    return;
+                }
+            };
+            run(&pdfium, jobs);
+        })
+        .map_err(|e| e.to_string())?;
+    init_rx.recv().map_err(|e| e.to_string())??;
+    Ok(tx)
 }
 
 /// Looks for libpdfium in `$OCHRE_PDFIUM`, next to the executable (or in `lib/`
@@ -103,57 +162,73 @@ fn bind_pdfium() -> Result<Pdfium> {
     })
 }
 
-fn run(pdfium: &Pdfium, rx: Receiver<Req>, tx: Sender<Resp>, ctx: egui::Context) {
-    let mut doc: Option<(u64, PdfDocument<'_>)> = None;
-    let mut queue: std::collections::VecDeque<Req> = std::collections::VecDeque::new();
+/// Serves requests for any number of open documents (one per tab), keyed by generation.
+fn run(pdfium: &Pdfium, rx: Receiver<Job>) {
+    let mut docs: std::collections::HashMap<u64, PdfDocument<'_>> = std::collections::HashMap::new();
+    let mut queue: std::collections::VecDeque<Job> = std::collections::VecDeque::new();
     loop {
         // Take everything that's waiting, but block only when idle.
         if queue.is_empty() {
             match rx.recv() {
-                Ok(r) => queue.push_back(r),
+                Ok(j) => queue.push_back(j),
                 Err(_) => return,
             }
         }
         queue.extend(rx.try_iter());
-        // A newer Load makes everything before it obsolete.
-        if let Some(pos) = queue.iter().rposition(|r| matches!(r, Req::Load { .. })) {
-            queue.drain(..pos);
+        // Closing frees memory and makes queued work for that document moot.
+        let closed: Vec<u64> = queue
+            .iter()
+            .filter_map(|j| match j.req {
+                Req::Close { generation } => Some(generation),
+                _ => None,
+            })
+            .collect();
+        if !closed.is_empty() {
+            for g in &closed {
+                docs.remove(g);
+            }
+            queue.retain(|j| match &j.req {
+                Req::Load { generation, .. } | Req::Render { generation, .. } | Req::Text { generation, .. } => {
+                    !closed.contains(generation)
+                }
+                Req::Close { .. } => false,
+            });
         }
         // One job at a time, most urgent first: load, then the newest render
         // (the page in view), then text extraction for search/markup.
         let pick = queue
             .iter()
-            .position(|r| matches!(r, Req::Load { .. }))
-            .or_else(|| queue.iter().rposition(|r| matches!(r, Req::Render { .. })))
+            .position(|j| matches!(j.req, Req::Load { .. }))
+            .or_else(|| queue.iter().rposition(|j| matches!(j.req, Req::Render { .. })))
             .unwrap_or(0);
-        let Some(req) = queue.remove(pick) else { continue };
+        let Some(Job { req, reply, ctx }) = queue.remove(pick) else { continue };
         let resp = match req {
-            Req::Load { generation, bytes, hide } => {
-                doc = None;
-                match load(pdfium, &bytes, &hide) {
-                    Ok((d, pages)) => {
-                        doc = Some((generation, d));
-                        Resp::Loaded { generation, pages }
-                    }
-                    Err(e) => Resp::Failed { generation, message: e.to_string() },
+            Req::Load { generation, bytes, hide } => match load(pdfium, &bytes, &hide) {
+                Ok((d, pages)) => {
+                    let outline = outline(&d);
+                    let links = (0..pages.len()).map(|i| links(&d, i)).collect();
+                    docs.insert(generation, d);
+                    Resp::Loaded { generation, pages, outline, links }
                 }
-            }
+                Err(e) => Resp::Failed { generation, message: e.to_string() },
+            },
             Req::Render { generation, page, scale } => {
-                let Some((g, d)) = doc.as_ref().filter(|(g, _)| *g == generation) else { continue };
+                let Some(d) = docs.get(&generation) else { continue };
                 match render(d, page, scale) {
-                    Ok(image) => Resp::Rendered { generation: *g, page, scale, image },
+                    Ok(image) => Resp::Rendered { generation, page, scale, image },
                     Err(_) => continue,
                 }
             }
             Req::Text { generation, page } => {
-                let Some((g, d)) = doc.as_ref().filter(|(g, _)| *g == generation) else { continue };
-                Resp::Text { generation: *g, page, chars: text(d, page).unwrap_or_default() }
+                let Some(d) = docs.get(&generation) else { continue };
+                Resp::Text { generation, page, chars: text(d, page).unwrap_or_default() }
             }
+            Req::Close { .. } => continue,
         };
-        if tx.send(resp).is_err() {
-            return;
+        // A client that went away (e.g. a finished test) just doesn't get its answer.
+        if reply.send(resp).is_ok() {
+            ctx.request_repaint();
         }
-        ctx.request_repaint();
     }
 }
 
@@ -195,6 +270,61 @@ fn load<'a>(pdfium: &'a Pdfium, bytes: &[u8], hide: &[Vec<usize>]) -> Result<(Pd
     Ok((doc, pages))
 }
 
+fn dest_target(d: &PdfDestination) -> Option<Target> {
+    let page = d.page_index().ok()? as usize;
+    let (x, y) = match d.view_settings() {
+        Ok(PdfDestinationViewSettings::SpecificCoordinatesAndZoom(x, y, _)) => (x.map(|v| v.value), y.map(|v| v.value)),
+        Ok(PdfDestinationViewSettings::FitPageHorizontallyToWindow(y)) => (None, y.map(|v| v.value)),
+        Ok(PdfDestinationViewSettings::FitPageVerticallyToWindow(x)) => (x.map(|v| v.value), None),
+        Ok(PdfDestinationViewSettings::FitPageToRectangle(r)) => (Some(r.left().value), Some(r.top().value)),
+        _ => (None, None),
+    };
+    Some(Target::Page { page, x, y })
+}
+
+fn action_target(a: &PdfAction) -> Option<Target> {
+    match a {
+        PdfAction::LocalDestination(l) => dest_target(&l.destination().ok()?),
+        PdfAction::Uri(u) => u.uri().ok().filter(|s| !s.trim().is_empty()).map(Target::Uri),
+        _ => None,
+    }
+}
+
+/// The outline as a flat depth-first list. Guards against cyclic (broken) outlines.
+fn outline(doc: &PdfDocument) -> Vec<OutlineItem> {
+    const MAX_ITEMS: usize = 5000;
+    fn walk(b: Option<PdfBookmark>, level: usize, out: &mut Vec<OutlineItem>) {
+        let mut cur = b;
+        while let Some(b) = cur {
+            if out.len() >= MAX_ITEMS || level > 32 {
+                return;
+            }
+            let title = b.title().unwrap_or_default().split_whitespace().collect::<Vec<_>>().join(" ");
+            let target = b.destination().as_ref().and_then(dest_target).or_else(|| b.action().as_ref().and_then(action_target));
+            out.push(OutlineItem { title, level, target });
+            walk(b.first_child(), level + 1, out);
+            cur = b.next_sibling();
+        }
+    }
+    let mut out = Vec::new();
+    let bookmarks = doc.bookmarks();
+    walk(bookmarks.root(), 0, &mut out);
+    out
+}
+
+fn links(doc: &PdfDocument, page: usize) -> Vec<Link> {
+    let Ok(p) = doc.pages().get(page as PdfPageIndex) else { return Vec::new() };
+    p.links()
+        .iter()
+        .filter_map(|l| {
+            let target = l.destination().as_ref().and_then(dest_target).or_else(|| l.action().as_ref().and_then(action_target))?;
+            let r = l.rect().ok()?;
+            let [x0, y0, x1, y1] = [r.left().value, r.bottom().value, r.right().value, r.top().value];
+            Some(Link { rect: [x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)], target })
+        })
+        .collect()
+}
+
 fn render(doc: &PdfDocument, page: usize, scale: f32) -> Result<egui::ColorImage> {
     let page = doc.pages().get(page as PdfPageIndex)?;
     let cfg = PdfRenderConfig::new()
@@ -222,3 +352,4 @@ fn text(doc: &PdfDocument, page: usize) -> Result<Vec<TextChar>> {
         })
         .collect())
 }
+

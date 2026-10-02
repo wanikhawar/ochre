@@ -7,7 +7,8 @@ use lopdf::{Dictionary, Document, Object, ObjectId, Stream, StringFormat, dictio
 use serde::{Deserialize, Serialize};
 
 use crate::annot::geometry::{
-    TEXT_ASCENT, TEXT_LINE_HEIGHT, TEXT_PAD, arrow_head, bounds, flatten_bezier, mark_strokes,
+    TEXT_ASCENT, TEXT_LINE_HEIGHT, TEXT_PAD, arrow_head, bounds, box_corners, flatten_bezier, mark_lines,
+    mark_strokes,
 };
 use crate::annot::model::{Annotation, Kind, MarkupKind, Pt, ShapeKind};
 use crate::annot::raster::{markup_line, markup_thickness};
@@ -206,6 +207,14 @@ pub fn add_annotation(doc: &mut Document, a: &Annotation, page: ObjectId) -> Obj
         Kind::Shape { shape, a: p, b: q } => {
             annot.set("C", reals(a.style.color));
             annot.set("BS", border(w));
+            // A rotated box shape is drawn upright in a rotated frame (`cm` about its center).
+            let rotated = a.angle != 0.0 && a.is_box();
+            if rotated {
+                let c = p.lerp(*q, 0.5);
+                let (s, co) = a.angle.sin_cos();
+                let (e, f) = (c.x - co * c.x + s * c.y, c.y - s * c.x - co * c.y);
+                let _ = writeln!(ops, "{} {} {} {} {} {} cm", num(co), num(s), num(-s), num(co), num(e), num(f));
+            }
             // Interior fill, drawn first with its own opacity (graphics state GS1).
             let fill = a.style.fill.filter(|_| matches!(shape, ShapeKind::Rect | ShapeKind::Ellipse));
             if let Some(f) = fill {
@@ -232,6 +241,21 @@ pub fn add_annotation(doc: &mut Document, a: &Annotation, page: ObjectId) -> Obj
             }
             let _ = writeln!(ops, "{color} RG {} w 1 J", num(w));
             match shape {
+                ShapeKind::Rect if rotated => {
+                    // A rotated rectangle is a polygon, so viewers that redraw
+                    // annotations themselves still get it right.
+                    annot.set("Subtype", "Polygon");
+                    annot.set("Vertices", reals(box_corners(a).iter().flat_map(|v| [v.x, v.y])));
+                    let (x, y) = (p.x.min(q.x), p.y.min(q.y));
+                    let _ = writeln!(
+                        ops,
+                        "0 j {} {} {} {} re S",
+                        num(x),
+                        num(y),
+                        num((p.x - q.x).abs()),
+                        num((p.y - q.y).abs())
+                    );
+                }
                 ShapeKind::Rect => {
                     annot.set("Subtype", "Square");
                     let (x, y) = (p.x.min(q.x), p.y.min(q.y));
@@ -251,11 +275,12 @@ pub fn add_annotation(doc: &mut Document, a: &Annotation, page: ObjectId) -> Obj
                 }
                 ShapeKind::Check | ShapeKind::Cross => {
                     // Ink, so viewers that redraw annotations themselves still show the mark.
+                    // InkList in page coordinates (rotated); the drawing is in the rotated frame.
                     let strokes = mark_strokes(*shape, *p, *q);
                     annot.set("Subtype", "Ink");
                     annot.set(
                         "InkList",
-                        Object::Array(strokes.iter().map(|l| reals(l.iter().flat_map(|p| [p.x, p.y]))).collect()),
+                        Object::Array(mark_lines(a).iter().map(|l| reals(l.iter().flat_map(|p| [p.x, p.y]))).collect()),
                     );
                     ops.push_str("1 j\n");
                     for line in &strokes {

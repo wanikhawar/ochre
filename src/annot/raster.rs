@@ -45,6 +45,13 @@ fn polyline_path(pts: &[Pt], close: bool) -> Option<Path> {
 
 /// Draws one annotation. `t` maps user space to pixmap pixels.
 pub fn draw(pm: &mut PixmapMut, a: &Annotation, t: Transform) {
+    // A rotated box shape is drawn upright in a rotated frame.
+    let t = if a.angle != 0.0 && a.is_box() {
+        let c = a.center();
+        t.pre_concat(Transform::from_rotate_at(a.angle.to_degrees(), c.x, c.y))
+    } else {
+        t
+    };
     let paint = paint(&a.style);
     let w = a.style.width;
     match &a.kind {

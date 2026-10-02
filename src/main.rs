@@ -10,7 +10,8 @@ mod ui;
 mod viewer;
 
 fn main() -> eframe::Result {
-    let path = std::env::args_os().nth(1).map(std::path::PathBuf::from);
+    // Every file given on the command line opens in its own tab.
+    let paths: Vec<std::path::PathBuf> = std::env::args_os().skip(1).map(Into::into).collect();
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("Ochre")
@@ -21,5 +22,5 @@ fn main() -> eframe::Result {
         multisampling: 4,
         ..Default::default()
     };
-    eframe::run_native("Ochre", options, Box::new(|cc| Ok(Box::new(app::App::new(&cc.egui_ctx, path)))))
+    eframe::run_native("Ochre", options, Box::new(|cc| Ok(Box::new(app::App::new(&cc.egui_ctx, paths)))))
 }

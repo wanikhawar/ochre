@@ -9,7 +9,8 @@ use anyhow::Result;
 
 use crate::annot::geometry::PageGeom;
 use crate::annot::model::{Annotation, Foreign};
-use crate::pdf::annots::{Scan, save, scan};
+use crate::pdf::annots::{Scan, save, scan, with_restored};
+use crate::pdf::worker::{Link, OutlineItem};
 
 #[derive(Clone, Debug)]
 pub enum Cmd {
@@ -33,6 +34,13 @@ pub struct Doc {
     pub read_only: Option<String>,
     /// Per page revision counter, bumped when its annotations change.
     pub page_rev: Vec<u64>,
+    /// What pdfium loads when other apps' annotations were restored by undo after a
+    /// save (see [`Doc::render_bytes`]), for the generation it was made for.
+    preview: Option<(u64, Arc<Vec<u8>>)>,
+    /// Table of contents, from pdfium.
+    pub outline: Vec<OutlineItem>,
+    /// Link areas per page, from pdfium.
+    pub links: Vec<Vec<Link>>,
     scan: Scan,
     /// Annotations as last loaded/saved, to detect changes.
     saved: Vec<Annotation>,
@@ -64,9 +72,12 @@ impl Doc {
             annots: scan.managed.clone(),
             foreign: scan.foreign.clone(),
             saved: scan.managed.clone(),
-            deleted_foreign: BTreeSet::new(),
             read_only,
+            deleted_foreign: BTreeSet::new(),
             page_rev: Vec::new(),
+            preview: None,
+            outline: Vec::new(),
+            links: Vec::new(),
             scan,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -79,7 +90,32 @@ impl Doc {
 
     /// `/Annots` indices pdfium must not draw, per page.
     pub fn hidden(&self) -> Vec<Vec<usize>> {
-        self.scan.hidden(&self.deleted_foreign)
+        self.scan.hidden(&self.foreign, &self.deleted_foreign)
+    }
+
+    /// Whether other-app annotation `i` is shown: in the file and not deleted, or
+    /// detached by a save and restored by undo.
+    fn foreign_shown(&self, i: usize) -> bool {
+        !self.deleted_foreign.contains(&i)
+    }
+
+    /// The bytes pdfium should show: the file, plus (in memory only) any other-app
+    /// annotations that undo restored after a save removed them.
+    pub fn render_bytes(&mut self) -> Arc<Vec<u8>> {
+        let restored = self.foreign.iter().enumerate().any(|(i, f)| !f.attached && self.foreign_shown(i));
+        if !restored {
+            return Arc::clone(&self.bytes);
+        }
+        if let Some((g, b)) = &self.preview
+            && *g == self.generation
+        {
+            return Arc::clone(b);
+        }
+        let bytes = with_restored(&self.bytes, &self.foreign, &self.deleted_foreign)
+            .map(Arc::new)
+            .unwrap_or_else(|_| Arc::clone(&self.bytes));
+        self.preview = Some((self.generation, Arc::clone(&bytes)));
+        bytes
     }
 
     pub fn set_pages(&mut self, pages: Vec<PageGeom>) {
@@ -92,7 +128,14 @@ impl Doc {
     }
 
     pub fn dirty_pages(&self) -> BTreeSet<usize> {
-        let mut pages: BTreeSet<usize> = self.deleted_foreign.iter().map(|&i| self.foreign[i].page).collect();
+        // Pages where an other-app annotation's shown state differs from the file.
+        let mut pages: BTreeSet<usize> = self
+            .foreign
+            .iter()
+            .enumerate()
+            .filter(|(i, f)| f.attached != self.foreign_shown(*i))
+            .map(|(_, f)| f.page)
+            .collect();
         let touched: BTreeSet<usize> = self.annots.iter().chain(&self.saved).map(|a| a.page).collect();
         for p in touched {
             if Self::on_page(&self.annots, p) != Self::on_page(&self.saved, p) {
@@ -193,6 +236,26 @@ impl Doc {
         }
     }
 
+    /// Like [`Doc::amend_last_modify`] for several annotations: each `after` replaces
+    /// the result of its annotation's `Modify` in the last undo step (added if missing).
+    pub fn amend_last_modifies(&mut self, afters: Vec<Annotation>) {
+        for after in afters {
+            let Some(i) = self.index_of(&after.id) else { continue };
+            if let Some(step) = self.undo.last_mut() {
+                let existing = step.iter_mut().find_map(|c| match c {
+                    Cmd::Modify { after: a, .. } if a.id == after.id => Some(a),
+                    _ => None,
+                });
+                match existing {
+                    Some(a) => *a = after.clone(),
+                    None => step.push(Cmd::Modify { before: self.annots[i].clone(), after: after.clone() }),
+                }
+            }
+            self.touch(after.page);
+            self.annots[i] = after;
+        }
+    }
+
     pub fn undo(&mut self) -> bool {
         let Some(cmds) = self.undo.pop() else { return false };
         let mut reload = false;
@@ -213,6 +276,11 @@ impl Doc {
         reload
     }
 
+    /// Number of steps that can be undone.
+    pub fn undo_depth(&self) -> usize {
+        self.undo.len()
+    }
+
     pub fn can_undo(&self) -> bool {
         !self.undo.is_empty()
     }
@@ -226,11 +294,44 @@ impl Doc {
         if let Some(why) = &self.read_only {
             anyhow::bail!("{why}");
         }
-        save(&self.bytes, &self.scan, &self.annots, &self.dirty_pages(), &self.deleted_foreign, out)?;
+        save(&self.bytes, &self.scan, &self.foreign, &self.annots, &self.dirty_pages(), &self.deleted_foreign, out)?;
         let reopened = Doc::open(out)?;
         let pages = std::mem::take(&mut self.pages);
+        let (outline, links) = (std::mem::take(&mut self.outline), std::mem::take(&mut self.links));
+        // Undo history survives saving. Our annotations keep their ids, so their steps
+        // still apply. Other apps' annotations are matched up by object number; one
+        // this save removed stays known, detached, so undo can still restore it.
+        let (old_foreign, old_deleted) = (std::mem::take(&mut self.foreign), std::mem::take(&mut self.deleted_foreign));
+        let (undo, redo) = (std::mem::take(&mut self.undo), std::mem::take(&mut self.redo));
         *self = reopened;
         self.set_pages(pages);
+        (self.outline, self.links) = (outline, links);
+        let mut map = std::collections::HashMap::new();
+        for (i, f) in old_foreign.into_iter().enumerate() {
+            let in_file = f.obj.and_then(|o| self.foreign.iter().position(|g| g.attached && g.obj == Some(o)));
+            if let Some(j) = in_file {
+                map.insert(i, j);
+            } else if old_deleted.contains(&i) && f.obj.is_some() {
+                map.insert(i, self.foreign.len());
+                self.deleted_foreign.insert(self.foreign.len());
+                self.foreign.push(Foreign { attached: false, index: 0, popups: Vec::new(), ..f });
+            }
+        }
+        let remap = |steps: Vec<Vec<Cmd>>| -> Vec<Vec<Cmd>> {
+            steps
+                .into_iter()
+                .map(|s| {
+                    s.into_iter()
+                        .filter_map(|c| match c {
+                            Cmd::DeleteForeign(i) => map.get(&i).map(|&j| Cmd::DeleteForeign(j)),
+                            c => Some(c),
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .filter(|s| !s.is_empty())
+                .collect()
+        };
+        (self.undo, self.redo) = (remap(undo), remap(redo));
         Ok(())
     }
 }
@@ -371,8 +472,145 @@ mod tests {
         assert!(!doc.is_dirty());
         doc.redo();
         doc.save_to(&path).unwrap();
-        assert!(doc.foreign.is_empty());
+        // Gone from the page; only a detached record remains, for undo.
+        assert!(Doc::open(&path).unwrap().foreign.is_empty());
+        assert!(doc.foreign.iter().enumerate().all(|(i, f)| !f.attached && !doc.foreign_shown(i)));
         assert_eq!(doc.annots.len(), created.len() - 1);
+    }
+
+    #[test]
+    fn saving_and_undoing_never_remove_other_apps_annotations() {
+        let path = tmp("keep_foreign.pdf");
+        std::fs::write(&path, sample_pdf()).unwrap();
+        let foreign_in_file = |path: &Path| {
+            let d = lopdf::Document::load(path).unwrap();
+            let (_, page) = d.get_pages().into_iter().next().unwrap();
+            let annots = d.get_dictionary(page).unwrap().get(b"Annots").unwrap().as_array().unwrap().clone();
+            annots
+                .iter()
+                .filter_map(|o| d.dereference(o).ok()?.1.as_dict().ok().cloned())
+                .filter(|a| a.get(b"NM").and_then(|n| n.as_str()).ok() == Some(b"okular-123"))
+                .count()
+        };
+        let mut doc = Doc::open(&path).unwrap();
+        let mut kinds = all_kinds();
+        kinds.truncate(3);
+        // Several saves with edits on the foreign annotation's page, then undo
+        // everything (across the saves) and save again.
+        for a in kinds {
+            doc.exec(vec![Cmd::Add(a)]);
+            doc.save_to(&path).unwrap();
+            assert_eq!(foreign_in_file(&path), 1);
+        }
+        while doc.can_undo() {
+            doc.undo();
+            assert_eq!(doc.foreign.len(), 1);
+            assert!(doc.deleted_foreign.is_empty());
+        }
+        assert!(doc.annots.is_empty());
+        doc.save_to(&path).unwrap();
+        assert_eq!(foreign_in_file(&path), 1, "still in the page's annotation list");
+        let reopened = Doc::open(&path).unwrap();
+        assert_eq!(reopened.foreign.len(), 1);
+        assert!(reopened.annots.is_empty());
+        // Redo it all and save: ours come back next to it.
+        let mut doc = reopened;
+        doc.exec(all_kinds().into_iter().map(Cmd::Add).collect());
+        doc.save_to(&path).unwrap();
+        assert_eq!(foreign_in_file(&path), 1);
+    }
+
+    /// One page with another app's square (green outline, at 400..500) that has a popup.
+    fn pdf_with_popup() -> Vec<u8> {
+        use lopdf::{Object, Stream, dictionary};
+        let mut doc = lopdf::Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let ap = doc.add_object(Stream::new(
+            dictionary! { "Type" => "XObject", "Subtype" => "Form", "BBox" => vec![0.into(), 0.into(), 100.into(), 100.into()] },
+            b"0 0.6 0 RG 4 w 2 2 96 96 re S".to_vec(),
+        ));
+        let square = doc.new_object_id();
+        let popup = doc.add_object(dictionary! {
+            "Type" => "Annot", "Subtype" => "Popup", "Parent" => square,
+            "Rect" => vec![500.into(), 500.into(), 600.into(), 560.into()],
+        });
+        doc.objects.insert(square, Object::Dictionary(dictionary! {
+            "Type" => "Annot", "Subtype" => "Square", "NM" => Object::string_literal("onlyoffice-1"),
+            "Rect" => vec![400.into(), 400.into(), 500.into(), 500.into()],
+            "Contents" => Object::string_literal("Check this"), "Popup" => popup,
+            "AP" => dictionary! { "N" => ap },
+        }));
+        let page = doc.add_object(dictionary! {
+            "Type" => "Page", "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Annots" => vec![square.into(), popup.into()],
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1 }),
+        );
+        let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog);
+        let mut out = Vec::new();
+        doc.save_to(&mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn deleting_another_apps_annotation_can_be_undone_after_saving() {
+        use crate::pdf::worker::{Req, Resp, Worker};
+        let path = tmp("undo_foreign.pdf");
+        std::fs::write(&path, pdf_with_popup()).unwrap();
+        // References in the page's /Annots in the saved file.
+        let in_file = |path: &Path| -> usize {
+            let d = lopdf::Document::load(path).unwrap();
+            let (_, page) = d.get_pages().into_iter().next().unwrap();
+            d.get_dictionary(page).unwrap().get(b"Annots").and_then(|a| a.as_array().map(Vec::len)).unwrap_or(0)
+        };
+        // Whether pdfium draws the square's green outline (left edge at x = 402).
+        let worker = Worker::spawn(eframe::egui::Context::default());
+        let drawn = |doc: &mut Doc| -> Option<bool> {
+            let w = worker.as_ref().ok()?;
+            let wait = || w.rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+            w.send(Req::Load { generation: doc.generation, bytes: doc.render_bytes(), hide: doc.hidden() });
+            let Resp::Loaded { .. } = wait() else { panic!("load failed") };
+            w.send(Req::Render { generation: doc.generation, page: 0, scale: 1.0 });
+            let Resp::Rendered { image, .. } = wait() else { panic!("render failed") };
+            let px = image.pixels[(792 - 450) * image.size[0] + 402];
+            Some(px.g() > 100 && px.r() < 100)
+        };
+
+        let mut doc = Doc::open(&path).unwrap();
+        let square = doc.foreign.iter().position(|f| f.subtype == "Square").unwrap();
+        assert!(drawn(&mut doc).unwrap_or(true));
+        doc.exec(vec![Cmd::DeleteForeign(square)]);
+        assert!(!drawn(&mut doc).unwrap_or(false));
+        doc.save_to(&path).unwrap();
+        assert_eq!(in_file(&path), 0, "the save removed it and its popup");
+        assert!(!doc.is_dirty());
+
+        // Undo after saving brings it back: shown right away, written on the next save.
+        assert!(doc.can_undo());
+        doc.undo();
+        assert!(doc.is_dirty());
+        assert!(drawn(&mut doc).unwrap_or(true));
+        let shown = doc.foreign.iter().enumerate().filter(|(i, f)| f.subtype == "Square" && doc.foreign_shown(*i));
+        assert_eq!(shown.count(), 1);
+        doc.save_to(&path).unwrap();
+        assert_eq!(in_file(&path), 2, "square and popup are back on the page");
+        let reopened = Doc::open(&path).unwrap();
+        let back = reopened.foreign.iter().find(|f| f.subtype == "Square").unwrap();
+        assert!(back.attached);
+        assert_eq!(back.note.as_deref(), Some("Check this"));
+
+        // Redo deletes it again, and that too survives a save and an undo.
+        doc.redo();
+        doc.save_to(&path).unwrap();
+        assert_eq!(in_file(&path), 0);
+        doc.undo();
+        doc.save_to(&path).unwrap();
+        assert_eq!(in_file(&path), 2);
+        assert!(drawn(&mut doc).unwrap_or(true));
     }
 
     #[test]
@@ -429,6 +667,63 @@ mod tests {
         let doc = Doc::open(&path).unwrap();
         assert!(doc.annots.is_empty());
         assert_eq!(doc.foreign.len(), 2);
+    }
+}
+
+/// Manual check of rotated annotations: `OCHRE_OUT=dir cargo test rotated_sample -- --ignored`
+/// writes `dir/rotated.pdf` to view in other apps.
+#[cfg(test)]
+mod rotated_sample {
+    use super::*;
+    use crate::annot::model::{Kind, Pt, ShapeKind, Style};
+
+    #[test]
+    #[ignore]
+    fn rotated_sample() {
+        let Ok(out) = std::env::var("OCHRE_OUT") else { return };
+        let path = PathBuf::from(out).join("rotated.pdf");
+        std::fs::write(&path, tests_pdf()).unwrap();
+        let mut doc = Doc::open(&path).unwrap();
+        let st = |c| Style { fill: Some([1.0, 0.86, 0.0]), fill_opacity: 0.4, ..Style::new(c, 3.0, 1.0) };
+        let mut cmds = Vec::new();
+        for (i, shape) in [ShapeKind::Rect, ShapeKind::Ellipse, ShapeKind::Check, ShapeKind::Cross].into_iter().enumerate() {
+            let x = 80.0 + i as f32 * 130.0;
+            let (a, b) = if matches!(shape, ShapeKind::Check | ShapeKind::Cross) {
+                (Pt::new(x, 740.0), Pt::new(x + 60.0, 680.0))
+            } else {
+                (Pt::new(x, 680.0), Pt::new(x + 100.0, 740.0))
+            };
+            let up = Annotation::new(0, st([0.86, 0.15, 0.15]), Kind::Shape { shape, a, b });
+            let turned = up.rotated(up.center(), 0.5).clone();
+            let mut turned = turned;
+            turned.map_points(|p| Pt::new(p.x, p.y - 150.0));
+            cmds.push(Cmd::Add(up));
+            cmds.push(Cmd::Add(turned));
+        }
+        let text = Annotation::new(
+            0,
+            Style::new([0.1, 0.35, 0.9], 18.0, 1.0),
+            Kind::Text { origin: Pt::new(100.0, 400.0), right: Pt::new(1.0, 0.0), down: Pt::new(0.0, -1.0), text: "Rotated text".into() },
+        );
+        let text = text.rotated(text.center(), 0.5);
+        cmds.push(Cmd::Add(text));
+        doc.exec(cmds);
+        doc.save_to(&path).unwrap();
+    }
+
+    fn tests_pdf() -> Vec<u8> {
+        use lopdf::{Object, dictionary};
+        let mut d = lopdf::Document::with_version("1.7");
+        let pages = d.new_object_id();
+        let page = d.add_object(dictionary! {
+            "Type" => "Page", "Parent" => pages, "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        });
+        d.objects.insert(pages, Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1 }));
+        let cat = d.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages });
+        d.trailer.set("Root", cat);
+        let mut v = Vec::new();
+        d.save_to(&mut v).unwrap();
+        v
     }
 }
 

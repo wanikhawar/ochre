@@ -6,6 +6,21 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::annot::model::Style;
+use crate::viewer::Fit;
+
+/// Where a file was left: the page at the top of the window and how far down it
+/// was (display points), plus the zoom.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ReadPos {
+    pub path: PathBuf,
+    pub page: usize,
+    pub y: f32,
+    pub zoom: f32,
+    pub fit: Option<Fit>,
+}
+
+/// How many files' reading positions are kept.
+const MAX_POSITIONS: usize = 200;
 
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
@@ -17,11 +32,22 @@ pub struct Config {
     pub recent: Vec<PathBuf>,
     /// Custom colors added to the palette.
     pub palette: Vec<[f32; 3]>,
+    /// Whether the table of contents sidebar is shown.
+    pub show_outline: bool,
+    /// Reading position per file, most recent first.
+    pub positions: Vec<ReadPos>,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { styles: BTreeMap::new(), stabilizer: 3.0, recent: Vec::new(), palette: Vec::new() }
+        Self {
+            styles: BTreeMap::new(),
+            stabilizer: 3.0,
+            recent: Vec::new(),
+            palette: Vec::new(),
+            show_outline: false,
+            positions: Vec::new(),
+        }
     }
 }
 
@@ -68,6 +94,16 @@ impl Config {
         if let Ok(s) = toml::to_string_pretty(self) {
             let _ = std::fs::write(p, s);
         }
+    }
+
+    pub fn position(&self, path: &std::path::Path) -> Option<&ReadPos> {
+        self.positions.iter().find(|p| p.path == path)
+    }
+
+    pub fn set_position(&mut self, pos: ReadPos) {
+        self.positions.retain(|p| p.path != pos.path);
+        self.positions.insert(0, pos);
+        self.positions.truncate(MAX_POSITIONS);
     }
 
     pub fn add_recent(&mut self, p: PathBuf) {

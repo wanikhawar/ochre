@@ -26,11 +26,14 @@ pub struct Scan {
 
 impl Scan {
     /// Per page: `/Annots` indices that must not be drawn by pdfium (ours, which we
-    /// draw ourselves, and foreign ones the user deleted).
-    pub fn hidden(&self, deleted_foreign: &BTreeSet<usize>) -> Vec<Vec<usize>> {
+    /// draw ourselves, and other apps' ones the user deleted).
+    pub fn hidden(&self, foreign: &[Foreign], deleted_foreign: &BTreeSet<usize>) -> Vec<Vec<usize>> {
         let mut hide = self.managed_idx.clone();
         for &i in deleted_foreign {
-            let f = &self.foreign[i];
+            let f = &foreign[i];
+            if !f.attached {
+                continue; // not in the file's /Annots anyway
+            }
             if let Some(h) = hide.get_mut(f.page) {
                 h.push(f.index);
                 h.extend(&f.popups);
@@ -101,13 +104,8 @@ pub fn scan(doc: &Document) -> Scan {
                 .unwrap_or_default();
             let flags = d.get(b"F").and_then(Object::as_i64).unwrap_or(0);
             let hidden = flags & 2 != 0;
-            let popups = d
-                .get(b"Popup")
-                .and_then(Object::as_reference)
-                .ok()
-                .and_then(|id| refs.iter().position(|r| *r == Some(id)))
-                .into_iter()
-                .collect();
+            let popup_obj = d.get(b"Popup").and_then(Object::as_reference).ok();
+            let popups = popup_obj.and_then(|id| refs.iter().position(|r| *r == Some(id))).into_iter().collect();
             // A FreeText's /Contents is its visible text, not a comment.
             let note = d
                 .get(b"Contents")
@@ -124,6 +122,9 @@ pub fn scan(doc: &Document) -> Scan {
                 subtype,
                 rect: dict_rect(d).unwrap_or([0.0; 4]),
                 note,
+                obj: refs[index],
+                popup_objs: popup_obj.into_iter().collect(),
+                attached: true,
             });
         }
         scan.managed_idx.push(managed_idx);
@@ -131,14 +132,48 @@ pub fn scan(doc: &Document) -> Scan {
     scan
 }
 
+/// Object references of detached other-app annotations (and their popups) that are
+/// no longer deleted, i.e. restored by undo, for `page`.
+fn restored_refs(foreign: &[Foreign], deleted_foreign: &BTreeSet<usize>, page: usize) -> Vec<Object> {
+    foreign
+        .iter()
+        .enumerate()
+        .filter(|(i, f)| f.page == page && !f.attached && !deleted_foreign.contains(i))
+        .flat_map(|(_, f)| f.obj.iter().chain(&f.popup_objs).map(|&id| Object::Reference(id)).collect::<Vec<_>>())
+        .collect()
+}
+
+/// `original` with restored other-app annotations put back in their pages'
+/// `/Annots` (after the existing entries, so their indices don't change), in memory:
+/// what pdfium shows until the next save writes it for real.
+pub fn with_restored(original: &[u8], foreign: &[Foreign], deleted_foreign: &BTreeSet<usize>) -> Result<Vec<u8>> {
+    let mut inc: IncrementalDocument = original.try_into().context("could not parse the PDF")?;
+    let pages = inc.get_prev_documents().get_pages();
+    let restore_pages: BTreeSet<usize> =
+        foreign.iter().enumerate().filter(|(i, f)| !f.attached && !deleted_foreign.contains(i)).map(|(_, f)| f.page).collect();
+    for page in restore_pages {
+        let page_id = *pages.values().nth(page).context("page missing")?;
+        let prev = inc.get_prev_documents();
+        let mut list = annots_array(prev, prev.get_dictionary(page_id)?);
+        list.extend(restored_refs(foreign, deleted_foreign, page));
+        inc.opt_clone_object_to_new_document(page_id)?;
+        inc.new_document.get_dictionary_mut(page_id)?.set("Annots", Object::Array(list));
+    }
+    let mut buf = Vec::with_capacity(original.len() + 4096);
+    inc.save_to(&mut buf).context("could not write the PDF")?;
+    Ok(buf)
+}
+
 /// Writes `annots` into the PDF `original` and saves it to `out`.
 ///
 /// Only pages whose annotations changed are touched. On those pages the
 /// `/Annots` array keeps every foreign entry (by reference) except ones in
-/// `deleted_foreign`, drops our old entries and appends our current ones.
+/// `deleted_foreign`, puts back restored ones, drops our old entries and appends
+/// our current ones.
 pub fn save(
     original: &[u8],
     scan: &Scan,
+    foreign: &[Foreign],
     annots: &[Annotation],
     dirty_pages: &BTreeSet<usize>,
     deleted_foreign: &BTreeSet<usize>,
@@ -153,7 +188,7 @@ pub fn save(
             bail!("this PDF is damaged (no valid cross-reference table), so it can't be updated safely");
         }
         let pages = inc.get_prev_documents().get_pages();
-        let hidden = scan.hidden(deleted_foreign);
+        let hidden = scan.hidden(foreign, deleted_foreign);
         for &page in dirty_pages {
             let page_id = *pages.values().nth(page).context("page missing")?;
             let drop: HashSet<usize> = hidden.get(page).into_iter().flatten().copied().collect();
@@ -165,6 +200,7 @@ pub fn save(
                 .filter(|(i, _)| !drop.contains(i))
                 .map(|(_, o)| o)
                 .collect();
+            new_list.extend(restored_refs(foreign, deleted_foreign, page));
             for a in annots.iter().filter(|a| a.page == page) {
                 new_list.push(Object::Reference(add_annotation(&mut inc.new_document, a, page_id)));
             }

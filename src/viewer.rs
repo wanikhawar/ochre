@@ -1548,6 +1548,31 @@ impl App {
         self.select(Some(sel));
     }
 
+    /// Where pasted `items` go: the page in the middle of the window, and how far
+    /// (user space) to move them there. They keep their place if it's in view,
+    /// else they're centered in the visible part of the page.
+    pub(crate) fn paste_target(&self, items: &[Annotation]) -> Option<(usize, Pt)> {
+        let doc = self.doc.as_ref()?;
+        let vp = self.view.viewport;
+        let page = self.view.page_at(vp.center(), false).unwrap_or(self.view.current_page);
+        let g = *doc.pages.get(page)?;
+        let Some(shown) = self.view.page_rects.get(page).map(|r| r.intersect(vp)).filter(|r| r.is_positive()) else {
+            return Some((page, Pt::default()));
+        };
+        let aff = self.view.to_screen(&g, page);
+        let mut group = Rect::NOTHING;
+        for a in items {
+            let [x0, y0, x1, y1] = geometry::bounds(a);
+            group.extend_with(pos(aff.apply(Pt::new(x0, y0))));
+            group.extend_with(pos(aff.apply(Pt::new(x1, y1))));
+        }
+        if shown.contains_rect(group) {
+            return Some((page, Pt::default()));
+        }
+        let shift = self.view.to_user(&g, page, shown.center()).sub(self.view.to_user(&g, page, group.center()));
+        Some((page, shift))
+    }
+
     /// Turns the text selection into a highlight / underline / strike-out annotation.
     pub fn markup_selection(&mut self, markup: MarkupKind) {
         let Some((page, quads)) = self.selection_quads().filter(|(_, q)| !q.is_empty()) else { return };
@@ -2269,6 +2294,66 @@ mod tests {
         let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id, "Outlines" => outlines });
         doc.trailer.set("Root", catalog);
         doc.save(path).unwrap();
+    }
+
+    #[test]
+    fn pasting_on_another_page_lands_in_view() {
+        let dir = std::env::temp_dir().join(format!("ochre-paste-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("paste.pdf");
+        reading_pdf(&path);
+        let ctx = egui::Context::default();
+        let app = App::new(&ctx, Some(path.clone()));
+        if app.worker.is_none() {
+            eprintln!("pdfium not available, skipping: {:?}", app.worker_error);
+            return;
+        }
+        let mut h = Harness { ctx, app, t: 0.0, mods: Modifiers::NONE, size: vec2(1000.0, 500.0) };
+        h.wait_until("pages", |a| a.doc.as_ref().is_some_and(|d| !d.pages.is_empty()));
+        h.frame(vec![]);
+
+        // A box near the top of page 1, copied.
+        let rect = Annotation::new(0, Style::new([1.0, 0.0, 0.0], 2.0, 1.0), Kind::Shape { shape: ShapeKind::Rect, a: Pt::new(100.0, 680.0), b: Pt::new(200.0, 740.0) });
+        h.app.exec(vec![Cmd::Add(rect.clone())]);
+        h.app.select(Some(Selection::Ours(rect.id.clone())));
+        let (clip, _) = h.app.clip_text().unwrap();
+        let on_screen = |h: &Harness, a: &Annotation| {
+            let g = h.doc().pages[a.page];
+            let aff = h.app.view.to_screen(&g, a.page);
+            let [x0, y0, x1, y1] = geometry::bounds(a);
+            let r = Rect::from_two_pos(pos(aff.apply(Pt::new(x0, y0))), pos(aff.apply(Pt::new(x1, y1))));
+            h.app.view.viewport.contains_rect(r)
+        };
+
+        // Looking at the middle of page 4, where the box's spot is out of view: the
+        // copy goes to the middle of the window.
+        h.app.view.jump = Some(Jump { page: 3, y: 350.0, margin: 0.0, x: JumpX::Keep, animate: false });
+        for _ in 0..10 {
+            h.frame(vec![]);
+        }
+        h.frame(vec![Event::Paste(clip.clone())]);
+        let pasted = h.doc().annots.last().unwrap().clone();
+        assert_eq!(pasted.page, 3);
+        assert!(on_screen(&h, &pasted), "{:?}", geometry::bounds(&pasted));
+        // Pasting again offsets the next copy from it.
+        h.frame(vec![Event::Paste(clip.clone())]);
+        let again = h.doc().annots.last().unwrap().clone();
+        let [ax, ..] = geometry::bounds(&again);
+        assert!((ax - geometry::bounds(&pasted)[0] - 12.0).abs() < 1e-3);
+
+        // Where the box's spot is in view, the copy keeps it (offset as the third
+        // paste in a row).
+        h.app.view.jump = Some(Jump { page: 4, y: 0.0, margin: 0.0, x: JumpX::Keep, animate: false });
+        for _ in 0..10 {
+            h.frame(vec![]);
+        }
+        h.frame(vec![Event::Paste(clip)]);
+        let kept = h.doc().annots.last().unwrap().clone();
+        let [x0, y0, ..] = geometry::bounds(&rect);
+        let [kx, ky, ..] = geometry::bounds(&kept);
+        assert_eq!(kept.page, 4);
+        assert!((kx - x0 - 24.0).abs() < 1e-3 && (ky - y0 + 24.0).abs() < 1e-3, "{:?}", geometry::bounds(&kept));
+        assert!(on_screen(&h, &kept));
     }
 
     #[test]

@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers};
 
-use crate::annot::model::{Annotation, Kind, MarkupKind, ShapeKind, Style};
+use crate::annot::model::{Annotation, Kind, MarkupKind, Pt, ShapeKind, Style};
 use crate::config::{Config, ReadPos};
 use crate::doc::{Cmd, Doc};
 use crate::pdf::worker::{Req, Resp, Target, TextChar, Worker};
@@ -469,23 +469,24 @@ impl App {
         Some((format!("{CLIP_PREFIX}{json}"), n))
     }
 
-    /// Pastes annotations from clipboard `text` onto the page in view. Pasting
-    /// where they came from offsets each paste a little further, so copies don't
-    /// hide the original.
+    /// Pastes annotations from clipboard `text` onto the page in view, where they
+    /// were on their page if that's in view, else in the middle of the window.
+    /// Pasting where they came from offsets each paste a little further, so copies
+    /// don't hide the original.
     pub fn paste_annotations(&mut self, text: &str) -> bool {
         let Some(clip) = text.strip_prefix(CLIP_PREFIX).and_then(|j| serde_json::from_str::<Clip>(j).ok()) else {
             return false;
         };
         let Some(doc) = &self.doc else { return false };
-        let page = self.view.current_page.min(doc.pages.len().saturating_sub(1));
+        let Some((page, shift)) = self.paste_target(&clip.items) else { return false };
         let count = match &self.last_paste {
             Some((t, n)) if t == text => n + 1,
             _ => 1,
         };
         self.last_paste = Some((text.to_owned(), count));
-        let same_place = clip.path == doc.path && clip.items.iter().all(|a| a.page == page);
+        let same_place = shift == Pt::default() && clip.path == doc.path && clip.items.iter().all(|a| a.page == page);
         let steps = if same_place { count } else { count - 1 };
-        self.place_copies(clip.items, page, steps as f32);
+        self.place_copies(clip.items, page, shift, steps as f32);
         true
     }
 
@@ -493,15 +494,16 @@ impl App {
     pub fn duplicate_selection(&mut self) {
         let items = self.selected_annots();
         if let Some(page) = items.first().map(|a| a.page) {
-            self.place_copies(items, page, 1.0);
+            self.place_copies(items, page, Pt::default(), 1.0);
         }
     }
 
-    /// Adds copies of `items` (new ids) on `page`, moved `steps` paste offsets
-    /// right and down on screen, as one undo step, and selects them.
-    fn place_copies(&mut self, items: Vec<Annotation>, page: usize, steps: f32) {
+    /// Adds copies of `items` (new ids) on `page`, moved by `shift` (user space) and
+    /// then `steps` paste offsets right and down on screen, as one undo step, and
+    /// selects them.
+    fn place_copies(&mut self, items: Vec<Annotation>, page: usize, shift: Pt, steps: f32) {
         let Some(g) = self.doc.as_ref().and_then(|d| d.pages.get(page)).copied() else { return };
-        let shift = g.to_user().apply_vec(crate::annot::model::Pt::new(PASTE_OFFSET, PASTE_OFFSET)).scale(steps);
+        let shift = shift.add(g.to_user().apply_vec(Pt::new(PASTE_OFFSET, PASTE_OFFSET)).scale(steps));
         let copies: Vec<Annotation> = items
             .into_iter()
             .map(|mut a| {
@@ -528,7 +530,7 @@ impl App {
             .filter(|a| !matches!(a.kind, Kind::Markup { .. }))
             .map(|a| {
                 let mut m = a.clone();
-                m.translate(doc.pages[a.page].to_user().apply_vec(crate::annot::model::Pt::new(dx, dy)));
+                m.translate(doc.pages[a.page].to_user().apply_vec(Pt::new(dx, dy)));
                 (a.clone(), m)
             })
             .collect();

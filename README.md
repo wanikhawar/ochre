@@ -35,11 +35,11 @@ Annotations made by other software are preserved:
 
 ### From a release (Linux x86_64)
 
-Download `ochre-1.0.0-x86_64-linux.tar.gz` from the [releases page](https://github.com/wanikhawar/ochre/releases), then:
+Download the latest `ochre-<version>-x86_64-linux.tar.gz` from the [releases page](https://github.com/wanikhawar/ochre/releases), then:
 
 ```sh
-tar -xzf ochre-1.0.0-x86_64-linux.tar.gz
-cd ochre-1.0.0-x86_64-linux
+tar -xzf ochre-*-x86_64-linux.tar.gz
+cd ochre-*-x86_64-linux
 ./install.sh          # installs to ~/.local (set PREFIX to change)
 ```
 

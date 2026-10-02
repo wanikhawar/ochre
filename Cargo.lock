@@ -1912,7 +1912,7 @@ dependencies = [
 
 [[package]]
 name = "ochre-pdf"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "crossbeam-channel",

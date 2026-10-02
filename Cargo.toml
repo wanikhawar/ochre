@@ -1,6 +1,6 @@
 [package]
 name = "ochre-pdf"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 description = "A fast, lightweight PDF reader and annotator with smooth ink, text markup and vim-style navigation"
 license = "MIT"

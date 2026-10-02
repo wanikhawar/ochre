@@ -252,6 +252,7 @@ mod tests {
             "NM" => Object::string_literal("okular-123"),
             "C" => vec![1.into(), 0.into(), 0.into()],
             "T" => Object::string_literal("Someone"),
+            "Contents" => Object::string_literal("Looks wrong"),
         });
         let page = doc.add_object(dictionary! {
             "Type" => "Page", "Parent" => pages_id, "Contents" => content,
@@ -322,7 +323,10 @@ mod tests {
         let mut doc = Doc::open(&path).unwrap();
         assert!(doc.annots.is_empty());
         assert_eq!(doc.foreign.len(), 1);
-        let created = all_kinds();
+        assert_eq!(doc.foreign[0].note.as_deref(), Some("Looks wrong"));
+        let mut created = all_kinds();
+        let noted = created.len() - 1;
+        created[noted].note = "Why? ✓".into();
         doc.exec(created.iter().cloned().map(Cmd::Add).collect());
         assert!(doc.is_dirty());
         doc.save_to(&path).unwrap();
@@ -333,6 +337,17 @@ mod tests {
 
         // Our annotations come back identical and editable; the foreign one is untouched.
         assert_eq!(doc.annots, created);
+        // The note is a standard /Contents comment that other viewers show.
+        let d = lopdf::Document::load(&path).unwrap();
+        let contents: Vec<String> = d
+            .objects
+            .values()
+            .filter_map(|o| o.as_dict().ok())
+            .filter(|d| d.get(b"Subtype").and_then(|s| s.as_name()).ok() == Some(b"Highlight"))
+            .filter_map(|d| d.get(b"Contents").and_then(|c| c.as_str()).ok())
+            .map(crate::pdf::write::decode_text_string)
+            .collect();
+        assert_eq!(contents, ["Why? ✓"]);
         assert_eq!(doc.foreign.len(), 1);
         assert_eq!(doc.foreign[0].subtype, "Square");
         assert!(!doc.is_dirty());

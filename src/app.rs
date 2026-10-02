@@ -13,7 +13,7 @@ use crate::doc::{Cmd, Doc};
 use crate::pdf::worker::{Req, Resp, TextChar, Worker};
 use crate::search::Search;
 use crate::ui::theme;
-use crate::viewer::{Fit, Gesture, Motion, Overlay, PageTex, TextEditState, TextSel, View};
+use crate::viewer::{Fit, Gesture, Motion, NoteEdit, Overlay, PageTex, TextEditState, TextSel, View};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tool {
@@ -142,6 +142,8 @@ pub struct App {
     pub text_requested: HashSet<usize>,
     pub gesture: Gesture,
     pub editing: Option<TextEditState>,
+    /// Note being written for the selected annotation.
+    pub note_edit: Option<NoteEdit>,
     pub selection: Option<Selection>,
     /// Selected page text (Select tool).
     pub text_sel: Option<TextSel>,
@@ -185,6 +187,7 @@ impl App {
             text_requested: HashSet::new(),
             gesture: Gesture::None,
             editing: None,
+            note_edit: None,
             selection: None,
             text_sel: None,
             search: Search::default(),
@@ -211,7 +214,7 @@ impl App {
     }
 
     pub fn set_tool(&mut self, tool: Tool) {
-        self.commit_text();
+        self.commit_edits();
         self.text_sel = None;
         self.gesture = Gesture::None;
         if tool != Tool::Select {
@@ -228,6 +231,7 @@ impl App {
     pub fn select(&mut self, sel: Option<Selection>) {
         if self.selection != sel {
             self.style_edit = None;
+            self.commit_note();
         }
         self.selection = sel;
     }
@@ -241,7 +245,7 @@ impl App {
     }
 
     pub fn undo(&mut self) {
-        self.commit_text();
+        self.commit_edits();
         if let Some(doc) = &mut self.doc {
             doc.undo();
         }
@@ -249,7 +253,7 @@ impl App {
     }
 
     pub fn redo(&mut self) {
-        self.commit_text();
+        self.commit_edits();
         if let Some(doc) = &mut self.doc {
             doc.redo();
         }
@@ -337,7 +341,7 @@ impl App {
     // ---------------------------------------------------------------- files
 
     pub fn request_open(&mut self, path: Option<PathBuf>) {
-        self.commit_text();
+        self.commit_edits();
         if self.doc.as_ref().is_some_and(Doc::is_dirty) {
             self.pending = Some(Pending::Open(path));
         } else {
@@ -370,6 +374,7 @@ impl App {
                 self.text_requested.clear();
                 self.gesture = Gesture::None;
                 self.editing = None;
+                self.note_edit = None;
                 self.selection = None;
                 self.style_edit = None;
                 self.search = Search::default();
@@ -386,7 +391,7 @@ impl App {
 
     /// Saves; returns true on success.
     pub(crate) fn save(&mut self, ctx: &egui::Context, save_as: bool) -> bool {
-        self.commit_text();
+        self.commit_edits();
         let Some(doc) = &mut self.doc else { return false };
         let target = if save_as {
             let mut d = rfd::FileDialog::new().add_filter("PDF", &["pdf"]).set_file_name(doc.name());
@@ -533,6 +538,17 @@ impl App {
             let none = Modifiers::NONE;
             if pressed(sc(none, Key::Delete)) || pressed(sc(none, Key::Backspace)) {
                 self.delete_selection();
+            }
+            // Enter opens the selected annotation's note (or edits a text box).
+            if let Some(Selection::Ours(id)) = self.selection.clone()
+                && self.tool == Tool::Select
+                && pressed(sc(none, Key::Enter))
+            {
+                match self.doc.as_ref().and_then(|d| d.get(&id)).map(|a| a.takes_note()) {
+                    Some(true) => self.open_note(&id),
+                    Some(false) => self.edit_text(&id),
+                    None => {}
+                }
             }
             // Ctrl+C arrives as a Copy event rather than a key press.
             if self.text_sel.is_some() && ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy))) {
@@ -734,7 +750,7 @@ impl App {
             self.title = title;
         }
         if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close {
-            self.commit_text();
+            self.commit_edits();
             if self.doc.as_ref().is_some_and(Doc::is_dirty) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.pending = Some(Pending::Close);

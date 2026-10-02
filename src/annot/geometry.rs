@@ -243,6 +243,22 @@ pub fn bounds(a: &Annotation) -> [f32; 4] {
     [r[0] - pad, r[1] - pad, r[2] + pad, r[3] + pad]
 }
 
+/// `a` scaled by `(sx, sy)` along the page's display axes about `anchor` (display
+/// space), so resizing follows the screen on rotated pages. A text box scales its
+/// font size by `sx` (callers pass `sx == sy` for text).
+pub fn scaled(a: &Annotation, g: &PageGeom, anchor: Pt, sx: f32, sy: f32) -> Annotation {
+    let (to_d, to_u) = (g.to_display(), g.to_user());
+    let mut out = a.clone();
+    out.map_points(|p| {
+        let d = to_d.apply(p);
+        to_u.apply(Pt::new(anchor.x + (d.x - anchor.x) * sx, anchor.y + (d.y - anchor.y) * sy))
+    });
+    if let Kind::Text { .. } = out.kind {
+        out.style.width = a.style.width * sx;
+    }
+    out
+}
+
 fn point_in_quad(p: Pt, q: &[Pt; 4]) -> bool {
     // QuadPoints order is UL, UR, LL, LR; walk it as a polygon UL-UR-LR-LL.
     let poly = [q[0], q[1], q[3], q[2]];
@@ -363,6 +379,21 @@ mod tests {
             assert!(on_screen[1].y > on_screen[0].y && on_screen[1].y > on_screen[2].y, "rotation {rotation}");
             assert!(on_screen[2].x > on_screen[1].x && on_screen[1].x > on_screen[0].x, "rotation {rotation}");
             assert!((on_screen[2].x - 120.0).abs() < 1e-3 && (on_screen[2].y - 100.0).abs() < 1e-3, "rotation {rotation}");
+        }
+    }
+
+    #[test]
+    fn scaling_follows_the_screen_on_rotated_pages() {
+        let style = super::super::model::Style::new([0.0; 3], 2.0, 1.0);
+        for rotation in [0, 90, 180, 270] {
+            let g = PageGeom { bbox: [0.0, 0.0, 600.0, 800.0], rotation };
+            let u = |x, y| g.to_user().apply(Pt::new(x, y));
+            let a = Annotation::new(0, style, Kind::Shape { shape: ShapeKind::Rect, a: u(100.0, 100.0), b: u(200.0, 150.0) });
+            // Twice as wide on screen, same height, anchored at the on-screen top-left.
+            let s = scaled(&a, &g, Pt::new(100.0, 100.0), 2.0, 1.0);
+            let Kind::Shape { a: p, b: q, .. } = s.kind else { panic!() };
+            let (p, q) = (g.to_display().apply(p), g.to_display().apply(q));
+            assert!(close(p, Pt::new(100.0, 100.0)) && close(q, Pt::new(300.0, 150.0)), "rotation {rotation}: {p:?} {q:?}");
         }
     }
 

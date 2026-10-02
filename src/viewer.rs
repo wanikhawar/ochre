@@ -48,13 +48,49 @@ pub struct TextEditState {
     focus: bool,
 }
 
+/// A note being written for one of our annotations.
+pub struct NoteEdit {
+    pub id: String,
+    pub text: String,
+    pub focus: bool,
+}
+
+/// How a selected annotation is being changed by dragging.
+#[derive(Clone, Copy, Debug)]
+pub enum EditOp {
+    /// Dragging the body; `start` is the press point (user space).
+    Move { start: Pt },
+    /// Dragging a corner handle. Display space: `anchor` is the opposite corner,
+    /// `corner` the dragged one and `start` the press point.
+    Scale { anchor: Pt, corner: Pt, start: Pt },
+    /// Dragging one end (0 = `a`, 1 = `b`) of a line or arrow.
+    Endpoint(usize),
+}
+
+/// A grab point on the selected annotation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Handle {
+    /// Corner of the bounding box, in screen order: top-left, top-right, bottom-left, bottom-right.
+    Corner(usize),
+    Endpoint(usize),
+}
+
+const HANDLE_SIZE: f32 = 8.0;
+const NOTE_BADGE_RADIUS: f32 = 8.0;
+
+/// Where the note badge of an annotation with screen bounds `r` goes: just right of
+/// its top edge, clear of the selection handles.
+fn badge_center(r: Rect) -> Pos2 {
+    pos2(r.right() + 4.0 + HANDLE_SIZE + NOTE_BADGE_RADIUS, r.top() + NOTE_BADGE_RADIUS - 4.0)
+}
+
 pub enum Gesture {
     None,
     Ink { page: usize, brush: LazyBrush, raw: Vec<Pt>, highlighter: bool, style: Style },
     Shape { page: usize, shape: ShapeKind, a: Pt, b: Pt, style: Style },
     Markup { page: usize, markup: MarkupKind, start: usize, end: usize, style: Style },
     Erase { removed: Vec<Cmd> },
-    Move { before: Annotation, start: Pt, current: Annotation },
+    Edit { before: Box<Annotation>, current: Annotation, op: EditOp },
     Pan { last: Pos2 },
     /// Dragging out a text selection with the Select tool. `click` is what a plain
     /// click (no drag) selects instead, e.g. another app's highlight over the text.
@@ -97,6 +133,8 @@ pub struct View {
     scroll_target: Option<Vec2>,
     /// Screen position for the text selection's action bar (this frame).
     pub sel_anchor: Option<Pos2>,
+    /// Screen bounds of the selected annotation (this frame), for its action bar and note editor.
+    pub annot_rect: Option<Rect>,
     /// Time and place of the last primary press, for double clicks.
     last_press: Option<(f64, Pos2)>,
     pub goto_page: Option<usize>,
@@ -122,6 +160,7 @@ impl Default for View {
             motion: None,
             scroll_target: None,
             sel_anchor: None,
+            annot_rect: None,
             last_press: None,
             goto_page: None,
             reveal: None,
@@ -149,8 +188,13 @@ impl View {
     }
 
     fn to_user(&self, g: &PageGeom, i: usize, p: Pos2) -> Pt {
+        g.to_user().apply(self.to_display(i, p))
+    }
+
+    /// Screen -> display points of page `i`.
+    fn to_display(&self, i: usize, p: Pos2) -> Pt {
         let r = self.page_rects[i];
-        g.to_user().apply(Pt::new((p.x - r.min.x) / self.zoom, (p.y - r.min.y) / self.zoom))
+        Pt::new((p.x - r.min.x) / self.zoom, (p.y - r.min.y) / self.zoom)
     }
 
     /// Page under (or nearest to, vertically) a screen position.
@@ -262,6 +306,47 @@ fn shape_box(g: &PageGeom, shape: ShapeKind, a: Pt, b: Pt, style: &Style, zoom: 
         max = da.add(Pt::new(half, half));
     }
     (to_u.apply(min), to_u.apply(max))
+}
+
+/// `before` changed by a drag of `op` to user-space point `u`. Shift keeps a
+/// resized annotation's proportions and snaps a line's end to 45°.
+fn edit_annotation(before: &Annotation, g: &PageGeom, op: EditOp, u: Pt, shift: bool, zoom: f32) -> Annotation {
+    match op {
+        EditOp::Move { start } => {
+            let mut moved = before.clone();
+            moved.translate(u.sub(start));
+            moved
+        }
+        EditOp::Endpoint(i) => {
+            let mut out = before.clone();
+            if let Kind::Shape { shape, a, b } = &mut out.kind {
+                let (fixed, end) = if i == 0 { (*b, a) } else { (*a, b) };
+                *end = if shift { shift_constrain(*shape, fixed, u) } else { u };
+            }
+            out
+        }
+        EditOp::Scale { anchor, corner, start } => {
+            let d = g.to_display().apply(u);
+            let target = corner.add(d.sub(start));
+            // Never flip or collapse: at least a few screen pixels on each side.
+            let min = 6.0 / zoom;
+            let factor = |t: f32, c: f32, a: f32| {
+                let span = c - a;
+                if span.abs() < 1e-3 { 1.0 } else { ((t - a) / span).max(min / span.abs()) }
+            };
+            let (mut sx, mut sy) = (factor(target.x, corner.x, anchor.x), factor(target.y, corner.y, anchor.y));
+            if let Kind::Text { .. } = before.kind {
+                // Text scales evenly (it's the font size), within the size setting's range.
+                let w = before.style.width;
+                sx = sx.max(sy).clamp(4.0 / w, 144.0 / w);
+                sy = sx;
+            } else if shift {
+                sx = sx.max(sy);
+                sy = sx;
+            }
+            geometry::scaled(before, g, anchor, sx, sy)
+        }
+    }
 }
 
 /// Index of the character at `p`, or the nearest one within `tol` (user units).
@@ -565,12 +650,13 @@ impl App {
             color: Color32::from_black_alpha(if ui.visuals().dark_mode { 120 } else { 40 }),
         };
         self.view.sel_anchor = None;
+        self.view.annot_rect = None;
         let settled = now - self.view.zoom_changed_at > 0.15;
         if !settled {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(160));
         }
         let exclude = match &self.gesture {
-            Gesture::Move { before, .. } => Some(before.id.clone()),
+            Gesture::Edit { before, .. } => Some(before.id.clone()),
             _ => None,
         };
 
@@ -592,6 +678,7 @@ impl App {
             }
             self.paint_overlay(&painter, i, rect, want, settled, exclude.as_deref(), ui.ctx());
             self.paint_texts(&painter, i);
+            self.paint_note_badges(&painter, i);
             self.paint_search(&painter, i, &self.view.to_screen(&pages[i], i));
             self.paint_text_selection(&painter, i, &pages[i]);
         }
@@ -669,10 +756,7 @@ impl App {
         let g = &doc.pages[page];
         let aff = self.view.to_screen(g, page);
         let editing = self.editing.as_ref().and_then(|e| e.id.as_deref());
-        let moving = match &self.gesture {
-            Gesture::Move { current, .. } => Some(current),
-            _ => None,
-        };
+        let moving = self.edited();
         for a in doc.annots.iter().filter(|a| a.page == page) {
             if Some(a.id.as_str()) == editing {
                 continue;
@@ -687,44 +771,175 @@ impl App {
         }
     }
 
-    fn paint_selection(&self, painter: &Painter) {
-        let Some(doc) = &self.doc else { return };
-        let accent = crate::ui::theme::ACCENT;
-        // Our annotations: solid outline with corner handles.
-        let outline = |r: Rect, c: Color32| {
-            let r = r.expand(4.0);
-            painter.rect_stroke(r, 2.0, Stroke::new(1.25, c), StrokeKind::Middle);
-            for corner in [r.left_top(), r.right_top(), r.left_bottom(), r.right_bottom()] {
-                let h = Rect::from_center_size(corner, vec2(7.0, 7.0));
-                painter.rect_filled(h, 1.5, Color32::WHITE);
-                painter.rect_stroke(h, 1.5, Stroke::new(1.25, c), StrokeKind::Middle);
+    /// The annotation being dragged, as it currently looks.
+    fn edited(&self) -> Option<&Annotation> {
+        match &self.gesture {
+            Gesture::Edit { current, .. } => Some(current),
+            _ => None,
+        }
+    }
+
+    /// Our selected annotation (as currently dragged, if it is).
+    fn selected_ours(&self) -> Option<&Annotation> {
+        let Some(Selection::Ours(id)) = &self.selection else { return None };
+        self.edited().filter(|a| a.id == *id).or_else(|| self.doc.as_ref()?.get(id))
+    }
+
+    /// Screen bounds of a foreign annotation.
+    fn foreign_rect(&self, i: usize) -> Option<Rect> {
+        let doc = self.doc.as_ref()?;
+        let f = doc.foreign.get(i)?;
+        let aff = self.view.to_screen(&doc.pages[f.page], f.page);
+        let [x0, y0, x1, y1] = f.rect;
+        Some(Rect::from_two_pos(pos(aff.apply(Pt::new(x0, y0))), pos(aff.apply(Pt::new(x1, y1)))))
+    }
+
+    /// Grab points of the selected annotation (screen space). Lines and arrows are
+    /// changed by their ends; text markup follows the text, so it has none.
+    fn handles(&self, a: &Annotation) -> Vec<(Handle, Pos2)> {
+        let Some(doc) = &self.doc else { return Vec::new() };
+        let aff = self.view.to_screen(&doc.pages[a.page], a.page);
+        match &a.kind {
+            Kind::Markup { .. } => Vec::new(),
+            Kind::Shape { shape: ShapeKind::Line | ShapeKind::Arrow, a: p, b: q, .. } => {
+                vec![(Handle::Endpoint(0), pos(aff.apply(*p))), (Handle::Endpoint(1), pos(aff.apply(*q)))]
+            }
+            _ => {
+                let r = screen_bounds(a, &aff).expand(4.0);
+                [r.left_top(), r.right_top(), r.left_bottom(), r.right_bottom()]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, c)| (Handle::Corner(i), c))
+                    .collect()
+            }
+        }
+    }
+
+    /// Handle of the selected annotation under a screen point (Select tool only).
+    fn handle_at(&self, p: Pos2) -> Option<(Annotation, Handle)> {
+        if self.tool != Tool::Select {
+            return None;
+        }
+        let a = self.selected_ours()?;
+        let reach = HANDLE_SIZE / 2.0 + 3.0;
+        self.handles(a)
+            .into_iter()
+            .filter(|(_, c)| c.distance(p) <= reach)
+            .min_by(|x, y| x.1.distance(p).total_cmp(&y.1.distance(p)))
+            .map(|(h, _)| (a.clone(), h))
+    }
+
+    /// Starts dragging handle `h` of `a`, pressed at screen point `p`.
+    fn start_handle_drag(&mut self, a: Annotation, h: Handle, p: Pos2) {
+        let op = match h {
+            Handle::Endpoint(i) => EditOp::Endpoint(i),
+            Handle::Corner(i) => {
+                let Some(doc) = &self.doc else { return };
+                let r = screen_bounds(&a, &self.view.to_screen(&doc.pages[a.page], a.page));
+                let corners = [r.left_top(), r.right_top(), r.left_bottom(), r.right_bottom()];
+                let disp = |q: Pos2| self.view.to_display(a.page, q);
+                EditOp::Scale { anchor: disp(corners[3 - i]), corner: disp(corners[i]), start: disp(p) }
             }
         };
-        // Other apps' annotations: dashed, without handles (they can't be moved).
-        let dashed = |r: Rect, c: Color32| {
-            let r = r.expand(4.0);
-            let pts = [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom(), r.left_top()];
-            painter.extend(egui::Shape::dashed_line(&pts, Stroke::new(1.5, c), 5.0, 3.0));
-        };
+        self.gesture = Gesture::Edit { before: Box::new(a.clone()), current: a, op };
+    }
+
+    fn paint_selection(&mut self, painter: &Painter) {
+        let accent = crate::ui::theme::ACCENT;
+        let handle_stroke = Stroke::new(1.25, accent);
         match &self.selection {
-            Some(Selection::Ours(id)) => {
-                let a = match &self.gesture {
-                    Gesture::Move { current, .. } if current.id == *id => Some(current),
-                    _ => doc.get(id),
-                };
-                if let Some(a) = a {
-                    outline(screen_bounds(a, &self.view.to_screen(&doc.pages[a.page], a.page)), accent);
+            Some(Selection::Ours(_)) => {
+                let Some(a) = self.selected_ours() else { return };
+                let Some(doc) = &self.doc else { return };
+                let r = screen_bounds(a, &self.view.to_screen(&doc.pages[a.page], a.page));
+                let outlined = r.expand(4.0);
+                let is_line = matches!(a.kind, Kind::Shape { shape: ShapeKind::Line | ShapeKind::Arrow, .. });
+                if !is_line {
+                    painter.rect_stroke(outlined, 2.0, handle_stroke, StrokeKind::Middle);
                 }
+                for (h, c) in self.handles(a) {
+                    match h {
+                        Handle::Corner(_) => {
+                            let hr = Rect::from_center_size(c, Vec2::splat(HANDLE_SIZE));
+                            painter.rect_filled(hr, 1.5, Color32::WHITE);
+                            painter.rect_stroke(hr, 1.5, handle_stroke, StrokeKind::Middle);
+                        }
+                        Handle::Endpoint(_) => {
+                            painter.circle(c, HANDLE_SIZE / 2.0 + 0.5, Color32::WHITE, handle_stroke);
+                        }
+                    }
+                }
+                self.view.annot_rect = Some(outlined);
             }
             Some(Selection::Foreign(i)) => {
-                if let Some(f) = doc.foreign.get(*i) {
-                    let aff = self.view.to_screen(&doc.pages[f.page], f.page);
-                    let [x0, y0, x1, y1] = f.rect;
-                    let r = Rect::from_two_pos(pos(aff.apply(Pt::new(x0, y0))), pos(aff.apply(Pt::new(x1, y1))));
-                    dashed(r, crate::ui::theme::WARN);
+                // Other apps' annotations: dashed, without handles (they can't be changed).
+                if let Some(r) = self.foreign_rect(*i) {
+                    let r = r.expand(4.0);
+                    let pts = [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom(), r.left_top()];
+                    painter.extend(egui::Shape::dashed_line(&pts, Stroke::new(1.5, crate::ui::theme::WARN), 5.0, 3.0));
                 }
             }
             None => {}
+        }
+    }
+
+    /// Note badges on one page: ours and other apps' annotations that carry a note.
+    fn note_badges(&self, page: usize) -> Vec<(Pos2, Selection, String)> {
+        let Some(doc) = &self.doc else { return Vec::new() };
+        let aff = self.view.to_screen(&doc.pages[page], page);
+        let edited = self.edited();
+        let ours = doc.annots.iter().filter(|a| a.page == page && !a.note.is_empty()).map(|a| {
+            let a = edited.filter(|e| e.id == a.id).unwrap_or(a);
+            (badge_center(screen_bounds(a, &aff)), Selection::Ours(a.id.clone()), a.note.clone())
+        });
+        let foreign = doc.foreign.iter().enumerate().filter_map(|(i, f)| {
+            let note = f.note.as_ref().filter(|_| f.page == page && f.selectable && !doc.deleted_foreign.contains(&i))?;
+            Some((badge_center(self.foreign_rect(i)?), Selection::Foreign(i), note.clone()))
+        });
+        ours.chain(foreign).collect()
+    }
+
+    fn paint_note_badges(&self, painter: &Painter, page: usize) {
+        let open = self.note_edit.as_ref().map(|n| n.id.as_str());
+        for (c, sel, _) in self.note_badges(page) {
+            let foreign = matches!(sel, Selection::Foreign(_));
+            let fill = if foreign { crate::ui::theme::WARN } else { crate::ui::theme::ACCENT };
+            let editing = matches!(&sel, Selection::Ours(id) if Some(id.as_str()) == open);
+            painter.circle_filled(c + vec2(0.0, 1.0), NOTE_BADGE_RADIUS, Color32::from_black_alpha(40));
+            painter.circle(c, NOTE_BADGE_RADIUS, fill, Stroke::new(if editing { 2.0 } else { 1.0 }, Color32::WHITE));
+            painter.text(
+                c,
+                egui::Align2::CENTER_CENTER,
+                egui_phosphor::regular::CHAT_TEXT,
+                FontId::proportional(NOTE_BADGE_RADIUS * 1.3),
+                Color32::WHITE,
+            );
+        }
+    }
+
+    /// The note badge under a screen point.
+    fn badge_at(&self, p: Pos2) -> Option<(Selection, String)> {
+        let page = self.view.page_at(p, false)?;
+        // A badge can stick out past the page edge, so check the neighbours too.
+        (page.saturating_sub(1)..=page + 1)
+            .filter(|&i| i < self.view.page_rects.len())
+            .flat_map(|i| self.note_badges(i))
+            .find(|(c, _, _)| c.distance(p) <= NOTE_BADGE_RADIUS + 2.0)
+            .map(|(_, sel, note)| (sel, note))
+    }
+
+    /// Note to show when hovering `p`: a badge, or (Select tool) an annotation with a note.
+    fn note_at(&self, p: Pos2) -> Option<String> {
+        if let Some((_, note)) = self.badge_at(p) {
+            return Some(note);
+        }
+        if self.tool != Tool::Select {
+            return None;
+        }
+        let doc = self.doc.as_ref()?;
+        match self.hit(p)? {
+            Selection::Ours(id) => Some(doc.get(&id)?.note.clone()).filter(|n| !n.is_empty()),
+            Selection::Foreign(i) => doc.foreign.get(i)?.note.clone(),
         }
     }
 
@@ -738,10 +953,17 @@ impl App {
                 page: *page,
                 style: *style,
                 kind: Kind::Ink { curve: catmull_rom(raw), highlighter: *highlighter },
+                note: String::new(),
             }),
             Gesture::Shape { page, shape, a, b, style } => {
                 let (a, b) = shape_box(&doc.pages[*page], *shape, *a, *b, style, self.view.zoom);
-                Some(Annotation { id: String::new(), page: *page, style: *style, kind: Kind::Shape { shape: *shape, a, b } })
+                Some(Annotation {
+                    id: String::new(),
+                    page: *page,
+                    style: *style,
+                    kind: Kind::Shape { shape: *shape, a, b },
+                    note: String::new(),
+                })
             }
             Gesture::Markup { page, markup, start, end, style } => {
                 let chars = self.text_chars.get(page).map(Vec::as_slice).unwrap_or_default();
@@ -751,9 +973,10 @@ impl App {
                     page: *page,
                     style: *style,
                     kind: Kind::Markup { markup: *markup, quads },
+                    note: String::new(),
                 })
             }
-            Gesture::Move { current, .. } if !matches!(current.kind, Kind::Text { .. }) => Some(current.clone()),
+            Gesture::Edit { current, .. } if !matches!(current.kind, Kind::Text { .. }) => Some(current.clone()),
             _ => None,
         };
         let Some(a) = live else { return };
@@ -798,7 +1021,7 @@ impl App {
             match ev {
                 Event::PointerButton { pos, button, pressed: true, modifiers } if hovered => {
                     if button == PointerButton::Middle || (button == PointerButton::Primary && (panning_key || self.tool == Tool::Hand)) {
-                        self.commit_text();
+                        self.commit_edits();
                         self.gesture = Gesture::Pan { last: pos };
                     } else if button == PointerButton::Primary {
                         self.on_press(ui, pos, modifiers);
@@ -819,7 +1042,17 @@ impl App {
             let icon = match (&self.gesture, self.tool) {
                 (Gesture::Pan { .. }, _) => CursorIcon::Grabbing,
                 _ if panning_key || self.tool == Tool::Hand => CursorIcon::Grab,
-                (Gesture::Move { .. }, _) => CursorIcon::Grabbing,
+                (Gesture::Edit { op: EditOp::Move { .. }, .. }, _) => CursorIcon::Grabbing,
+                (Gesture::Edit { op: EditOp::Endpoint(_), .. }, _) => CursorIcon::Crosshair,
+                (Gesture::Edit { op: EditOp::Scale { anchor, corner, .. }, .. }, _) => {
+                    // Same diagonal as when the drag started (screen and display axes agree).
+                    if (corner.x - anchor.x) * (corner.y - anchor.y) > 0.0 {
+                        CursorIcon::ResizeNwSe
+                    } else {
+                        CursorIcon::ResizeNeSw
+                    }
+                }
+                _ if resp.hover_pos().is_some_and(|p| self.badge_at(p).is_some()) => CursorIcon::PointingHand,
                 (Gesture::Markup { .. }, _) => CursorIcon::Text,
                 (_, Tool::Highlighter) => match resp.hover_pos() {
                     Some(p) if self.over_text(p) && !ctx.input(|i| i.modifiers.alt) => CursorIcon::Text,
@@ -830,6 +1063,11 @@ impl App {
                 (_, Tool::Eraser) => CursorIcon::None,
                 (Gesture::SelectText { .. }, _) => CursorIcon::Text,
                 (_, Tool::Select) => match resp.hover_pos() {
+                    Some(p) if self.handle_at(p).is_some() => match self.handle_at(p).map(|(_, h)| h) {
+                        Some(Handle::Corner(0 | 3)) => CursorIcon::ResizeNwSe,
+                        Some(Handle::Corner(_)) => CursorIcon::ResizeNeSw,
+                        _ => CursorIcon::Crosshair,
+                    },
                     Some(p) if self.hit(p).is_some() => CursorIcon::Move,
                     Some(p) if self.over_text(p) => CursorIcon::Text,
                     _ => CursorIcon::Default,
@@ -847,6 +1085,16 @@ impl App {
             && let Some(p) = resp.hover_pos().and_then(|p| self.view.page_at(p, true)) {
                 self.request_text(p);
             }
+        // Hovering a note badge (or, with Select, an annotation with a note) shows the note.
+        if matches!(self.gesture, Gesture::None)
+            && self.note_edit.is_none()
+            && let Some(note) = resp.hover_pos().and_then(|p| self.note_at(p))
+        {
+            resp.clone().on_hover_ui_at_pointer(|ui| {
+                ui.set_max_width(320.0);
+                ui.label(note);
+            });
+        }
     }
 
     fn over_text(&self, p: Pos2) -> bool {
@@ -923,7 +1171,22 @@ impl App {
         let double = self.view.last_press.is_some_and(|(t, at)| now - t < 0.4 && at.distance(p) < 6.0);
         self.view.last_press = if double { None } else { Some((now, p)) };
         let was_editing = self.editing.is_some();
-        self.commit_text();
+        self.commit_edits();
+        // A note badge opens (ours) or selects (other apps') the annotation's note.
+        if let Some((sel, _)) = self.badge_at(p) {
+            self.text_sel = None;
+            match sel {
+                Selection::Ours(id) => {
+                    self.set_tool(Tool::Select);
+                    self.open_note(&id);
+                }
+                foreign => {
+                    self.set_tool(Tool::Select);
+                    self.select(Some(foreign));
+                }
+            }
+            return;
+        }
         let Some(doc) = &self.doc else { return };
         let Some(page) = self.view.page_at(p, true) else {
             if self.tool == Tool::Select {
@@ -1007,6 +1270,10 @@ impl App {
                 self.erase_at(p);
             }
             Tool::Select => {
+                if let Some((a, h)) = self.handle_at(p) {
+                    self.start_handle_drag(a, h, p);
+                    return;
+                }
                 let hit = self.hit(p);
                 self.text_sel = None;
                 // Text markup sits on the text: dragging over it selects text, and a
@@ -1018,8 +1285,12 @@ impl App {
                 if let Some(a) = &movable {
                     if double && matches!(a.kind, Kind::Text { .. }) {
                         self.edit_text(&a.id);
+                    } else if double {
+                        self.open_note(&a.id);
+                        return;
                     } else {
-                        self.gesture = Gesture::Move { start: u, current: a.clone(), before: a.clone() };
+                        let op = EditOp::Move { start: u };
+                        self.gesture = Gesture::Edit { before: Box::new(a.clone()), current: a.clone(), op };
                     }
                 }
                 if movable.is_none() {
@@ -1046,6 +1317,7 @@ impl App {
 
     fn on_move(&mut self, p: Pos2, modifiers: Modifiers) {
         let Some(doc) = &self.doc else { return };
+        let zoom = self.view.zoom;
         match &mut self.gesture {
             Gesture::None => {}
             Gesture::Ink { page, brush, raw, .. } => {
@@ -1065,11 +1337,10 @@ impl App {
                 }
             }
             Gesture::Erase { .. } => self.erase_at(p),
-            Gesture::Move { before, start, current } => {
-                let u = self.view.to_user(&doc.pages[before.page], before.page, p);
-                let mut moved = before.clone();
-                moved.translate(u.sub(*start));
-                *current = moved;
+            Gesture::Edit { before, current, op } => {
+                let g = doc.pages[before.page];
+                let u = self.view.to_user(&g, before.page, p);
+                *current = edit_annotation(before, &g, *op, u, modifiers.shift, zoom);
             }
             Gesture::SelectText { .. } => {
                 if let Some(sel) = &mut self.text_sel {
@@ -1122,9 +1393,9 @@ impl App {
                     doc.record(removed);
                 }
             }
-            Gesture::Move { before, current, .. } => {
-                if before != current {
-                    self.exec(vec![Cmd::Modify { before, after: current }]);
+            Gesture::Edit { before, current, .. } => {
+                if *before != current {
+                    self.exec(vec![Cmd::Modify { before: *before, after: current }]);
                 }
             }
             Gesture::SelectText { click } => {
@@ -1158,7 +1429,7 @@ impl App {
 
     // ------------------------------------------------------------- text
 
-    fn edit_text(&mut self, id: &str) {
+    pub fn edit_text(&mut self, id: &str) {
         let Some(a) = self.doc.as_ref().and_then(|d| d.get(id)) else { return };
         if let Kind::Text { origin, right, down, text } = &a.kind {
             self.editing = Some(TextEditState {
@@ -1175,7 +1446,34 @@ impl App {
         }
     }
 
-    pub fn commit_text(&mut self) {
+    /// Finishes any text box or note being typed.
+    pub fn commit_edits(&mut self) {
+        self.commit_note();
+        self.commit_text();
+    }
+
+    /// Opens the note editor for one of our annotations (and selects it).
+    pub fn open_note(&mut self, id: &str) {
+        self.commit_edits();
+        let Some(a) = self.doc.as_ref().and_then(|d| d.get(id)).filter(|a| a.takes_note()) else { return };
+        let (id, text) = (a.id.clone(), a.note.clone());
+        self.select(Some(Selection::Ours(id.clone())));
+        self.note_edit = Some(NoteEdit { id, text, focus: true });
+    }
+
+    /// Saves the note being edited (as one undo step) and closes the editor.
+    pub fn commit_note(&mut self) {
+        let Some(n) = self.note_edit.take() else { return };
+        let Some(doc) = &self.doc else { return };
+        let Some(before) = doc.get(&n.id).cloned() else { return };
+        let note = n.text.trim().to_string();
+        if note != before.note {
+            let after = Annotation { note, ..before.clone() };
+            self.exec(vec![Cmd::Modify { before, after }]);
+        }
+    }
+
+    fn commit_text(&mut self) {
         let Some(e) = self.editing.take() else { return };
         let Some(doc) = &self.doc else { return };
         let text = e.text.trim_end().to_string();
@@ -1254,7 +1552,7 @@ impl App {
             StrokeKind::Outside,
         );
         if escape {
-            self.commit_text();
+            self.commit_edits();
         }
     }
 }
@@ -1458,6 +1756,43 @@ mod tests {
         let Kind::Shape { a: back, .. } = h.doc().annots[1].kind.clone() else { panic!() };
         assert!((back.x - 100.0).abs() < 1.0, "undo moved back to {back:?}");
 
+        // Resize the rectangle by its bottom-right handle; undo restores it.
+        h.click(h.at(100.0, 325.0));
+        let rect = h.doc().annots[1].clone();
+        assert_eq!(h.app.selection, Some(Selection::Ours(rect.id.clone())));
+        let corner = h.app.handles(&rect)[3];
+        assert_eq!(corner.0, Handle::Corner(3));
+        h.drag(&[corner.1, corner.1 + vec2(20.0, 10.0), corner.1 + vec2(40.0, 20.0)]);
+        let Kind::Shape { a, b, .. } = h.doc().annots[1].kind.clone() else { panic!() };
+        let zoom = h.app.view.zoom;
+        assert!((a.x - 100.0).abs() < 1.0 && (b.y - 350.0).abs() < 1.0, "top-left stays: {a:?} {b:?}");
+        assert!((b.x - 200.0 - 40.0 / zoom).abs() < 2.0, "right edge follows: {b:?}");
+        assert!((a.y - 300.0 + 20.0 / zoom).abs() < 2.0, "bottom edge follows: {a:?}");
+        h.key(Key::Z, Modifiers::COMMAND);
+        assert_eq!(h.doc().annots[1], rect);
+
+        // Resizing a text box changes its font size, keeping its proportions.
+        let text = h.doc().annots.iter().find(|a| matches!(a.kind, Kind::Text { .. })).unwrap().clone();
+        h.app.select(Some(Selection::Ours(text.id.clone())));
+        h.frame(vec![]);
+        let corner = h.app.handles(&text)[3].1;
+        h.drag(&[corner, corner + vec2(30.0, 2.0)]);
+        let grown = h.doc().get(&text.id).unwrap();
+        assert!(grown.style.width > text.style.width * 1.2, "font {} -> {}", text.style.width, grown.style.width);
+        h.key(Key::Z, Modifiers::COMMAND);
+
+        // A note: Enter opens the editor, typing and clicking away saves it as one undo step.
+        h.app.select(Some(Selection::Ours(rect.id.clone())));
+        h.frame(vec![]);
+        h.key(Key::Enter, Modifiers::NONE);
+        assert!(h.app.note_edit.is_some());
+        h.frame(vec![]);
+        h.frame(vec![Event::Text("Check this figure".into())]);
+        h.click(h.at(450.0, 150.0));
+        assert!(h.app.note_edit.is_none());
+        assert_eq!(h.doc().get(&rect.id).unwrap().note, "Check this figure");
+        assert_eq!(h.app.note_at(badge_center(screen_bounds(&h.doc().annots[1], &h.app.view.to_screen(&h.doc().pages[0], 0)))).as_deref(), Some("Check this figure"));
+
         // Eraser removes our ink but never touches the foreign annotation.
         h.app.set_tool(Tool::Eraser);
         let across: Vec<Pos2> = (0..40).map(|i| h.at(160.0, 560.0 - i as f32 * 3.0)).collect();
@@ -1627,6 +1962,19 @@ mod tests {
         assert!((b.x - a.x - 15.0).abs() < 0.5 && (a.y - b.y - 15.0).abs() < 0.5, "box {a:?} {b:?}");
         assert!(a.lerp(b, 0.5).dist(Pt::new(480.0, 300.0)) < 1.0);
         assert_eq!(tick.style.color, [0.15, 0.62, 0.25], "ticks default to green");
+
+        // Lines and arrows are changed by dragging an end.
+        h.app.set_tool(Tool::Shape(ShapeKind::Arrow));
+        h.drag(&[h.at(300.0, 250.0), h.at(350.0, 250.0), h.at(400.0, 250.0)]);
+        let arrow = h.doc().annots.last().unwrap().clone();
+        h.app.set_tool(Tool::Select);
+        h.app.select(Some(Selection::Ours(arrow.id.clone())));
+        h.frame(vec![]);
+        let handles = h.app.handles(&arrow);
+        assert_eq!(handles.iter().map(|x| x.0).collect::<Vec<_>>(), [Handle::Endpoint(0), Handle::Endpoint(1)]);
+        h.drag(&[handles[1].1, h.at(400.0, 230.0), h.at(400.0, 200.0)]);
+        let Kind::Shape { a, b, .. } = h.doc().get(&arrow.id).unwrap().kind else { panic!() };
+        assert!(a.dist(Pt::new(300.0, 250.0)) < 1.0 && b.dist(Pt::new(400.0, 200.0)) < 1.0, "{a:?} {b:?}");
 
         // Save and reopen: everything is there, foreign annotation untouched.
         let ctx = h.ctx.clone();

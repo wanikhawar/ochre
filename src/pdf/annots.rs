@@ -11,7 +11,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use lopdf::{Dictionary, Document, IncrementalDocument, Object, ObjectId};
 
-use super::write::{LEGACY_PRIVATE_KEY, PRIVATE_KEY, Private, add_annotation, dict_rect};
+use super::write::{LEGACY_PRIVATE_KEY, PRIVATE_KEY, Private, add_annotation, decode_text_string, dict_rect};
 use crate::annot::model::{Annotation, Foreign, LEGACY_NM_PREFIX, NM_PREFIX};
 
 #[derive(Default)]
@@ -108,6 +108,14 @@ pub fn scan(doc: &Document) -> Scan {
                 .and_then(|id| refs.iter().position(|r| *r == Some(id)))
                 .into_iter()
                 .collect();
+            // A FreeText's /Contents is its visible text, not a comment.
+            let note = d
+                .get(b"Contents")
+                .and_then(Object::as_str)
+                .ok()
+                .filter(|_| subtype != "FreeText")
+                .map(|b| decode_text_string(b).replace("\r\n", "\n").replace('\r', "\n").trim().to_string())
+                .filter(|n| !n.is_empty());
             scan.foreign.push(Foreign {
                 page,
                 index,
@@ -115,6 +123,7 @@ pub fn scan(doc: &Document) -> Scan {
                 selectable: !hidden && !matches!(subtype.as_str(), "Link" | "Widget" | "Popup"),
                 subtype,
                 rect: dict_rect(d).unwrap_or([0.0; 4]),
+                note,
             });
         }
         scan.managed_idx.push(managed_idx);

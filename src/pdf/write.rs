@@ -49,7 +49,6 @@ pub fn text_string(s: &str) -> Object {
     Object::String(bytes, StringFormat::Hexadecimal)
 }
 
-#[cfg(test)]
 /// Decodes a PDF text string (UTF-16BE with BOM, UTF-8 with BOM, or PDFDocEncoding ~ Latin-1).
 pub fn decode_text_string(b: &[u8]) -> String {
     if let Some(rest) = b.strip_prefix(&[0xFE, 0xFF]) {
@@ -366,6 +365,9 @@ pub fn add_annotation(doc: &mut Document, a: &Annotation, page: ObjectId) -> Obj
         }
     }
     ops.push_str("Q\n");
+    if a.takes_note() && !a.note.is_empty() {
+        annot.set("Contents", text_string(&a.note));
+    }
 
     let mut gs = dictionary! {
         "Type" => "ExtGState",

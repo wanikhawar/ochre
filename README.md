@@ -15,9 +15,14 @@ A fast, lightweight PDF reader and annotator for Linux, written in Rust (egui + 
   - A tick or cross is placed with a single click.
   - Rectangles and ellipses can be filled, with a separate fill opacity.
 - **Tool settings** in a popup from the tool rail: palette, custom color picker with hex input, and width, size and opacity that you can drag or type.
-- **Select**, move, restyle and delete annotations, plus an eraser and undo/redo.
+- **Select**, move, resize, restyle and delete annotations, plus an eraser and undo/redo.
+  - Drag a corner handle to resize (Shift keeps the proportions). Resizing a text box changes its font size.
+  - Drag either end of a line or arrow.
   - The Select tool also selects page text: drag, or double-click a word.
   - Copy selected text with Ctrl+C, or turn it into a highlight, underline or strike-out.
+- **Notes** on any annotation: select it and choose "Add note", press Enter, or double-click it.
+  - Annotations with a note show a badge; hover over it to read the note.
+  - Notes are saved as standard `/Contents` comments, so Acrobat, Okular and others show them too. Notes on other apps' annotations are shown read-only.
 - **Vim-style navigation** and `/` search (smartcase, n / N).
 - Zoom (fit width / fit page / Ctrl+wheel), recent files, and light and dark themes that follow the system.
 
@@ -94,6 +99,9 @@ Vim-style navigation works whenever you're not typing in a text field.
 | Shift while drawing a shape | Square / circle / 45° lines |
 | Alt while highlighting | Freehand even over text |
 | Double-click a text box (Select tool) | Edit it |
+| Double-click an annotation, or Enter (Select tool) | Add or edit its note |
+| Ctrl+Enter, Esc | Finish the note |
+| Shift while resizing | Keep proportions / 45° line ends |
 | Delete | Delete selection |
 | Ctrl+Z, Ctrl+Shift+Z / Ctrl+Y | Undo, redo |
 | Ctrl+S, Ctrl+Shift+S | Save, save as |

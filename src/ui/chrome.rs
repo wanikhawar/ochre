@@ -5,7 +5,7 @@ use eframe::egui::{
     self, Align, Align2, Color32, FontId, Id, Layout, Pos2, Rect, Response, RichText, Sense, Stroke,
     Vec2, pos2, vec2,
 };
-use egui::{Popup, PopupCloseBehavior, SetOpenCommand};
+use egui::{KeyboardShortcut, Modifiers, Popup, PopupCloseBehavior, SetOpenCommand};
 use egui_phosphor::regular as ph;
 
 use super::color;
@@ -13,7 +13,7 @@ use super::theme::{self, ACCENT, WARN};
 use crate::annot::model::{MarkupKind, ShapeKind};
 use crate::app::{App, PALETTE, Selection, Tool, rgb};
 use crate::doc::Doc;
-use crate::viewer::Fit;
+use crate::viewer::{Fit, Gesture};
 
 const SHAPES: [ShapeKind; 6] =
     [ShapeKind::Check, ShapeKind::Cross, ShapeKind::Rect, ShapeKind::Ellipse, ShapeKind::Line, ShapeKind::Arrow];
@@ -303,6 +303,15 @@ impl App {
                 }
             });
         }
+        if let Some(r) = self.view.annot_rect.filter(|r| canvas.intersects(*r)) {
+            if self.note_edit.is_some() {
+                self.note_editor(ctx, canvas, r);
+            } else if matches!(self.gesture, Gesture::None) && self.editing.is_none() {
+                // Above the selection, clear of its handles.
+                let at = pos2(r.center().x, r.top() - 10.0);
+                self.pill(ctx, "annot-actions", canvas, Align2::CENTER_BOTTOM, at, |app, ui| app.annot_actions(ui));
+            }
+        }
         let toast_y = canvas.bottom() - if narrow { 52.0 } else { 14.0 };
         self.toast(ctx, pos2(canvas.center().x, toast_y));
     }
@@ -332,6 +341,88 @@ impl App {
                     });
                 });
             });
+    }
+
+    /// Action bar of our selected annotation: note and delete.
+    fn annot_actions(&mut self, ui: &mut egui::Ui) {
+        let Some(Selection::Ours(id)) = self.selection.clone() else { return };
+        let Some(a) = self.doc.as_ref().and_then(|d| d.get(&id)) else { return };
+        if a.takes_note() {
+            let label = if a.note.is_empty() { "Add note" } else { "Edit note" };
+            let text = RichText::new(format!("{}  {label}", ph::CHAT_TEXT)).size(13.0);
+            if ui.add(egui::Button::new(text).frame(false).min_size(vec2(0.0, 24.0))).on_hover_text("Enter").clicked() {
+                self.open_note(&id);
+            }
+            ui.separator();
+        }
+        if icon_button(ui, ph::TRASH, "Delete (Del)", true, false, 24.0).clicked() {
+            self.delete_selection();
+        }
+    }
+
+    /// Editor for the selected annotation's note, under the annotation.
+    fn note_editor(&mut self, ctx: &egui::Context, canvas: Rect, r: Rect) {
+        let Some(n) = &mut self.note_edit else { return };
+        let mut done = false;
+        let mut remove = false;
+        let below = r.bottom() + 220.0 < canvas.bottom();
+        let (pivot, at) = if below {
+            (Align2::CENTER_TOP, pos2(r.center().x, r.bottom() + 10.0))
+        } else {
+            (Align2::CENTER_BOTTOM, pos2(r.center().x, r.top() - 10.0))
+        };
+        egui::Area::new(Id::new("note-editor"))
+            .order(egui::Order::Foreground)
+            .pivot(pivot)
+            .fixed_pos(at)
+            .constrain_to(canvas.shrink(8.0))
+            .show(ctx, |ui| {
+                theme::pill(ctx).inner_margin(egui::Margin::same(10)).show(ui, |ui| {
+                    ui.set_width(280.0);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(ph::CHAT_TEXT).color(ACCENT));
+                        ui.label(RichText::new("Note").strong());
+                    });
+                    ui.add_space(4.0);
+                    let id = Id::new("note-edit");
+                    if n.focus {
+                        // Repeated until it sticks (see the text box editor).
+                        ui.memory_mut(|m| m.request_focus(id));
+                    }
+                    let edit = egui::TextEdit::multiline(&mut n.text)
+                        .id(id)
+                        .hint_text("Write a note…")
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(3);
+                    let resp = ui.add(edit);
+                    if resp.has_focus() && !ui.input(|i| i.pointer.any_down() || i.pointer.any_released()) {
+                        n.focus = false;
+                    }
+                    let submit = KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::Enter);
+                    if resp.has_focus() && ui.input_mut(|i| i.consume_shortcut(&submit)) {
+                        done = true;
+                    }
+                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        done = true;
+                    }
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if primary_button(ui, "Done").on_hover_text("Ctrl+Enter").clicked() {
+                            done = true;
+                        }
+                        if !n.text.trim().is_empty() && ui.button("Remove note").clicked() {
+                            remove = true;
+                        }
+                    });
+                });
+            });
+        if remove && let Some(n) = &mut self.note_edit {
+            n.text.clear();
+            done = true;
+        }
+        if done {
+            self.commit_note();
+        }
     }
 
     /// Only annotations from other apps get a floating note; tool settings live in

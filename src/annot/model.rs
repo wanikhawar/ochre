@@ -111,15 +111,19 @@ pub struct Annotation {
     pub page: usize,
     pub style: Style,
     pub kind: Kind,
+    /// Comment attached to the annotation (written as `/Contents`). Unused for text boxes.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub note: String,
 }
 
 impl Annotation {
     pub fn new(page: usize, style: Style, kind: Kind) -> Self {
-        Self { id: new_id(), page, style, kind }
+        Self { id: new_id(), page, style, kind, note: String::new() }
     }
 
-    pub fn translate(&mut self, d: Pt) {
-        let mv = |p: &mut Pt| *p = p.add(d);
+    /// Applies `f` to every point. Direction vectors (a text box's `right`/`down`) are kept.
+    pub fn map_points(&mut self, f: impl Fn(Pt) -> Pt) {
+        let mv = |p: &mut Pt| *p = f(*p);
         match &mut self.kind {
             Kind::Ink { curve, .. } => curve.iter_mut().for_each(mv),
             Kind::Text { origin, .. } => mv(origin),
@@ -129,6 +133,15 @@ impl Annotation {
             }
             Kind::Markup { quads, .. } => quads.iter_mut().flatten().for_each(mv),
         }
+    }
+
+    pub fn translate(&mut self, d: Pt) {
+        self.map_points(|p| p.add(d));
+    }
+
+    /// Whether a note can be attached (text boxes are text already).
+    pub fn takes_note(&self) -> bool {
+        !matches!(self.kind, Kind::Text { .. })
     }
 }
 
@@ -157,4 +170,6 @@ pub struct Foreign {
     pub rect: [f32; 4],
     /// Hidden widgets, links and popups are not selectable.
     pub selectable: bool,
+    /// Its `/Contents` comment, shown read-only.
+    pub note: Option<String>,
 }

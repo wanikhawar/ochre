@@ -12,12 +12,18 @@ use super::color;
 use super::theme::{self, ACCENT, WARN};
 use crate::annot::model::{MarkupKind, ShapeKind};
 use crate::app::{App, PALETTE, Selection, Tool, rgb};
+use crate::config::SidebarTab;
 use crate::doc::Doc;
 use crate::pdf::worker::Target;
 use crate::viewer::{Fit, Gesture};
 
 /// Vertical padding of the app bar; tabs extend over it to fill the bar's height.
 const APP_BAR_MARGIN_Y: f32 = 3.0;
+
+/// Where the status bar's page controls are and where its tool part ends (this
+/// frame), kept in egui's temporary data for tests.
+pub const STATUS_NAV_RECT: &str = "status-nav-rect";
+pub const STATUS_TOOL_END: &str = "status-tool-end";
 
 const SHAPES: [ShapeKind; 6] =
     [ShapeKind::Check, ShapeKind::Cross, ShapeKind::Rect, ShapeKind::Ellipse, ShapeKind::Line, ShapeKind::Arrow];
@@ -36,7 +42,7 @@ pub fn tool_icon(tool: Tool) -> &'static str {
         Tool::Shape(ShapeKind::Arrow) => ph::ARROW_UP_RIGHT,
         Tool::Shape(ShapeKind::Check) => ph::CHECK,
         Tool::Shape(ShapeKind::Cross) => ph::X,
-        Tool::Markup(MarkupKind::Highlight) => ph::MARKER_CIRCLE,
+        Tool::Markup(MarkupKind::Highlight) => ph::TEXT_AA,
         Tool::Markup(MarkupKind::Underline) => ph::TEXT_UNDERLINE,
         Tool::Markup(MarkupKind::StrikeOut) => ph::TEXT_STRIKETHROUGH,
         Tool::Eraser => ph::ERASER,
@@ -101,7 +107,8 @@ impl App {
                     ui.spacing_mut().item_spacing.x = 2.0;
                     let has_doc = self.doc.is_some();
                     let dirty = self.doc.as_ref().is_some_and(Doc::is_dirty);
-                    ui.label(RichText::new(ph::FILE_PDF).size(18.0).color(ACCENT));
+                    ui.add(egui::Image::new(super::brand::icon()).fit_to_exact_size(Vec2::splat(22.0)))
+                        .on_hover_text("Ochre");
                     ui.add_space(6.0);
                     if icon_button(ui, ph::FOLDER_OPEN, "Open… (Ctrl+O)", true, false, 28.0).clicked() {
                         self.request_open(None);
@@ -161,11 +168,23 @@ impl App {
     fn tab_strip(&mut self, ui: &mut egui::Ui, strip: Rect) {
         let p = theme::current(ui.ctx());
         let n = self.tabs.len();
-        let width = (strip.width() / n as f32).clamp(120.0, 220.0);
-        let overflow = (width * n as f32 - strip.width()).max(0.0);
+        // Each tab is as wide as its name needs (up to 340), shrinking evenly
+        // (down to 120) when they don't all fit; past that the strip scrolls.
+        let wanted: Vec<f32> = (0..n)
+            .map(|i| {
+                let name = self.tab_doc(i).map(|d| d.name()).unwrap_or_default();
+                let w = ui.fonts_mut(|f| f.layout_no_wrap(name, FontId::proportional(13.0), Color32::WHITE).size().x);
+                (w + 50.0).clamp(120.0, 340.0)
+            })
+            .collect();
+        let total: f32 = wanted.iter().sum();
+        let fit = if total > strip.width() { (strip.width() / total).max(0.0) } else { 1.0 };
+        let widths: Vec<f32> = wanted.iter().map(|w| (w * fit).max(120.0f32.min(*w))).collect();
+        let lefts: Vec<f32> = widths.iter().scan(0.0, |x, w| { let l = *x; *x += w; Some(l) }).collect();
+        let overflow = (widths.iter().sum::<f32>() - strip.width()).max(0.0);
         if self.reveal_tab {
             // Bring the active tab into view.
-            let (l, r) = (self.active as f32 * width, (self.active + 1) as f32 * width);
+            let (l, r) = (lefts[self.active], lefts[self.active] + widths[self.active]);
             self.tab_scroll = self.tab_scroll.min(l).max(r - strip.width());
             self.reveal_tab = false;
         }
@@ -183,8 +202,8 @@ impl App {
             let (name, dirty, path) = (doc.name(), doc.is_dirty(), doc.path.display().to_string());
             let active = i == self.active;
             let rect = Rect::from_min_size(
-                pos2(strip.left() + i as f32 * width - self.tab_scroll, strip.top()),
-                vec2(width, strip.height()),
+                pos2(strip.left() + lefts[i] - self.tab_scroll, strip.top()),
+                vec2(widths[i], strip.height()),
             );
             let visible = rect.intersect(strip);
             if !visible.is_positive() {
@@ -329,7 +348,6 @@ impl App {
                     self.rail_tool(ui, Tool::Markup(self.last_markup), &MARKUPS.map(Tool::Markup));
                     rail_separator(ui);
                     self.rail_tool(ui, Tool::Eraser, &[]);
-                    self.settings_button(ui);
                 });
             });
     }
@@ -385,18 +403,42 @@ impl App {
 
     /// Sidebar with the document's table of contents. The entry for the part being
     /// read is highlighted; top-level entries start expanded.
-    pub fn outline_panel(&mut self, ui: &mut egui::Ui) {
+    /// Sidebar (F9) with two tabs: the document's table of contents and a list of
+    /// its annotations. At most about a third of the window wide; in a narrow
+    /// window it closes again after you pick an entry.
+    pub fn sidebar(&mut self, ui: &mut egui::Ui) {
         let p = theme::current(ui.ctx());
-        let ctx = ui.ctx().clone();
+        let window = ui.ctx().content_rect().width();
+        let max = (window * 0.36).max(170.0);
         egui::Panel::left("outline")
             .resizable(true)
-            .default_size(260.0)
-            .size_range(160.0..=520.0)
+            .default_size(260f32.min(max))
+            .size_range(160f32.min(max)..=max.min(520.0))
             .frame(egui::Frame::new().fill(p.bar).inner_margin(egui::Margin::symmetric(6, 8)))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.add_space(4.0);
-                    ui.label(RichText::new("Contents").strong());
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    let tabs = [
+                        (SidebarTab::Contents, ph::LIST_BULLETS, "Contents"),
+                        (SidebarTab::Annotations, ph::CHAT_TEXT, "Annotations"),
+                        (SidebarTab::Pages, ph::FILES, "Pages"),
+                    ];
+                    // Names when they fit next to the close button, else icons.
+                    let names_width: f32 = tabs
+                        .iter()
+                        .map(|(_, _, l)| ui.fonts_mut(|f| f.layout_no_wrap(l.to_string(), FontId::proportional(14.0), p.text).size().x) + 18.0)
+                        .sum();
+                    let with_names = names_width + 30.0 <= ui.available_width();
+                    for (tab, icon, label) in tabs {
+                        let on = self.cfg.sidebar_tab == tab;
+                        let text = RichText::new(if with_names { label } else { icon }).color(if on { p.text } else { p.weak });
+                        let text = if on { text.strong() } else { text };
+                        let resp = ui.add(egui::Button::new(text).fill(if on { p.hover } else { Color32::TRANSPARENT }).corner_radius(5));
+                        let resp = if with_names { resp } else { resp.on_hover_text(label) };
+                        if resp.clicked() {
+                            self.cfg.sidebar_tab = tab;
+                        }
+                    }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if icon_button(ui, ph::X, "Close (F9)", true, false, 22.0).clicked() {
                             self.cfg.show_outline = false;
@@ -404,88 +446,335 @@ impl App {
                     });
                 });
                 ui.add_space(4.0);
-                let Some(doc) = &self.doc else { return };
-                if doc.outline.is_empty() {
-                    ui.add_space(8.0);
-                    ui.vertical_centered(|ui| ui.label(weak(ui, "This PDF has no table of contents.")));
-                    return;
-                }
-                let items = doc.outline.clone();
-                let current = self.current_outline_item();
-                let mut clicked: Option<usize> = None;
-                let mut toggled: Option<usize> = None;
-                egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.y = 1.0;
-                    // Entries below a collapsed one are skipped until the level comes back up.
-                    let mut hidden_below: Option<usize> = None;
-                    for (i, item) in items.iter().enumerate() {
-                        if hidden_below.is_some_and(|l| item.level > l) {
-                            continue;
-                        }
-                        hidden_below = None;
-                        let has_children = items.get(i + 1).is_some_and(|n| n.level > item.level);
-                        let open = has_children && ((item.level == 0) != self.outline_toggled.contains(&i));
-                        if has_children && !open {
-                            hidden_below = Some(item.level);
-                        }
-                        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::click());
-                        // A collapsed entry stands in for the current entry hidden inside it.
-                        let contains_current = current.is_some_and(|c| {
-                            c > i && items[i + 1..=c].iter().all(|n| n.level > item.level)
-                        });
-                        let active = current == Some(i) || (has_children && !open && contains_current);
-                        let bg = if active {
-                            p.accent_tint
-                        } else if resp.hovered() {
-                            p.hover
-                        } else {
-                            Color32::TRANSPARENT
-                        };
-                        ui.painter().rect_filled(rect, 5.0, bg);
-                        let x = rect.left() + 4.0 + item.level as f32 * 14.0;
-                        let caret = Rect::from_min_size(pos2(x, rect.top()), vec2(16.0, rect.height()));
-                        if has_children {
-                            let icon = if open { ph::CARET_DOWN } else { ph::CARET_RIGHT };
-                            ui.painter().text(caret.center(), Align2::CENTER_CENTER, icon, FontId::proportional(11.0), p.weak);
-                        }
-                        let text_x = caret.right() + 2.0;
-                        let page = match &item.target {
-                            Some(Target::Page { page, .. }) => format!("{}", page + 1),
-                            _ => String::new(),
-                        };
-                        let painter = ui.painter();
-                        let page_w = painter
-                            .text(rect.right_center() - vec2(6.0, 0.0), Align2::RIGHT_CENTER, &page, FontId::proportional(11.5), p.weak)
-                            .width();
-                        let title_clip = Rect::from_min_max(pos2(text_x, rect.top()), pos2(rect.right() - page_w - 12.0, rect.bottom()));
-                        let color = if active { ACCENT } else { p.text };
-                        let galley = painter.layout_no_wrap(item.title.clone(), FontId::proportional(13.0), color);
-                        let truncated = galley.size().x > title_clip.width();
-                        painter.with_clip_rect(title_clip).galley(
-                            pos2(text_x, rect.center().y - galley.size().y / 2.0),
-                            galley,
-                            color,
-                        );
-                        let resp = if truncated { resp.on_hover_text(&item.title) } else { resp };
-                        if resp.clicked() {
-                            let on_caret = resp.interact_pointer_pos().is_some_and(|q| caret.contains(q));
-                            if has_children && (on_caret || item.target.is_none()) {
-                                toggled = Some(i);
-                            } else {
-                                clicked = Some(i);
-                            }
-                        }
-                    }
-                });
-                if let Some(i) = toggled
-                    && !self.outline_toggled.remove(&i)
-                {
-                    self.outline_toggled.insert(i);
-                }
-                if let Some(t) = clicked.and_then(|i| items[i].target.clone()) {
-                    self.follow(&ctx, &t);
+                let picked = match self.cfg.sidebar_tab {
+                    SidebarTab::Contents => self.contents_list(ui),
+                    SidebarTab::Annotations => self.annotations_list(ui),
+                    SidebarTab::Pages => self.pages_list(ui),
+                };
+                if picked && window < 760.0 {
+                    self.cfg.show_outline = false;
                 }
             });
+    }
+
+    /// The table of contents; returns whether an entry was picked.
+    fn contents_list(&mut self, ui: &mut egui::Ui) -> bool {
+        let p = theme::current(ui.ctx());
+        let ctx = ui.ctx().clone();
+        let Some(doc) = &self.doc else { return false };
+        if doc.outline.is_empty() {
+            ui.add_space(8.0);
+            ui.vertical_centered(|ui| ui.label(weak(ui, "This PDF has no table of contents.")));
+            return false;
+        }
+        let items = doc.outline.clone();
+        let current = self.current_outline_item();
+        let mut clicked: Option<usize> = None;
+        let mut toggled: Option<usize> = None;
+        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 1.0;
+            // Entries below a collapsed one are skipped until the level comes back up.
+            let mut hidden_below: Option<usize> = None;
+            for (i, item) in items.iter().enumerate() {
+                if hidden_below.is_some_and(|l| item.level > l) {
+                    continue;
+                }
+                hidden_below = None;
+                let has_children = items.get(i + 1).is_some_and(|n| n.level > item.level);
+                let open = has_children && ((item.level == 0) != self.outline_toggled.contains(&i));
+                if has_children && !open {
+                    hidden_below = Some(item.level);
+                }
+                let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::click());
+                // A collapsed entry stands in for the current entry hidden inside it.
+                let contains_current = current.is_some_and(|c| {
+                    c > i && items[i + 1..=c].iter().all(|n| n.level > item.level)
+                });
+                let active = current == Some(i) || (has_children && !open && contains_current);
+                let bg = if active {
+                    p.accent_tint
+                } else if resp.hovered() {
+                    p.hover
+                } else {
+                    Color32::TRANSPARENT
+                };
+                ui.painter().rect_filled(rect, 5.0, bg);
+                if active {
+                    // An accent bar marks it; the text stays bright for contrast.
+                    let bar = Rect::from_min_size(rect.min + vec2(0.0, 5.0), vec2(3.0, rect.height() - 10.0));
+                    ui.painter().rect_filled(bar, 1.5, ACCENT);
+                }
+                let x = rect.left() + 4.0 + item.level as f32 * 14.0;
+                let caret = Rect::from_min_size(pos2(x, rect.top()), vec2(16.0, rect.height()));
+                if has_children {
+                    let icon = if open { ph::CARET_DOWN } else { ph::CARET_RIGHT };
+                    ui.painter().text(caret.center(), Align2::CENTER_CENTER, icon, FontId::proportional(11.0), p.weak);
+                }
+                let text_x = caret.right() + 2.0;
+                let page = match &item.target {
+                    Some(Target::Page { page, .. }) => format!("{}", page + 1),
+                    _ => String::new(),
+                };
+                let painter = ui.painter();
+                let page_w = painter
+                    .text(rect.right_center() - vec2(6.0, 0.0), Align2::RIGHT_CENTER, &page, FontId::proportional(11.5), p.weak)
+                    .width();
+                let title_clip = Rect::from_min_max(pos2(text_x, rect.top()), pos2(rect.right() - page_w - 12.0, rect.bottom()));
+                let color = if active && ui.visuals().dark_mode { Color32::WHITE } else { p.text };
+                let galley = painter.layout_no_wrap(item.title.clone(), FontId::proportional(13.0), color);
+                let truncated = galley.size().x > title_clip.width();
+                painter.with_clip_rect(title_clip).galley(
+                    pos2(text_x, rect.center().y - galley.size().y / 2.0),
+                    galley,
+                    color,
+                );
+                let resp = if truncated { resp.on_hover_text(&item.title) } else { resp };
+                if resp.clicked() {
+                    let on_caret = resp.interact_pointer_pos().is_some_and(|q| caret.contains(q));
+                    if has_children && (on_caret || item.target.is_none()) {
+                        toggled = Some(i);
+                    } else {
+                        clicked = Some(i);
+                    }
+                }
+            }
+        });
+        if let Some(i) = toggled
+            && !self.outline_toggled.remove(&i)
+        {
+            self.outline_toggled.insert(i);
+        }
+        match clicked.and_then(|i| items[i].target.clone()) {
+            Some(t) => {
+                self.follow(&ctx, &t);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Every annotation in the document, by page, top to bottom: what it is (or the
+    /// highlighted text), its note, and its page. Clicking one goes to it and
+    /// selects it. Returns whether one was picked.
+    fn annotations_list(&mut self, ui: &mut egui::Ui) -> bool {
+        let p = theme::current(ui.ctx());
+        let Some(doc) = &self.doc else { return false };
+        let entries = self.annotation_entries();
+        if entries.is_empty() {
+            ui.add_space(8.0);
+            ui.vertical_centered(|ui| ui.label(weak(ui, "No annotations yet.")));
+            return false;
+        }
+        // Highlighted text comes from the page text, which loads on demand.
+        let need_text: Vec<usize> = doc
+            .annots
+            .iter()
+            .filter(|a| matches!(a.kind, crate::annot::model::Kind::Markup { .. }))
+            .map(|a| a.page)
+            .collect();
+        for page in need_text {
+            self.request_text(page);
+        }
+        ui.label(weak(ui, format!("{} on {} pages", entries.len(), entries.iter().map(|e| e.page).collect::<std::collections::BTreeSet<_>>().len())).small());
+        ui.add_space(2.0);
+        let mut picked = None;
+        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 1.0;
+            let mut last_page = None;
+            for e in &entries {
+                if last_page != Some(e.page) {
+                    last_page = Some(e.page);
+                    ui.add_space(4.0);
+                    ui.label(weak(ui, format!("PAGE {}", e.page + 1)).small().strong());
+                }
+                let height = if e.note.is_some() { 44.0 } else { 28.0 };
+                let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click());
+                let active = self.selection.as_ref() == Some(&e.sel)
+                    || matches!((&self.selection, &e.sel), (Some(Selection::Many(ids)), Selection::Ours(id)) if ids.contains(id));
+                let bg = if active { p.accent_tint } else if resp.hovered() { p.hover } else { Color32::TRANSPARENT };
+                let painter = ui.painter();
+                painter.rect_filled(rect, 5.0, bg);
+                let top = rect.top() + 14.0;
+                painter.circle_filled(pos2(rect.left() + 10.0, top), 4.5, e.color);
+                painter.text(pos2(rect.left() + 26.0, top), Align2::CENTER_CENTER, e.icon, FontId::proportional(13.0), p.weak);
+                let text_x = rect.left() + 38.0;
+                let clip = Rect::from_min_max(pos2(text_x, rect.top()), rect.right_bottom() - vec2(6.0, 0.0));
+                let painter = painter.with_clip_rect(clip);
+                let mut job = egui::text::LayoutJob::simple_singleline(e.title.clone(), FontId::proportional(13.0), p.text);
+                job.wrap = egui::text::TextWrapping::truncate_at_width(clip.width());
+                let g = painter.layout_job(job);
+                painter.galley(pos2(text_x, top - g.size().y / 2.0), g, p.text);
+                if let Some(note) = &e.note {
+                    let mut job = egui::text::LayoutJob::simple_singleline(
+                        format!("{}  {}", ph::CHAT_TEXT, note.replace('\n', " ")),
+                        FontId::proportional(12.0),
+                        p.weak,
+                    );
+                    job.wrap = egui::text::TextWrapping::truncate_at_width(clip.width());
+                    let g = painter.layout_job(job);
+                    painter.galley(pos2(text_x, top + 9.0), g, p.weak);
+                }
+                let resp = resp.on_hover_text(match &e.note {
+                    Some(n) => format!("{}\n\n{n}", e.title),
+                    None => e.title.clone(),
+                });
+                if resp.clicked() {
+                    picked = Some(e.clone());
+                }
+            }
+        });
+        let Some(e) = picked else { return false };
+        self.go_to_annotation(e.page, e.bounds, e.sel);
+        true
+    }
+
+    /// Page thumbnails with page tools: click to go to a page (Ctrl/Shift+click to
+    /// select several), drag to reorder, and rotate, delete or extract the selected
+    /// pages (or the one in view) from the toolbar or the right-click menu. Returns
+    /// whether a page was picked to go to.
+    fn pages_list(&mut self, ui: &mut egui::Ui) -> bool {
+        #[derive(Clone, Copy)]
+        enum Action {
+            Rotate(bool),
+            Delete,
+            Extract,
+            Go(usize),
+            Move(usize, usize),
+        }
+        let p = theme::current(ui.ctx());
+        let ctx = ui.ctx().clone();
+        let Some(doc) = &self.doc else { return false };
+        let n = doc.pages.len();
+        if n == 0 {
+            return false;
+        }
+        let sizes: Vec<(f32, f32)> = doc.pages.iter().map(|g| g.display_size()).collect();
+        let editable = doc.read_only.is_none();
+        let mut action: Option<Action> = None;
+
+        let tools = |ui: &mut egui::Ui, action: &mut Option<Action>| {
+            let menu = |ui: &mut egui::Ui, label: String, a: Action, action: &mut Option<Action>, enabled: bool| {
+                if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+                    *action = Some(a);
+                    ui.close();
+                }
+            };
+            menu(ui, format!("{}  Rotate left", ph::ARROW_COUNTER_CLOCKWISE), Action::Rotate(false), action, editable);
+            menu(ui, format!("{}  Rotate right", ph::ARROW_CLOCKWISE), Action::Rotate(true), action, editable);
+            menu(ui, format!("{}  Extract to a new PDF…", ph::EXPORT), Action::Extract, action, true);
+            ui.separator();
+            menu(ui, format!("{}  Delete", ph::TRASH), Action::Delete, action, editable);
+        };
+
+        // Toolbar: what's selected, and the tools for it.
+        let selected = self.pages_ui.selected.len();
+        ui.horizontal(|ui| {
+            let what = if selected == 0 { format!("{n} pages") } else { format!("{selected} of {n} selected") };
+            ui.label(weak(ui, what).small());
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 1.0;
+                let target = if selected == 0 { "the page in view" } else { "the selected pages" };
+                for (icon, tip, a, on) in [
+                    (ph::TRASH, format!("Delete {target}"), Action::Delete, editable),
+                    (ph::EXPORT, format!("Extract {target} to a new PDF"), Action::Extract, true),
+                    (ph::ARROW_CLOCKWISE, format!("Rotate {target} right"), Action::Rotate(true), editable),
+                    (ph::ARROW_COUNTER_CLOCKWISE, format!("Rotate {target} left"), Action::Rotate(false), editable),
+                ] {
+                    if icon_button(ui, icon, &tip, on, false, 22.0).clicked() {
+                        action = Some(a);
+                    }
+                }
+            });
+        });
+        ui.add_space(2.0);
+
+        let mut visible = Vec::new();
+        let mut source = egui::scroll_area::ScrollSource::ALL;
+        source.drag = egui::scroll_area::ScrollSource::NONE.drag; // dragging moves pages
+        egui::ScrollArea::vertical().id_salt("page-thumbs").auto_shrink(false).scroll_source(source).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            let width = (ui.available_width() - 20.0).clamp(40.0, crate::app::THUMB_WIDTH);
+            let mut rows = Vec::with_capacity(n);
+            for (i, &(w, h)) in sizes.iter().enumerate() {
+                let height = width * h / w.max(1.0);
+                let (row, resp) = ui.allocate_exact_size(vec2(ui.available_width(), height + 26.0), Sense::click_and_drag());
+                rows.push(row);
+                let is_selected = self.pages_ui.selected.contains(&i);
+                let current = self.view.current_page == i;
+                if ui.is_rect_visible(row) {
+                    visible.push(i);
+                    let painter = ui.painter();
+                    if is_selected {
+                        painter.rect_filled(row, 6.0, p.accent_tint);
+                    } else if resp.hovered() {
+                        painter.rect_filled(row, 6.0, p.hover);
+                    }
+                    let img = Rect::from_min_size(pos2(row.center().x - width / 2.0, row.top() + 5.0), vec2(width, height));
+                    painter.rect_filled(img, 0.0, Color32::WHITE);
+                    if let Some(t) = self.pages_ui.thumbs.get(&i) {
+                        let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+                        painter.image(t.tex.id(), img, uv, Color32::WHITE);
+                    }
+                    let border = if is_selected { Stroke::new(2.0, ACCENT) } else { Stroke::new(1.0, p.border) };
+                    painter.rect_stroke(img, 0.0, border, egui::StrokeKind::Outside);
+                    let label = RichText::new(format!("{}", i + 1)).size(12.0);
+                    let label = if current { label.color(ACCENT).strong() } else { label.color(p.weak) };
+                    let g = painter.layout_no_wrap(label.text().to_owned(), FontId::proportional(12.0), if current { ACCENT } else { p.weak });
+                    painter.galley(pos2(row.center().x - g.size().x / 2.0, img.bottom() + 4.0), g, p.weak);
+                }
+                if resp.clicked() && self.click_page(i, ui.input(|i| i.modifiers)) {
+                    action = Some(Action::Go(i));
+                }
+                if resp.secondary_clicked() && !self.pages_ui.selected.contains(&i) {
+                    self.pages_ui.selected = std::iter::once(i).collect();
+                    self.pages_ui.anchor = Some(i);
+                }
+                resp.context_menu(|ui| tools(ui, &mut action));
+                if resp.drag_started() && editable {
+                    self.pages_ui.dragging = Some(i);
+                }
+            }
+            // Dragging: a line shows where the pages will go; letting go moves them.
+            if let Some(from) = self.pages_ui.dragging {
+                let pointer = ui.input(|i| i.pointer.interact_pos());
+                if let Some(at) = pointer {
+                    let to = rows.iter().position(|r| at.y < r.center().y).unwrap_or(n);
+                    let y = rows.get(to).map_or_else(|| rows[n - 1].bottom() + 1.0, |r| r.top() - 1.0);
+                    let x = rows[0].x_range().shrink(6.0);
+                    ui.painter().hline(x, y, Stroke::new(3.0, ACCENT));
+                    // Scroll when dragging near the top or bottom edge.
+                    let clip = ui.clip_rect();
+                    let edge = if at.y < clip.top() + 30.0 { 8.0 } else if at.y > clip.bottom() - 30.0 { -8.0 } else { 0.0 };
+                    if edge != 0.0 {
+                        ui.scroll_with_delta(vec2(0.0, edge));
+                        ctx.request_repaint();
+                    }
+                    if ui.input(|i| i.pointer.any_released()) {
+                        self.pages_ui.dragging = None;
+                        if to != from && to != from + 1 || self.pages_ui.selected.len() > 1 {
+                            action = Some(Action::Move(from, to));
+                        }
+                    }
+                } else {
+                    self.pages_ui.dragging = None;
+                }
+            }
+        });
+        for i in visible {
+            self.request_thumb(i);
+        }
+        match action {
+            Some(Action::Rotate(cw)) => self.rotate_pages(&ctx, cw),
+            Some(Action::Delete) => self.delete_pages(&ctx),
+            Some(Action::Extract) => self.extract_pages(),
+            Some(Action::Move(from, to)) => self.move_pages(&ctx, from, to),
+            Some(Action::Go(i)) => {
+                self.go_to_page(i);
+                return true;
+            }
+            None => {}
+        }
+        false
     }
 
     /// The outline entry for the part being read: the last one starting at or above
@@ -510,6 +799,109 @@ impl App {
             .map(|(i, _)| i)
     }
 
+    // ------------------------------------------------------------ status bar
+
+
+    /// Bar along the bottom: the active tool (or selection) with its settings on
+    /// the left, page and zoom controls on the right. It has its own strip, so it
+    /// never covers the page.
+    pub fn status_bar(&mut self, ui: &mut egui::Ui) {
+        let p = theme::current(ui.ctx());
+        egui::Panel::bottom("status")
+            .resizable(false)
+            .exact_size(32.0)
+            .frame(egui::Frame::new().fill(p.bar).inner_margin(egui::Margin::symmetric(8, 3)))
+            .show(ui, |ui| {
+                let bar = ui.max_rect();
+                ui.painter().hline(bar.x_range(), bar.top() - 3.0, Stroke::new(1.0, p.border));
+                ui.horizontal_centered(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    let has_pages = self.doc.as_ref().is_some_and(|d| !d.pages.is_empty());
+                    // The page controls' width (from the last frame) is reserved
+                    // first; the tool part gets what's left and shortens to fit.
+                    let id = Id::new("status-nav-width");
+                    let nav_width: f32 = if has_pages { ui.data(|d| d.get_temp(id)).unwrap_or(0.0) } else { 0.0 };
+                    self.tool_status(ui, (bar.width() - nav_width - 12.0).max(0.0));
+                    let tool_end = ui.cursor().min.x - ui.spacing().item_spacing.x;
+                    ui.data_mut(|d| d.insert_temp(Id::new(STATUS_TOOL_END), tool_end));
+                    if has_pages {
+                        // Right-aligned but laid out left to right (a right-to-left
+                        // layout would reverse the controls).
+                        ui.add_space((ui.available_width() - nav_width).max(0.0));
+                        let r = ui.horizontal(|ui| self.nav(ui)).response.rect;
+                        ui.data_mut(|d| d.insert_temp(Id::new(STATUS_NAV_RECT), r));
+                        if (r.width() - nav_width).abs() > 0.5 {
+                            ui.data_mut(|d| d.insert_temp(id, r.width()));
+                            ui.ctx().request_repaint();
+                        }
+                    }
+                });
+            });
+    }
+
+    /// The active tool's (or selection's) name, and a button for its settings,
+    /// in at most `room` points: shortened (summary, then name dropped) to fit.
+    fn tool_status(&mut self, ui: &mut egui::Ui, room: f32) {
+        let p = theme::current(ui.ctx());
+        let (style, sel_tool) = self.shown_style();
+        let tool = sel_tool.unwrap_or(self.tool);
+        let (icon, name) = match (self.group_style(), sel_tool) {
+            (Some(g), _) => (ph::SELECTION_ALL, format!("{} annotations selected", g.count)),
+            (None, Some(t)) => (tool_icon(t), format!("{} · selected", t.label())),
+            (None, None) => (tool_icon(tool), tool.label().to_string()),
+        };
+        let has_settings = tool.has_color() || tool.width_label().is_some();
+        // The settings button shows what they are now: color, width, opacity.
+        let mut summary = Vec::new();
+        if tool.width_label().is_some() {
+            summary.push(format!("{} pt", (style.width * 10.0).round() / 10.0));
+        }
+        if tool.has_color() {
+            summary.push(format!("{:.0}%", style.opacity * 100.0));
+        }
+        let text_width = |t: &str, size: f32| ui.fonts_mut(|f| f.layout_no_wrap(t.to_owned(), FontId::proportional(size), p.text).size().x);
+        let name_w = text_width(&name, 14.0) + 26.0;
+        let summary_w = text_width(&summary.join(" · "), 12.5) + 58.0;
+        let compact_button = 50.0;
+        let (show_name, show_summary) = match has_settings {
+            false => (name_w <= room, false),
+            true if name_w + summary_w <= room => (true, true),
+            true if name_w + compact_button <= room => (true, false),
+            true => (false, false),
+        };
+        let icon_resp = ui.label(RichText::new(icon).size(15.0).color(ACCENT));
+        if show_name {
+            ui.label(RichText::new(&name).color(p.text));
+        } else {
+            icon_resp.on_hover_text(&name);
+        }
+        if !has_settings {
+            return;
+        }
+        ui.add_space(6.0);
+        let text = if show_summary {
+            format!("      {}  {}", summary.join(" · "), ph::CARET_UP)
+        } else {
+            format!("      {}", ph::CARET_UP)
+        };
+        let resp = ui
+            .add(egui::Button::new(RichText::new(text).size(12.5)).corner_radius(6).min_size(vec2(0.0, 24.0)))
+            .on_hover_text("Tool settings: color, width, opacity");
+        if tool.has_color() {
+            let c = pos2(resp.rect.left() + 14.0, resp.rect.center().y);
+            ui.painter().circle_filled(c, 6.5, rgb(style.color));
+            ui.painter().circle_stroke(c, 7.0, Stroke::new(1.0, p.weak));
+        }
+        Popup::menu(&resp)
+            .close_behavior(PopupCloseBehavior::CloseOnClickOutside)
+            .align(egui::RectAlign::TOP_START)
+            .gap(6.0)
+            .show(|ui| {
+                ui.set_width(236.0);
+                self.settings_panel(ui);
+            });
+    }
+
     // ------------------------------------------------------------ floating UI
 
     /// Pills and toast drawn over the page canvas.
@@ -524,11 +916,6 @@ impl App {
             let y = canvas.top() + if narrow && self.properties_visible() { 46.0 } else { 8.0 };
             self.pill(ctx, "search", canvas, Align2::RIGHT_TOP, pos2(canvas.right() - 10.0, y), |app, ui| {
                 app.search_bar(ui);
-            });
-        }
-        if self.doc.as_ref().is_some_and(|d| !d.pages.is_empty()) {
-            self.pill(ctx, "nav", canvas, Align2::RIGHT_BOTTOM, pos2(canvas.right() - 10.0, canvas.bottom() - 10.0), |app, ui| {
-                app.nav(ui);
             });
         }
         if let Some(at) = self.view.sel_anchor.filter(|p| canvas.contains(*p)) {
@@ -562,7 +949,7 @@ impl App {
                 self.pill(ctx, "annot-actions", canvas, Align2::CENTER_BOTTOM, at, |app, ui| app.annot_actions(ui));
             }
         }
-        let toast_y = canvas.bottom() - if narrow { 52.0 } else { 14.0 };
+        let toast_y = canvas.bottom() - 14.0;
         self.toast(ctx, pos2(canvas.center().x, toast_y));
     }
 
@@ -731,45 +1118,6 @@ impl App {
         });
     }
 
-    /// Rail button showing the current color; opens the settings popup for the
-    /// active tool (or the selected annotation).
-    fn settings_button(&mut self, ui: &mut egui::Ui) {
-        let (style, sel_tool) = self.shown_style();
-        let tool = sel_tool.unwrap_or(self.tool);
-        if !tool.has_color() && tool.width_label().is_none() {
-            return;
-        }
-        rail_separator(ui);
-        let p = theme::current(ui.ctx());
-        let (rect, resp) = ui.allocate_exact_size(Vec2::splat(30.0), Sense::click());
-        let open = Popup::is_id_open(ui.ctx(), Popup::default_response_id(&resp));
-        let bg = if open {
-            p.accent_tint
-        } else if resp.hovered() {
-            p.hover
-        } else {
-            Color32::TRANSPARENT
-        };
-        let painter = ui.painter();
-        painter.rect_filled(rect, 6.0, bg);
-        if tool.has_color() {
-            painter.circle_filled(rect.center(), 8.0, rgb(style.color));
-            painter.circle_stroke(rect.center(), 8.5, Stroke::new(1.0, p.weak));
-        } else {
-            painter.text(rect.center(), Align2::CENTER_CENTER, ph::SLIDERS_HORIZONTAL, FontId::proportional(16.0), p.text);
-        }
-        let what = if sel_tool.is_some() { "selected annotation" } else { tool.label() };
-        let resp = resp.on_hover_text(format!("Settings: {what}"));
-        Popup::menu(&resp)
-            .close_behavior(PopupCloseBehavior::CloseOnClickOutside)
-            .align(egui::RectAlign::RIGHT_END)
-            .gap(8.0)
-            .show(|ui| {
-                ui.set_width(236.0);
-                self.settings_panel(ui);
-            });
-    }
-
     fn settings_panel(&mut self, ui: &mut egui::Ui) {
         let (mut style, sel_tool) = self.shown_style();
         let tool = sel_tool.unwrap_or(self.tool);
@@ -797,8 +1145,6 @@ impl App {
             if custom_changed {
                 self.cfg.save();
             }
-            ui.add_space(6.0);
-            color::picker(ui, &mut style.color);
             ui.add_space(4.0);
             ui.separator();
         }
@@ -845,6 +1191,16 @@ impl App {
                 self.cfg.stabilizer = stabilizer_radius(level);
             }
         });
+        // The full picker only when asked for.
+        if tool.has_color() {
+            ui.add_space(2.0);
+            egui::CollapsingHeader::new(RichText::new("Custom color").color(p.weak))
+                .id_salt("custom-color")
+                .default_open(false)
+                .show(ui, |ui| {
+                    color::picker(ui, &mut style.color);
+                });
+        }
         if style != original {
             self.apply_style(style);
         }
@@ -853,7 +1209,7 @@ impl App {
     fn nav(&mut self, ui: &mut egui::Ui) {
         let Some(n) = self.doc.as_ref().map(|d| d.pages.len()) else { return };
         let cur = self.view.current_page + 1;
-        if let Some(&(page, _)) = self.view.back.last() {
+        if let Some(&(page, _, _)) = self.view.back.last() {
             let tip = format!("Back to page {} (Alt+←)", page + 1);
             if icon_button(ui, ph::ARROW_BEND_UP_LEFT, &tip, true, false, 22.0).clicked() {
                 self.go_back();
@@ -961,9 +1317,8 @@ impl App {
                 .show(ui, |ui| {
                     ui.set_width(width);
                     ui.vertical_centered(|ui| {
-                        ui.label(RichText::new(ph::FILE_PDF).size(52.0).color(ACCENT));
-                        ui.add_space(4.0);
-                        ui.label(RichText::new("Ochre").size(24.0).strong());
+                        let dark = ui.visuals().dark_mode;
+                        ui.add(egui::Image::new(super::brand::wordmark(dark)).fit_to_exact_size(vec2(231.0, 90.0)));
                         ui.label(weak(ui, "Read and annotate PDFs"));
                         ui.add_space(14.0);
                         for err in [&self.worker_error, &self.load_error].into_iter().flatten() {
@@ -1016,8 +1371,8 @@ fn setting_row(
     ui.end_row();
 }
 
-/// Smoothing levels 1–10. Level 1 is a 3 px stabilizer; each level adds 1.5 px.
-pub const MIN_STABILIZER: f32 = 3.0;
+/// Smoothing levels 1–10. Level 1 is a 9 px stabilizer; each level adds 1.5 px.
+pub const MIN_STABILIZER: f32 = 9.0;
 const STABILIZER_STEP: f32 = 1.5;
 
 fn stabilizer_level(radius: f32) -> f32 {
@@ -1039,14 +1394,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn smoothing_levels_start_at_three_pixels() {
-        assert_eq!(stabilizer_radius(1.0), 3.0);
-        assert_eq!(stabilizer_level(3.0), 1.0);
+    fn smoothing_levels_start_at_nine_pixels() {
+        // What used to be level 5 is now level 1.
+        assert_eq!(stabilizer_radius(1.0), 9.0);
+        assert_eq!(stabilizer_level(9.0), 1.0);
         // Older, weaker settings show as the lowest level.
-        assert_eq!(stabilizer_level(2.5), 1.0);
+        assert_eq!(stabilizer_level(3.0), 1.0);
         for level in 1..=10 {
             assert_eq!(stabilizer_level(stabilizer_radius(level as f32)), level as f32);
         }
-        assert_eq!(stabilizer_radius(10.0), 16.5);
+        assert_eq!(stabilizer_radius(10.0), 22.5);
     }
 }

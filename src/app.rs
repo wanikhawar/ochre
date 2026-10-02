@@ -13,7 +13,7 @@ use crate::doc::{Cmd, Doc};
 use crate::pdf::worker::{Req, Resp, Target, TextChar, Worker};
 use crate::search::Search;
 use crate::ui::theme;
-use crate::viewer::{Fit, Gesture, Jump, Motion, NoteEdit, Overlay, PageTex, TextEditState, TextSel, View};
+use crate::viewer::{Fit, Gesture, Jump, JumpX, Motion, NoteEdit, Overlay, PageTex, TextEditState, TextSel, View};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tool {
@@ -53,7 +53,7 @@ impl Tool {
             Tool::Select => "Select",
             Tool::Hand => "Pan",
             Tool::Pen => "Pen",
-            Tool::Highlighter => "Highlighter",
+            Tool::Highlighter => "Highlighter pen",
             Tool::Text => "Text",
             Tool::Shape(ShapeKind::Rect) => "Rectangle",
             Tool::Shape(ShapeKind::Ellipse) => "Ellipse",
@@ -155,6 +155,7 @@ pub(crate) enum Pending {
 #[derive(Default)]
 pub struct Tab {
     doc: Option<Doc>,
+    pages_ui: PagesUi,
     sent_generation: u64,
     view: View,
     tex: HashMap<usize, PageTex>,
@@ -167,6 +168,30 @@ pub struct Tab {
     search: Search,
     outline_toggled: HashSet<usize>,
 }
+
+/// A page thumbnail, and what it was made from.
+pub struct Thumb {
+    pub tex: egui::TextureHandle,
+    /// pdfium generation and the page's annotation revision.
+    pub key: (u64, u64),
+}
+
+/// State of the Pages sidebar tab.
+#[derive(Default)]
+pub struct PagesUi {
+    pub thumbs: HashMap<usize, Thumb>,
+    pub in_flight: HashMap<usize, (u64, u64)>,
+    /// Selected pages, and where a Shift+click range starts.
+    pub selected: std::collections::BTreeSet<usize>,
+    pub anchor: Option<usize>,
+    /// A page thumbnail being dragged to a new place.
+    pub dragging: Option<usize>,
+    /// The page layout the page-keyed caches are for.
+    pub seen_layout: Vec<crate::annot::model::PageSlot>,
+}
+
+/// Width of page thumbnails, in points.
+pub const THUMB_WIDTH: f32 = 150.0;
 
 /// Where `doc` is scrolled to in `view`, to remember for next time.
 fn read_pos(doc: &Doc, view: &View) -> Option<ReadPos> {
@@ -233,6 +258,7 @@ pub struct App {
     pub active: usize,
     /// Scroll the tab strip to the active tab (after switching or opening).
     pub(crate) reveal_tab: bool,
+    pub pages_ui: PagesUi,
     /// How far the tab strip is scrolled (when the tabs don't fit).
     pub(crate) tab_scroll: f32,
     /// The last clipboard text pasted and how many times, to step repeated pastes.
@@ -251,6 +277,8 @@ pub(crate) enum FileDialog {
     Open,
     /// Save As for the document at this path (its tab may not be active by then).
     SaveAs(PathBuf),
+    /// Save an extracted PDF (made when Extract was clicked) of this many pages.
+    Extract(Arc<Vec<u8>>, usize),
 }
 
 /// Marks clipboard text holding copied annotations (JSON after it).
@@ -269,6 +297,8 @@ impl App {
     pub fn new(ctx: &egui::Context, paths: impl IntoIterator<Item = PathBuf>) -> Self {
         setup_fonts(ctx);
         theme::install(ctx);
+        // Draws the logo SVGs.
+        egui_extras::install_image_loaders(ctx);
         ctx.options_mut(|o| o.zoom_with_keyboard = false);
         let (worker, worker_error) = match Worker::spawn(ctx.clone()) {
             Ok(w) => (Some(w), None),
@@ -282,7 +312,8 @@ impl App {
             load_error: None,
             sent_generation: 0,
             view: View::default(),
-            tool: Tool::Pen,
+            // Reading first: a stray drag shouldn't draw on the page.
+            tool: Tool::Select,
             last_shape: ShapeKind::Rect,
             last_markup: MarkupKind::Highlight,
             tex: HashMap::new(),
@@ -308,6 +339,7 @@ impl App {
             tabs: Vec::new(),
             active: 0,
             reveal_tab: false,
+            pages_ui: PagesUi::default(),
             tab_scroll: 0.0,
             last_paste: None,
             last_nudge: None,
@@ -328,10 +360,22 @@ impl App {
         self.status = Some((msg.into(), ctx.input(|i| i.time), error));
     }
 
+    /// Drops the drag in progress. The eraser removes annotations as it goes, so a
+    /// cancelled erase puts them back (a finished one is recorded on release).
+    pub fn cancel_gesture(&mut self) {
+        if let Gesture::Erase { removed } = std::mem::replace(&mut self.gesture, Gesture::None)
+            && let Some(doc) = &mut self.doc
+        {
+            for cmd in removed.iter().rev() {
+                doc.apply(cmd, false);
+            }
+        }
+    }
+
     pub fn set_tool(&mut self, tool: Tool) {
         self.commit_edits();
         self.text_sel = None;
-        self.gesture = Gesture::None;
+        self.cancel_gesture();
         if tool != Tool::Select {
             self.select(None);
         }
@@ -364,6 +408,7 @@ impl App {
         if let Some(doc) = &mut self.doc {
             doc.undo();
         }
+        self.follow_layout();
         self.after_history_jump();
     }
 
@@ -372,10 +417,11 @@ impl App {
         if let Some(doc) = &mut self.doc {
             doc.redo();
         }
+        self.follow_layout();
         self.after_history_jump();
     }
 
-    fn after_history_jump(&mut self) {
+    pub(crate) fn after_history_jump(&mut self) {
         self.style_edit = None;
         let valid = match (&self.selection, &self.doc) {
             (Some(Selection::Ours(id)), Some(doc)) => doc.get(id).is_some(),
@@ -675,8 +721,10 @@ impl App {
 
     /// Moves the active tab's state out of `App` (leaving it empty).
     fn take_tab(&mut self) -> Tab {
+        self.cancel_gesture();
         Tab {
             doc: self.doc.take(),
+            pages_ui: std::mem::take(&mut self.pages_ui),
             sent_generation: std::mem::take(&mut self.sent_generation),
             view: std::mem::take(&mut self.view),
             tex: std::mem::take(&mut self.tex),
@@ -694,6 +742,7 @@ impl App {
     /// Makes `t` the active tab's state.
     fn put_tab(&mut self, t: Tab) {
         self.doc = t.doc;
+        self.pages_ui = t.pages_ui;
         self.sent_generation = t.sent_generation;
         self.view = t.view;
         self.tex = t.tex;
@@ -797,6 +846,8 @@ impl App {
 
     /// Goes to a link or table-of-contents target. Page jumps can be undone with Back.
     pub fn follow(&mut self, ctx: &egui::Context, target: &Target) {
+        // Leaving the spot: finish any text or note being typed there.
+        self.commit_edits();
         match target {
             Target::Page { page, x, y } => {
                 let Some(g) = self.doc.as_ref().and_then(|d| d.pages.get(*page)).copied() else { return };
@@ -804,9 +855,9 @@ impl App {
                 let jump = match y {
                     Some(y) => {
                         let at = g.to_display().apply(crate::annot::model::Pt::new(x.unwrap_or(g.bbox[0]), *y));
-                        Jump { page: *page, y: at.y.max(0.0), margin: 12.0, animate: true }
+                        Jump { page: *page, y: at.y.max(0.0), margin: 12.0, x: JumpX::Keep, animate: true }
                     }
-                    None => Jump { page: *page, y: 0.0, margin: crate::viewer::TOP_MARGIN, animate: true },
+                    None => Jump { page: *page, y: 0.0, margin: crate::viewer::TOP_MARGIN, x: JumpX::Keep, animate: true },
                 };
                 self.view.jump = Some(jump);
             }
@@ -826,8 +877,8 @@ impl App {
 
     /// Returns to where the last link or contents jump started.
     pub fn go_back(&mut self) {
-        if let Some((page, y)) = self.view.back.pop() {
-            self.view.jump = Some(Jump { page, y, margin: 0.0, animate: true });
+        if let Some((page, y, x)) = self.view.back.pop() {
+            self.view.jump = Some(Jump { page, y, margin: 0.0, x: JumpX::Left(x), animate: true });
         }
     }
 
@@ -886,6 +937,17 @@ impl App {
                     self.open(Some(p));
                 }
             }
+            FileDialog::Extract(bytes, n) => {
+                let Some(target) = paths.into_iter().next() else { return };
+                let name = target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                match crate::pdf::annots::write_atomically(&target, &bytes) {
+                    Ok(()) => {
+                        let what = if n == 1 { "1 page".to_string() } else { format!("{n} pages") };
+                        self.set_status(ctx, format!("Extracted {what} to {name}"), false);
+                    }
+                    Err(e) => self.set_status(ctx, format!("Extract failed: {e:#}"), true),
+                }
+            }
             FileDialog::SaveAs(doc_path) => {
                 let Some(target) = paths.into_iter().next() else { return };
                 let Some(i) = (0..self.tabs.len()).find(|&i| self.tab_doc(i).is_some_and(|d| d.path == doc_path)) else {
@@ -926,7 +988,7 @@ impl App {
                     if p.fit.is_none() {
                         self.view.zoom = p.zoom.clamp(0.1, 8.0);
                     }
-                    self.view.jump = Some(Jump { page: p.page, y: p.y, margin: 0.0, animate: false });
+                    self.view.jump = Some(Jump { page: p.page, y: p.y, margin: 0.0, x: JumpX::Keep, animate: false });
                 }
                 self.cfg.add_recent(canonical);
                 self.cfg.save();
@@ -964,7 +1026,7 @@ impl App {
         };
         let result = doc.save_to(&target);
         match result {
-            Ok(()) => {
+            Ok(outcome) => {
                 // Foreign indices change after a save; our ids don't.
                 self.selection = kept;
                 self.style_edit = None;
@@ -972,7 +1034,18 @@ impl App {
                 self.cfg.add_recent(target.canonicalize().unwrap_or(target));
                 self.remember_position();
                 self.cfg.save();
-                self.set_status(ctx, "Saved", false);
+                let mut msg = match &outcome {
+                    o if o.conflicts > 0 => format!(
+                        "Saved. {} edited both here and elsewhere: both versions were kept",
+                        if o.conflicts == 1 { "1 annotation was".to_string() } else { format!("{} annotations were", o.conflicts) }
+                    ),
+                    o if o.combined => "Saved, together with changes saved meanwhile from elsewhere".into(),
+                    _ => "Saved".into(),
+                };
+                if outcome.history_cleared {
+                    msg.push_str(". Pages were rearranged elsewhere, so undo history was cleared");
+                }
+                self.set_status(ctx, msg, false);
                 true
             }
             Err(e) => {
@@ -985,6 +1058,7 @@ impl App {
     // ---------------------------------------------------------------- worker
 
     fn pump_worker(&mut self, ctx: &egui::Context) {
+        self.follow_layout();
         let Some(worker) = &self.worker else { return };
         if let Some(doc) = &mut self.doc
             && doc.generation != self.sent_generation {
@@ -1019,6 +1093,9 @@ impl App {
                         Resp::Text { page, chars, .. } => {
                             t.text_chars.insert(page, chars);
                         }
+                        Resp::Rendered { page, thumb: true, .. } => {
+                            t.pages_ui.in_flight.remove(&page);
+                        }
                         Resp::Rendered { page, .. } => {
                             t.in_flight.remove(&page);
                         }
@@ -1040,7 +1117,26 @@ impl App {
                     self.load_error = Some(message);
                     self.close_active_tab();
                 }
-                Resp::Rendered { generation, page, scale, image } => {
+                Resp::Rendered { generation, page, image, thumb: true, .. } => {
+                    let key = self.pages_ui.in_flight.remove(&page);
+                    if generation != doc.generation || page >= doc.pages.len() {
+                        continue;
+                    }
+                    let image = with_annotations(image, doc, page);
+                    let key = key.unwrap_or((generation, 0));
+                    let opts = egui::TextureOptions::LINEAR;
+                    match self.pages_ui.thumbs.get_mut(&page) {
+                        Some(t) => {
+                            t.tex.set(image, opts);
+                            t.key = key;
+                        }
+                        None => {
+                            let tex = ctx.load_texture(format!("thumb{page}"), image, opts);
+                            self.pages_ui.thumbs.insert(page, Thumb { tex, key });
+                        }
+                    }
+                }
+                Resp::Rendered { generation, page, scale, image, .. } => {
                     self.in_flight.remove(&page);
                     if generation != doc.generation {
                         continue;
@@ -1075,8 +1171,177 @@ impl App {
         if self.in_flight.contains_key(&page) {
             return;
         }
-        worker.send(Req::Render { generation: doc.generation, page, scale });
+        worker.send(Req::Render { generation: doc.generation, page, scale, thumb: false });
         self.in_flight.insert(page, (scale, doc.generation));
+    }
+
+    // ---------------------------------------------------------------- pages
+
+    /// The pages page tools act on: the selected ones, else the one in view.
+    pub fn target_pages(&self) -> std::collections::BTreeSet<usize> {
+        if self.pages_ui.selected.is_empty() {
+            std::iter::once(self.view.current_page).collect()
+        } else {
+            self.pages_ui.selected.clone()
+        }
+    }
+
+    /// Whether page tools can change this document.
+    fn pages_editable(&mut self, ctx: &egui::Context) -> bool {
+        let Some(doc) = &self.doc else { return false };
+        if let Some(why) = doc.read_only.clone() {
+            self.set_status(ctx, why, true);
+            return false;
+        }
+        self.commit_edits();
+        true
+    }
+
+    pub fn rotate_pages(&mut self, ctx: &egui::Context, clockwise: bool) {
+        if !self.pages_editable(ctx) {
+            return;
+        }
+        let pages = self.target_pages();
+        if let Some(doc) = &mut self.doc {
+            doc.rotate_pages(&pages, clockwise);
+        }
+        self.follow_layout();
+    }
+
+    pub fn delete_pages(&mut self, ctx: &egui::Context) {
+        if !self.pages_editable(ctx) {
+            return;
+        }
+        let pages = self.target_pages();
+        let Some(doc) = &mut self.doc else { return };
+        if doc.delete_pages(&pages) {
+            self.follow_layout();
+            self.pages_ui.selected.clear();
+            let n = pages.len();
+            let msg = if n == 1 { "Deleted 1 page (Ctrl+Z brings it back)".into() } else { format!("Deleted {n} pages (Ctrl+Z brings them back)") };
+            self.set_status(ctx, msg, false);
+        } else {
+            self.set_status(ctx, "A document needs at least one page", true);
+        }
+    }
+
+    /// Moves the selected pages (or `page` if it isn't selected) to just before `to`.
+    pub fn move_pages(&mut self, ctx: &egui::Context, page: usize, to: usize) {
+        if !self.pages_editable(ctx) {
+            return;
+        }
+        let pages = if self.pages_ui.selected.contains(&page) {
+            self.pages_ui.selected.clone()
+        } else {
+            std::iter::once(page).collect()
+        };
+        // The moved pages stay selected (follow_layout renumbers the selection).
+        self.pages_ui.selected = pages.clone();
+        if let Some(doc) = &mut self.doc {
+            doc.move_pages(&pages, to);
+        }
+        self.follow_layout();
+    }
+
+    /// A click on page `i`'s thumbnail: Ctrl adds or removes it, Shift selects the
+    /// range from the last plain or Ctrl click, a plain click selects just it.
+    /// Returns whether to go to the page (plain click).
+    pub fn click_page(&mut self, i: usize, m: egui::Modifiers) -> bool {
+        let sel = &mut self.pages_ui.selected;
+        if m.command {
+            if !sel.remove(&i) {
+                sel.insert(i);
+            }
+            self.pages_ui.anchor = Some(i);
+            false
+        } else if m.shift {
+            // With no anchor yet (or its page gone), this click becomes it.
+            let from = *self.pages_ui.anchor.get_or_insert(i);
+            *sel = (from.min(i)..=from.max(i)).collect();
+            false
+        } else {
+            *sel = std::iter::once(i).collect();
+            self.pages_ui.anchor = Some(i);
+            true
+        }
+    }
+
+    /// Scrolls to page `i`, finishing any text or note being typed first.
+    pub fn go_to_page(&mut self, i: usize) {
+        self.commit_edits();
+        self.view.goto_page = Some(i);
+    }
+
+    /// Asks where to save the selected pages (or the one in view) as a new PDF.
+    pub fn extract_pages(&mut self) {
+        let mut name = String::from("pages.pdf");
+        let mut dir = None;
+        if let Some(doc) = &self.doc {
+            let stem = doc.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            let pages = self.target_pages();
+            let first = pages.first().map_or(1, |p| p + 1);
+            name = if pages.len() == 1 { format!("{stem} (page {first}).pdf") } else { format!("{stem} (pages).pdf") };
+            dir = doc.path.parent().map(PathBuf::from);
+        }
+        let mut d = rfd::FileDialog::new().add_filter("PDF", &["pdf"]).set_file_name(name);
+        if let Some(dir) = dir {
+            d = d.set_directory(dir);
+        }
+        self.extract_pages_with(move || d.save_file().into_iter().collect());
+    }
+
+    /// Makes the new PDF from the selected pages (or the one in view) right away,
+    /// so what's saved is those pages as they are now, whatever happens while
+    /// `ask` (the save dialog) is open; it's written where `ask` says.
+    pub fn extract_pages_with(&mut self, ask: impl FnOnce() -> Vec<PathBuf> + Send + 'static) {
+        let pages = self.target_pages();
+        self.commit_edits();
+        let Some(doc) = &self.doc else { return };
+        let ctx = self.ctx.clone();
+        match doc.extract_bytes(&pages) {
+            Ok(bytes) => self.show_dialog(FileDialog::Extract(Arc::new(bytes), pages.len()), ask),
+            Err(e) => self.set_status(&ctx, format!("Extract failed: {e:#}"), true),
+        }
+    }
+
+    /// Asks for a thumbnail of `page` unless an up-to-date one is there or coming.
+    pub fn request_thumb(&mut self, page: usize) {
+        let (Some(worker), Some(doc)) = (&self.worker, &self.doc) else { return };
+        let Some(g) = doc.pages.get(page) else { return };
+        let key = (doc.generation, doc.page_rev.get(page).copied().unwrap_or(0));
+        if self.pages_ui.thumbs.get(&page).is_some_and(|t| t.key == key) || self.pages_ui.in_flight.get(&page) == Some(&key) {
+            return;
+        }
+        let scale = THUMB_WIDTH * self.ctx.pixels_per_point() / g.display_size().0.max(1.0);
+        worker.send(Req::Render { generation: doc.generation, page, scale, thumb: true });
+        self.pages_ui.in_flight.insert(page, key);
+    }
+
+    /// Page-keyed caches are for one page order: after pages are rotated, deleted or
+    /// reordered (or undone), they start over.
+    /// The page selection (and its Shift anchor) follows its pages: by page object,
+    /// so after a reorder it's the same pages, and deleted ones drop out.
+    fn follow_layout(&mut self) {
+        let Some(doc) = &self.doc else { return };
+        if self.pages_ui.seen_layout == doc.layout {
+            return;
+        }
+        let old = std::mem::replace(&mut self.pages_ui.seen_layout, doc.layout.clone());
+        if old.is_empty() {
+            return;
+        }
+        let renumber = |p: usize| old.get(p).and_then(|s| doc.layout.iter().position(|t| t.obj == s.obj));
+        self.pages_ui.selected = self.pages_ui.selected.iter().filter_map(|&p| renumber(p)).collect();
+        self.pages_ui.anchor = self.pages_ui.anchor.and_then(renumber);
+        self.tex.clear();
+        self.in_flight.clear();
+        self.overlay.clear();
+        self.text_chars.clear();
+        self.text_requested.clear();
+        self.search.reset_pages();
+        self.pages_ui.thumbs.clear();
+        self.pages_ui.in_flight.clear();
+        self.after_history_jump();
     }
 
     pub fn request_text(&mut self, page: usize) {
@@ -1214,7 +1479,7 @@ impl App {
                 }
             }
             if pressed(sc(none, Key::Escape)) {
-                self.gesture = Gesture::None;
+                self.cancel_gesture();
                 self.select(None);
                 self.text_sel = None;
                 if self.search.open {
@@ -1353,6 +1618,23 @@ impl App {
     }
 }
 
+/// A page thumbnail with our annotations drawn on it (pdfium leaves them out:
+/// Ochre draws them itself).
+fn with_annotations(image: egui::ColorImage, doc: &Doc, page: usize) -> egui::ColorImage {
+    let [w, h] = image.size;
+    let Some(mut pm) = tiny_skia::Pixmap::new(w as u32, h as u32) else { return image };
+    for (dst, src) in pm.pixels_mut().iter_mut().zip(&image.pixels) {
+        *dst = tiny_skia::ColorU8::from_rgba(src.r(), src.g(), src.b(), src.a()).premultiply();
+    }
+    let g = doc.pages[page];
+    let scale = w as f32 / g.display_size().0.max(1.0);
+    let t = g.to_display().then_scale_translate(scale, 0.0, 0.0).to_skia();
+    for a in doc.annots.iter().filter(|a| a.page == page) {
+        crate::annot::raster::draw(&mut pm.as_mut(), a, t);
+    }
+    egui::ColorImage::from_rgba_premultiplied([w, h], pm.data())
+}
+
 pub fn rgb(c: [f32; 3]) -> Color32 {
     Color32::from_rgb((c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8)
 }
@@ -1413,9 +1695,10 @@ impl App {
 
         self.app_bar(ui);
         if self.doc.is_some() {
+            self.status_bar(ui);
             self.tool_rail(ui);
             if self.cfg.show_outline {
-                self.outline_panel(ui);
+                self.sidebar(ui);
             }
         }
         let canvas = egui::CentralPanel::default()

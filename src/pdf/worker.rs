@@ -15,7 +15,8 @@ pub enum Req {
     /// Load `bytes`, removing the given `/Annots` indices per page from the
     /// in-memory copy so pdfium doesn't draw them.
     Load { generation: u64, bytes: Arc<Vec<u8>>, hide: Vec<Vec<usize>> },
-    Render { generation: u64, page: usize, scale: f32 },
+    /// `thumb`: for the page thumbnails, not the page view.
+    Render { generation: u64, page: usize, scale: f32, thumb: bool },
     Text { generation: u64, page: usize },
     /// Forget a loaded document (its tab was closed or it was reloaded).
     Close { generation: u64 },
@@ -56,7 +57,7 @@ pub struct Link {
 pub enum Resp {
     Loaded { generation: u64, pages: Vec<PageGeom>, outline: Vec<OutlineItem>, links: Vec<Vec<Link>> },
     Failed { generation: u64, message: String },
-    Rendered { generation: u64, page: usize, scale: f32, image: egui::ColorImage },
+    Rendered { generation: u64, page: usize, scale: f32, image: egui::ColorImage, thumb: bool },
     Text { generation: u64, page: usize, chars: Vec<TextChar> },
 }
 
@@ -212,10 +213,10 @@ fn run(pdfium: &Pdfium, rx: Receiver<Job>) {
                 }
                 Err(e) => Resp::Failed { generation, message: e.to_string() },
             },
-            Req::Render { generation, page, scale } => {
+            Req::Render { generation, page, scale, thumb } => {
                 let Some(d) = docs.get(&generation) else { continue };
                 match render(d, page, scale) {
-                    Ok(image) => Resp::Rendered { generation, page, scale, image },
+                    Ok(image) => Resp::Rendered { generation, page, scale, image, thumb },
                     Err(_) => continue,
                 }
             }

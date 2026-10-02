@@ -7,7 +7,10 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use eframe::egui::{self, Color32, Key, Rect, pos2};
+use eframe::egui::{self, Key, Rect, pos2};
+
+/// Id of the search field.
+pub const SEARCH_FIELD: &str = "search-field";
 use memchr::memmem;
 
 use crate::annot::model::Pt;
@@ -116,6 +119,11 @@ pub struct Search {
 }
 
 impl Search {
+    /// Forgets results and page text (pages were reordered), keeping the query.
+    pub fn reset_pages(&mut self) {
+        *self = Search { open: self.open, query: std::mem::take(&mut self.query), ..Default::default() };
+    }
+
     pub fn total(&self) -> usize {
         self.order.len()
     }
@@ -223,11 +231,21 @@ impl App {
         ui.label(egui::RichText::new(ph::MAGNIFYING_GLASS).size(13.0).weak());
         let r = ui.add(
             egui::TextEdit::singleline(&mut self.search.query)
+                .id(egui::Id::new(SEARCH_FIELD))
                 .desired_width(160.0)
                 .hint_text("Search  (/ then Enter, n / N)"),
         );
         if std::mem::take(&mut self.search.focus) {
             r.request_focus();
+            // Select the previous query, so typing replaces it.
+            if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), r.id) {
+                let all = egui::text::CCursorRange::two(
+                    egui::text::CCursor::new(0),
+                    egui::text::CCursor::new(self.search.query.chars().count()),
+                );
+                state.cursor.set_char_range(Some(all));
+                state.store(ui.ctx(), r.id);
+            }
         }
         self.update_matches();
         let (enter, shift, escape) =
@@ -277,16 +295,21 @@ impl App {
         }
         let Some(matches) = self.search.by_page.get(&page) else { return };
         let current = self.search.current.and_then(|c| self.search.order.get(c)).copied();
+        // Blue with an outline, so matches don't look like the yellow highlights
+        // saved in the document; the current one is stronger.
+        let accent = crate::ui::theme::ACCENT;
         for (i, rects) in matches.iter().enumerate() {
-            let fill = if current == Some((page, i)) {
-                Color32::from_rgba_unmultiplied(255, 120, 0, 120)
+            let (fill, stroke) = if current == Some((page, i)) {
+                (accent.gamma_multiply(0.35), egui::Stroke::new(2.0, accent))
             } else {
-                Color32::from_rgba_unmultiplied(255, 190, 0, 70)
+                (accent.gamma_multiply(0.12), egui::Stroke::new(1.0, accent.gamma_multiply(0.8)))
             };
             for r in rects {
                 let a = to_screen.apply(Pt::new(r[0], r[1]));
                 let b = to_screen.apply(Pt::new(r[2], r[3]));
-                painter.rect_filled(Rect::from_two_pos(pos2(a.x, a.y), pos2(b.x, b.y)).expand(1.0), 2.0, fill);
+                let rect = Rect::from_two_pos(pos2(a.x, a.y), pos2(b.x, b.y)).expand(1.5);
+                painter.rect_filled(rect, 2.0, fill);
+                painter.rect_stroke(rect, 2.0, stroke, egui::StrokeKind::Outside);
             }
         }
     }

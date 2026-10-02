@@ -147,7 +147,21 @@ pub struct Jump {
     pub page: usize,
     pub y: f32,
     pub margin: f32,
+    pub x: JumpX,
     pub animate: bool,
+}
+
+/// Where a jump goes horizontally (page display points).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum JumpX {
+    /// Leave the horizontal scroll alone.
+    Keep,
+    /// Bring this span into view, centering it if it isn't already.
+    Reveal(f32, f32),
+    /// Center the window on this x.
+    Center(f32),
+    /// Put the window's left edge here (Back).
+    Left(f32),
 }
 
 /// How many positions the Back history keeps.
@@ -170,8 +184,13 @@ pub struct View {
     last_press: Option<(f64, Pos2)>,
     pub goto_page: Option<usize>,
     pub jump: Option<Jump>,
-    /// Positions to return to with Back (page, display y), oldest first.
-    pub back: Vec<(usize, f32)>,
+    /// Zoom and window size during the jump under way, and for how many frames they
+    /// haven't changed: a jump only ends once they've settled.
+    jump_layout: Option<(f32, Vec2)>,
+    jump_stable: u8,
+    /// Positions to return to with Back (page, display y, display x of the
+    /// window's left edge), oldest first.
+    pub back: Vec<(usize, f32, f32)>,
     /// Scroll so this point (user space) of a page is visible.
     pub reveal: Option<(usize, Pt)>,
     pub current_page: usize,
@@ -198,6 +217,8 @@ impl Default for View {
             last_press: None,
             goto_page: None,
             jump: None,
+            jump_layout: None,
+            jump_stable: 0,
             back: Vec::new(),
             reveal: None,
             current_page: 0,
@@ -244,8 +265,9 @@ impl View {
 
     /// Remembers the current position for Back.
     pub fn push_back(&mut self) {
-        if let Some(pos) = self.position() {
-            self.back.push(pos);
+        if let Some((page, y)) = self.position() {
+            let x = (self.viewport.left() - self.page_rects[page].left()) / self.zoom;
+            self.back.push((page, y, x));
             if self.back.len() > MAX_BACK {
                 self.back.remove(0);
             }
@@ -321,12 +343,16 @@ fn screen_bounds(a: &Annotation, aff: &Affine) -> Rect {
     ])
 }
 
-fn render_scale(g: &PageGeom, zoom: f32, ppp: f32) -> f32 {
+/// Scale to render page textures at. `max_side` is the largest texture the GPU
+/// takes; beyond the caps, the texture is stretched (slightly blurry, no crash).
+fn render_scale(g: &PageGeom, zoom: f32, ppp: f32, max_side: usize) -> f32 {
     let (w, h) = g.display_size();
     let want = zoom * ppp;
-    let cap = (MAX_PIXELS / (w * h).max(1.0)).sqrt().min(MAX_SIDE / w.max(h).max(1.0));
-    // Quantize so tiny zoom jitter doesn't trigger re-renders.
-    ((want.min(cap) * 100.0).round() / 100.0).max(0.05)
+    // A couple of pixels short of the limit: sizes are rounded up.
+    let side = MAX_SIDE.min(max_side as f32 - 2.0);
+    let cap = (MAX_PIXELS / (w * h).max(1.0)).sqrt().min(side / w.max(h).max(1.0));
+    // Quantize so tiny zoom jitter doesn't trigger re-renders (down, never past the cap).
+    ((want.min(cap) * 100.0).floor() / 100.0).max(0.05)
 }
 
 fn shift_constrain(shape: ShapeKind, a: Pt, b: Pt) -> Pt {
@@ -487,6 +513,34 @@ pub fn range_text(chars: &[TextChar], start: usize, end: usize) -> String {
     raw.replace("\r\n", "\n").replace('\r', "\n").trim().to_string()
 }
 
+/// The page text under text markup: the characters whose centers fall in its quads.
+pub fn markup_text(chars: &[TextChar], quads: &[[Pt; 4]]) -> String {
+    let inside = |c: &TextChar| {
+        let (x, y) = ((c.rect[0] + c.rect[2]) / 2.0, (c.rect[1] + c.rect[3]) / 2.0);
+        quads.iter().any(|q| {
+            let (xs, ys) = (q.map(|p| p.x), q.map(|p| p.y));
+            let (x0, x1) = (xs.iter().copied().fold(f32::INFINITY, f32::min), xs.iter().copied().fold(f32::NEG_INFINITY, f32::max));
+            let (y0, y1) = (ys.iter().copied().fold(f32::INFINITY, f32::min), ys.iter().copied().fold(f32::NEG_INFINITY, f32::max));
+            x >= x0 && x <= x1 && y >= y0 && y <= y1
+        })
+    };
+    let text: String = chars.iter().filter(|c| !c.ch.is_control() && inside(c)).map(|c| c.ch).collect();
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// One row of the annotations list.
+#[derive(Clone, Debug)]
+pub struct AnnotEntry {
+    pub page: usize,
+    /// Its box on the page (display points: x0, y0 top, x1, y1), to scroll to.
+    pub bounds: [f32; 4],
+    pub sel: Selection,
+    pub icon: &'static str,
+    pub color: Color32,
+    pub title: String,
+    pub note: Option<String>,
+}
+
 /// Groups the selected characters into one quad per text line.
 fn markup_quads(chars: &[TextChar], start: usize, end: usize, g: &PageGeom) -> Vec<[Pt; 4]> {
     let (s, e) = (start.min(end), start.max(end));
@@ -627,13 +681,42 @@ impl App {
         if let Some(p) = self.view.goto_page.take().filter(|p| *p < pages.len()) {
             target = Some(vec2(base.x, page_top(p)));
         }
-        if let Some(j) = self.view.jump.take().filter(|j| j.page < pages.len()) {
-            let t = vec2(base.x, lay.origins[j.page].y + j.y * self.view.zoom - j.margin);
-            if j.animate {
-                target = Some(t);
+        // A jump keeps its destination in page coordinates and is recomputed every
+        // frame until it arrives, so a zoom or window change on the way (e.g. Fit
+        // Width after the sidebar closes) doesn't send it to a stale spot.
+        let zoom = self.view.zoom;
+        let mut jump_target = None;
+        if self.view.jump.is_some() {
+            let layout = (zoom, vp.size());
+            if self.view.jump_layout == Some(layout) {
+                self.view.jump_stable = self.view.jump_stable.saturating_add(1);
             } else {
-                self.view.set_offset = Some(clamp(t));
+                (self.view.jump_layout, self.view.jump_stable) = (Some(layout), 0);
+            }
+            ctx.request_repaint();
+        } else {
+            self.view.jump_layout = None;
+        }
+        if let Some(j) = self.view.jump.as_mut().filter(|j| j.page < pages.len()) {
+            let o = lay.origins[j.page];
+            if let JumpX::Reveal(x0, x1) = j.x {
+                // Scroll sideways only if the span isn't already in view.
+                let (l, r) = (o.x + x0 * zoom, o.x + x1 * zoom);
+                let off = self.view.offset.x;
+                j.x = if l < off + 16.0 || r > off + vp.width() - 16.0 { JumpX::Center((x0 + x1) / 2.0) } else { JumpX::Keep };
+            }
+            let x = match j.x {
+                JumpX::Center(c) => o.x + c * zoom - vp.width() / 2.0,
+                JumpX::Left(l) => o.x + l * zoom,
+                JumpX::Keep | JumpX::Reveal(..) => base.x,
+            };
+            let t = clamp(vec2(x, o.y + j.y * zoom - j.margin));
+            if j.animate {
+                jump_target = Some(t);
+            } else {
+                self.view.set_offset = Some(t);
                 self.view.scroll_target = None;
+                self.view.jump = None;
             }
         }
         if let Some((p, u)) = self.view.reveal.take()
@@ -682,24 +765,38 @@ impl App {
                 target = Some(vec2(base.x, y));
             }
         }
+        // Any other navigation replaces a jump under way.
         if let Some(t) = target {
             self.view.scroll_target = Some(clamp(t));
+            self.view.jump = None;
+        } else if let Some(t) = jump_target {
+            self.view.scroll_target = Some(t);
         }
 
         let dt = ctx.input(|i| i.stable_dt).min(1.0 / 20.0);
         // Wheel or scrollbar input cancels an animated jump.
         if ctx.input(|i| i.smooth_scroll_delta != Vec2::ZERO) {
             self.view.scroll_target = None;
+            self.view.jump = None;
         }
-        // Holding j / k: continuous, frame-rate independent scrolling.
-        let (j, k) = ctx.input(|i| {
+        // Holding j / k or the arrow keys: continuous, frame-rate independent
+        // scrolling. With annotations selected, the arrows nudge them instead.
+        let nudging = self.tool == Tool::Select
+            && matches!(self.selection, Some(crate::app::Selection::Ours(_) | crate::app::Selection::Many(_)));
+        let dir = ctx.input(|i| {
             let plain = !i.modifiers.any();
-            (plain && i.key_down(Key::J), plain && i.key_down(Key::K))
+            let held = |k: Key| plain && i.key_down(k);
+            let arrows = plain && !nudging;
+            let axis = |plus: bool, minus: bool| (plus as i32 - minus as i32) as f32;
+            vec2(
+                axis(arrows && held(Key::ArrowRight), arrows && held(Key::ArrowLeft)),
+                axis(held(Key::J) || (arrows && held(Key::ArrowDown)), held(Key::K) || (arrows && held(Key::ArrowUp))),
+            )
         });
-        if !typing && (j != k) {
+        if !typing && dir != Vec2::ZERO {
             self.view.scroll_target = None;
-            let dir = if j { 1.0 } else { -1.0 };
-            self.view.set_offset = Some(clamp(self.view.offset + vec2(0.0, dir * 1100.0 * dt)));
+            self.view.jump = None;
+            self.view.set_offset = Some(clamp(self.view.offset + dir * 1100.0 * dt));
             ctx.request_repaint();
         } else if let Some(t) = self.view.scroll_target {
             let cur = self.view.offset;
@@ -707,6 +804,11 @@ impl App {
             if (t - next).length() < 0.5 {
                 self.view.set_offset = Some(t);
                 self.view.scroll_target = None;
+                // Arrived; but if the layout is still changing (e.g. the sidebar just
+                // closed), keep the jump so it's recomputed in the new layout.
+                if self.view.jump_stable >= 2 {
+                    self.view.jump = None;
+                }
             } else {
                 self.view.set_offset = Some(next);
                 ctx.request_repaint();
@@ -726,6 +828,7 @@ impl App {
         now: f64,
     ) {
         let painter = ui.painter().clone();
+        let max_side = ui.ctx().input(|i| i.max_texture_side);
         let Some(doc) = &self.doc else { return };
         let pages = doc.pages.clone();
         let generation = doc.generation;
@@ -769,7 +872,7 @@ impl App {
             let rect = self.view.page_rects[i];
             painter.add(page_shadow.as_shape(rect, 0));
             painter.rect_filled(rect, 0.0, Color32::WHITE);
-            let want = render_scale(&pages[i], self.view.zoom, ppp);
+            let want = render_scale(&pages[i], self.view.zoom, ppp, max_side);
             let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
             let need = match self.tex.get(&i) {
                 Some(t) => {
@@ -931,7 +1034,8 @@ impl App {
     fn foreign_rect(&self, i: usize) -> Option<Rect> {
         let doc = self.doc.as_ref()?;
         let f = doc.foreign.get(i)?;
-        let aff = self.view.to_screen(&doc.pages[f.page], f.page);
+        let page = doc.foreign_page(i).filter(|&p| p < doc.pages.len())?;
+        let aff = self.view.to_screen(&doc.pages[page], page);
         let [x0, y0, x1, y1] = f.rect;
         Some(Rect::from_two_pos(pos(aff.apply(Pt::new(x0, y0))), pos(aff.apply(Pt::new(x1, y1)))))
     }
@@ -1080,7 +1184,8 @@ impl App {
             (badge_center(screen_bounds(a, &aff)), Selection::Ours(a.id.clone()), a.note.clone())
         });
         let foreign = doc.foreign.iter().enumerate().filter_map(|(i, f)| {
-            let note = f.note.as_ref().filter(|_| f.page == page && f.selectable && !doc.deleted_foreign.contains(&i))?;
+            let here = doc.foreign_page(i) == Some(page);
+            let note = f.note.as_ref().filter(|_| here && f.selectable && !doc.deleted_foreign.contains(&i))?;
             Some((badge_center(self.foreign_rect(i)?), Selection::Foreign(i), note.clone()))
         });
         ours.chain(foreign).collect()
@@ -1374,6 +1479,75 @@ impl App {
         self.view.sel_anchor = top.map(|r| pos2(r.center().x, r.top() - 6.0));
     }
 
+    /// Every annotation (ours and other apps'), by page and position, for the list.
+    pub fn annotation_entries(&self) -> Vec<AnnotEntry> {
+        let Some(doc) = &self.doc else { return Vec::new() };
+        let shown = |page: usize, r: [f32; 4]| {
+            let g = doc.pages[page].to_display();
+            let pts = [(r[0], r[1]), (r[2], r[1]), (r[0], r[3]), (r[2], r[3])].map(|(x, y)| g.apply(Pt::new(x, y)));
+            let (xs, ys) = (pts.map(|p| p.x), pts.map(|p| p.y));
+            let min = |v: [f32; 4]| v.iter().copied().fold(f32::INFINITY, f32::min);
+            let max = |v: [f32; 4]| v.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            [min(xs), min(ys), max(xs), max(ys)]
+        };
+        let mut out: Vec<AnnotEntry> = doc
+            .annots
+            .iter()
+            .filter(|a| a.page < doc.pages.len())
+            .map(|a| {
+                let tool = crate::app::tool_of(a);
+                let title = match &a.kind {
+                    Kind::Markup { quads, .. } => match self.text_chars.get(&a.page).map(|c| markup_text(c, quads)) {
+                        Some(t) if !t.is_empty() => format!("“{t}”"),
+                        _ => tool.label().to_string(),
+                    },
+                    Kind::Text { text, .. } => text.lines().next().unwrap_or_default().to_string(),
+                    _ => tool.label().to_string(),
+                };
+                AnnotEntry {
+                    page: a.page,
+                    bounds: shown(a.page, geometry::bounds(a)),
+                    sel: Selection::Ours(a.id.clone()),
+                    icon: crate::ui::chrome::tool_icon(tool),
+                    color: crate::app::rgb(a.style.color),
+                    title,
+                    note: (!a.note.is_empty()).then(|| a.note.clone()),
+                }
+            })
+            .collect();
+        out.extend(doc.foreign.iter().enumerate().filter_map(|(i, f)| {
+            let page = doc.foreign_page(i).filter(|&p| p < doc.pages.len() && f.selectable && !doc.deleted_foreign.contains(&i))?;
+            Some(AnnotEntry {
+                page,
+                bounds: shown(page, f.rect),
+                sel: Selection::Foreign(i),
+                icon: egui_phosphor::regular::INFO,
+                color: crate::ui::theme::WARN,
+                title: match &f.text {
+                    Some(t) => format!("{}: {}  · other app", f.kind_name(), t.lines().next().unwrap_or_default()),
+                    None => format!("{}  · other app", f.kind_name()),
+                },
+                note: f.note.clone(),
+            })
+        }));
+        out.sort_by(|a, b| a.page.cmp(&b.page).then(a.bounds[1].total_cmp(&b.bounds[1])));
+        out
+    }
+
+    /// Scrolls to an annotation's box `bounds` (display points) on both axes (Back
+    /// returns) and selects it, finishing any text or note being typed first.
+    pub fn go_to_annotation(&mut self, page: usize, bounds: [f32; 4], sel: Selection) {
+        self.commit_edits();
+        self.view.push_back();
+        let [x0, y0, x1, _] = bounds;
+        self.view.jump = Some(Jump { page, y: y0.max(0.0), margin: 80.0, x: JumpX::Reveal(x0, x1), animate: true });
+        if self.tool != Tool::Select {
+            self.set_tool(Tool::Select);
+        }
+        self.text_sel = None;
+        self.select(Some(sel));
+    }
+
     /// Turns the text selection into a highlight / underline / strike-out annotation.
     pub fn markup_selection(&mut self, markup: MarkupKind) {
         let Some((page, quads)) = self.selection_quads().filter(|(_, q)| !q.is_empty()) else { return };
@@ -1397,7 +1571,7 @@ impl App {
             .enumerate()
             .rev()
             .find(|(i, f)| {
-                f.page == page
+                doc.foreign_page(*i) == Some(page)
                     && f.selectable
                     && !doc.deleted_foreign.contains(i)
                     && u.x >= f.rect[0] - tol
@@ -1927,6 +2101,7 @@ mod tests {
     use super::*;
     use crate::doc::Doc;
     use eframe::egui::{Modifiers, RawInput};
+    use std::collections::BTreeSet;
 
     /// One page with two lines of Helvetica text and a foreign square annotation.
     fn text_pdf(path: &std::path::Path) {
@@ -1978,13 +2153,15 @@ mod tests {
         app: App,
         t: f64,
         mods: Modifiers,
+        /// Window size.
+        size: Vec2,
     }
 
     impl Harness {
         fn frame(&mut self, events: Vec<Event>) {
             self.t += 1.0 / 60.0;
             let input = RawInput {
-                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 1500.0))),
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, self.size)),
                 time: Some(self.t),
                 // Held modifiers, as a real window reports them.
                 events: [vec![Event::ModifiersChanged(self.mods)], events].concat(),
@@ -2029,8 +2206,10 @@ mod tests {
             self.drag(&[p]);
         }
 
+        /// A key tap: pressed and released, with `modifiers` held meanwhile.
         fn key(&mut self, key: Key, modifiers: Modifiers) {
-            self.frame(vec![Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }]);
+            let ev = |pressed| Event::Key { key, physical_key: None, pressed, repeat: false, modifiers };
+            self.frame(vec![Event::ModifiersChanged(modifiers), ev(true), ev(false)]);
         }
 
         fn doc(&self) -> &Doc {
@@ -2106,7 +2285,7 @@ mod tests {
             eprintln!("pdfium not available, skipping: {:?}", app.worker_error);
             return;
         }
-        let mut h = Harness { ctx, app, t: 0.0, mods: Modifiers::NONE };
+        let mut h = Harness { ctx, app, t: 0.0, mods: Modifiers::NONE, size: vec2(1000.0, 1500.0) };
         h.wait_until("pages", |a| a.doc.as_ref().is_some_and(|d| !d.pages.is_empty()));
         h.frame(vec![]);
 
@@ -2208,7 +2387,7 @@ mod tests {
             eprintln!("pdfium not available, skipping: {:?}", app.worker_error);
             return;
         }
-        let mut h = Harness { ctx, app, t: 0.0, mods: Modifiers::NONE };
+        let mut h = Harness { ctx, app, t: 0.0, mods: Modifiers::NONE, size: vec2(1000.0, 1500.0) };
         let name = |h: &Harness| h.doc().name();
         let loaded = |a: &App| a.doc.as_ref().is_some_and(|d| !d.pages.is_empty());
         // Both files open in tabs; the last one is active.
@@ -2283,7 +2462,7 @@ mod tests {
             eprintln!("pdfium not available, skipping: {:?}", app.worker_error);
             return;
         }
-        let mut h = Harness { ctx, app, t: 0.0, mods: Modifiers::NONE };
+        let mut h = Harness { ctx, app, t: 0.0, mods: Modifiers::NONE, size: vec2(1000.0, 1500.0) };
         h.wait_until("pages", |a| a.doc.as_ref().is_some_and(|d| !d.pages.is_empty()));
         h.frame(vec![]);
         h.app.set_tool(Tool::Shape(ShapeKind::Rect));
@@ -2411,7 +2590,7 @@ mod tests {
             eprintln!("pdfium not available, skipping: {:?}", app.worker_error);
             return;
         }
-        let mut h = Harness { ctx, app, t: 0.0, mods: Modifiers::NONE };
+        let mut h = Harness { ctx, app, t: 0.0, mods: Modifiers::NONE, size: vec2(1000.0, 1500.0) };
         h.wait_until("pages", |a| a.doc.as_ref().is_some_and(|d| !d.pages.is_empty()));
 
         // A dialog that takes a while to answer: frames keep coming meanwhile.
@@ -2446,6 +2625,452 @@ mod tests {
     }
 
     #[test]
+    fn cancelling_the_eraser_puts_back_what_it_erased() {
+        let dir = std::env::temp_dir().join(format!("ochre-erase-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("erase.pdf");
+        text_pdf(&path);
+        let ctx = egui::Context::default();
+        let app = App::new(&ctx, Some(path));
+        if app.worker.is_none() {
+            eprintln!("pdfium not available, skipping: {:?}", app.worker_error);
+            return;
+        }
+        let mut h = Harness { ctx, app, t: 0.0, mods: Modifiers::NONE, size: vec2(1000.0, 1500.0) };
+        h.wait_until("pages", |a| a.doc.as_ref().is_some_and(|d| !d.pages.is_empty()));
+        h.frame(vec![]);
+        h.app.set_tool(Tool::Shape(ShapeKind::Rect));
+        h.drag(&[h.at(100.0, 300.0), h.at(150.0, 325.0), h.at(200.0, 350.0)]);
+        let rect = h.doc().annots.clone();
+
+        // Escape, a tool switch or a tab switch in the middle of erasing: nothing is lost.
+        for cancel in [0, 1] {
+            h.app.set_tool(Tool::Eraser);
+            let at = h.at(100.0, 325.0);
+            h.frame(vec![Event::PointerMoved(at)]);
+            h.button(at, true);
+            assert!(h.doc().annots.is_empty(), "erased while dragging");
+            match cancel {
+                0 => h.key(Key::Escape, Modifiers::NONE),
+                _ => h.key(Key::P, Modifiers::NONE),
+            }
+            h.button(at, false);
+            assert_eq!(h.doc().annots, rect, "put back (cancel {cancel})");
+        }
+        // A finished erase is still one undo step.
+        h.app.set_tool(Tool::Eraser);
+        h.drag(&[h.at(100.0, 325.0), h.at(101.0, 325.0)]);
+        assert!(h.doc().annots.is_empty());
+        h.key(Key::Z, Modifiers::COMMAND);
+        assert_eq!(h.doc().annots, rect);
+    }
+
+    #[test]
+    fn reading_defaults_arrow_keys_search_and_annotation_list() {
+        let dir = std::env::temp_dir().join(format!("ochre-ui2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ui2.pdf");
+        text_pdf(&path);
+        let ctx = egui::Context::default();
+        let app = App::new(&ctx, Some(path));
+        if app.worker.is_none() {
+            eprintln!("pdfium not available, skipping: {:?}", app.worker_error);
+            return;
+        }
+        let mut h = Harness { ctx, app, t: 0.0, mods: Modifiers::NONE, size: vec2(1000.0, 1500.0) };
+        h.wait_until("pages", |a| a.doc.as_ref().is_some_and(|d| !d.pages.is_empty()));
+        h.frame(vec![]);
+        // Documents open with Select, not a drawing tool.
+        assert_eq!(h.app.tool, Tool::Select);
+
+        // Holding the down arrow scrolls; releasing stops.
+        let hold = |h: &mut Harness, key: Key, frames: usize| {
+            let ev = |pressed| Event::Key { key, physical_key: None, pressed, repeat: false, modifiers: Modifiers::NONE };
+            h.frame(vec![ev(true)]);
+            for _ in 0..frames {
+                h.frame(vec![]);
+            }
+            h.frame(vec![ev(false)]);
+            h.frame(vec![]);
+        };
+        let y0 = h.app.view.offset.y;
+        hold(&mut h, Key::ArrowDown, 8);
+        let y1 = h.app.view.offset.y;
+        assert!(y1 > y0 + 50.0, "scrolled {}", y1 - y0);
+        hold(&mut h, Key::ArrowUp, 8);
+        assert!(h.app.view.offset.y < y1 - 50.0);
+        // With an annotation selected, the arrows move it instead of the view.
+        h.app.set_tool(Tool::Shape(ShapeKind::Rect));
+        h.drag(&[h.at(100.0, 300.0), h.at(150.0, 325.0), h.at(200.0, 350.0)]);
+        let rect = h.doc().annots[0].clone();
+        h.app.set_tool(Tool::Select);
+        h.app.select(Some(Selection::Ours(rect.id.clone())));
+        let y = h.app.view.offset.y;
+        hold(&mut h, Key::ArrowDown, 8);
+        assert_eq!(h.app.view.offset.y, y);
+        assert_ne!(h.doc().annots[0], rect, "nudged");
+        h.key(Key::Escape, Modifiers::NONE);
+
+        // Ctrl+F opens search with the previous query selected, so typing replaces it.
+        h.app.search.query = "highlight".into();
+        h.key(Key::F, Modifiers::COMMAND);
+        h.frame(vec![]);
+        h.frame(vec![]);
+        let state = egui::TextEdit::load_state(&h.ctx, egui::Id::new(crate::search::SEARCH_FIELD)).unwrap();
+        let range = state.cursor.char_range().unwrap();
+        let (a, b) = (usize::from(range.primary.index), usize::from(range.secondary.index));
+        assert_eq!((a.min(b), a.max(b)), (0, 9), "whole query selected");
+        h.key(Key::Escape, Modifiers::NONE);
+
+        // The annotations list: page order, highlighted text, notes; clicking selects.
+        h.frame(vec![Event::PointerMoved(h.at(80.0, 705.0))]);
+        h.wait_until("text chars", |a| a.text_chars.contains_key(&0));
+        h.app.set_tool(Tool::Markup(MarkupKind::Highlight));
+        h.drag(&[h.at(73.0, 705.0), h.at(150.0, 705.0), h.at(262.0, 705.0)]);
+        let mut noted = h.doc().annots[0].clone();
+        noted.note = "look here".into();
+        h.app.exec(vec![Cmd::Modify { before: h.doc().annots[0].clone(), after: noted.clone() }]);
+        let entries = h.app.annotation_entries();
+        let titles: Vec<&str> = entries.iter().map(|e| e.title.as_str()).collect();
+        assert_eq!(titles.len(), 3, "{titles:?}");
+        assert!(titles[0].starts_with("“Hello world please highlight"), "top of the page first: {titles:?}");
+        // The other app's square (y 400-500) is above the rectangle (y 300-350).
+        assert_eq!(titles[1], "Rectangle  · other app");
+        assert_eq!(titles[2], "Rectangle");
+        assert_eq!(entries[2].note.as_deref(), Some("look here"));
+        let e = entries[2].clone();
+        h.app.go_to_annotation(e.page, e.bounds, e.sel.clone());
+        assert_eq!((h.app.tool, h.app.selection.clone()), (Tool::Select, Some(Selection::Ours(rect.id.clone()))));
+        assert_eq!(h.app.view.back.len(), 1, "Back returns from it");
+    }
+
+    #[test]
+    fn going_to_an_annotation_from_the_list() {
+        let dir = std::env::temp_dir().join(format!("ochre-goto-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("goto.pdf");
+        text_pdf(&path);
+        let ctx = egui::Context::default();
+        let app = App::new(&ctx, Some(path));
+        if app.worker.is_none() {
+            eprintln!("pdfium not available, skipping: {:?}", app.worker_error);
+            return;
+        }
+        let mut h = Harness { ctx, app, t: 0.0, mods: Modifiers::NONE, size: vec2(1000.0, 1500.0) };
+        h.wait_until("pages", |a| a.doc.as_ref().is_some_and(|d| !d.pages.is_empty()));
+        h.frame(vec![]);
+        // A text box, and a rectangle near the right edge of the page.
+        h.app.set_tool(Tool::Text);
+        h.click(h.at(100.0, 200.0));
+        h.frame(vec![]);
+        h.frame(vec![Event::Text("First".into())]);
+        h.app.set_tool(Tool::Shape(ShapeKind::Rect));
+        h.drag(&[h.at(540.0, 100.0), h.at(560.0, 110.0), h.at(580.0, 120.0)]);
+        h.app.set_tool(Tool::Select);
+        let entry = |h: &Harness, title: &str| h.app.annotation_entries().into_iter().find(|e| e.title == title).unwrap();
+
+        // Editing the text box, then picking the rectangle in the list: the edit is
+        // finished, and typing no longer goes into the text box.
+        let text = entry(&h, "First");
+        h.app.edit_text(match &text.sel {
+            Selection::Ours(id) => id,
+            _ => unreachable!(),
+        });
+        h.frame(vec![]);
+        assert!(h.app.editing.is_some());
+        let rect = entry(&h, "Rectangle");
+        h.app.go_to_annotation(rect.page, rect.bounds, rect.sel.clone());
+        assert!(h.app.editing.is_none(), "the text box edit was finished");
+        h.frame(vec![Event::Text(" typed later".into())]);
+        assert_eq!(entry(&h, "First").title, "First");
+
+        // Zoomed in with the view at the left edge: going to the rectangle on the
+        // right also scrolls sideways, so it's actually on screen.
+        h.app.view.zoom_by(3.0);
+        h.frame(vec![]);
+        h.frame(vec![]);
+        h.app.view.set_offset = Some(vec2(0.0, h.app.view.offset.y));
+        h.frame(vec![]);
+        let rect = entry(&h, "Rectangle");
+        h.app.go_to_annotation(rect.page, rect.bounds, rect.sel.clone());
+        h.wait_until("scroll settles", |a| a.view.scroll_target.is_none());
+        h.frame(vec![]);
+        let shown = h.app.view.viewport;
+        let on_screen = h.at(560.0, 110.0);
+        assert!(shown.contains(on_screen), "{on_screen:?} not in {shown:?}");
+    }
+
+    #[test]
+    fn jumps_land_after_the_layout_changes_and_back_restores_both_axes() {
+        let dir = std::env::temp_dir().join(format!("ochre-jump-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("jump.pdf");
+        reading_pdf(&path);
+        let ctx = egui::Context::default();
+        let app = App::new(&ctx, Some(path));
+        if app.worker.is_none() {
+            eprintln!("pdfium not available, skipping: {:?}", app.worker_error);
+            return;
+        }
+        let mut h = Harness { ctx, app, t: 0.0, mods: Modifiers::NONE, size: vec2(680.0, 500.0) };
+        h.wait_until("pages", |a| a.doc.as_ref().is_some_and(|d| !d.pages.is_empty()));
+        // A rectangle near the bottom right of page 3.
+        let page = 2;
+        h.app.exec(vec![Cmd::Add(Annotation::new(
+            page,
+            Style::new([0.9, 0.1, 0.1], 2.0, 1.0),
+            Kind::Shape { shape: ShapeKind::Rect, a: Pt::new(500.0, 100.0), b: Pt::new(560.0, 140.0) },
+        ))]);
+        let entry = || -> Box<dyn Fn(&Harness) -> AnnotEntry> {
+            Box::new(|h: &Harness| h.app.annotation_entries().into_iter().find(|e| e.title == "Rectangle").unwrap())
+        };
+        let entry = entry();
+        let settle = |h: &mut Harness| {
+            for _ in 0..3 {
+                h.frame(vec![]);
+            }
+            h.wait_until("scroll settles", |a| a.view.scroll_target.is_none() && a.view.jump.is_none());
+            h.frame(vec![]);
+        };
+        let visible = |h: &Harness| {
+            let g = h.doc().pages[page];
+            let on_screen = pos(h.app.view.to_screen(&g, page).apply(Pt::new(530.0, 120.0)));
+            (h.app.view.viewport.contains(on_screen), on_screen, h.app.view.viewport)
+        };
+
+        // In a narrow window the sidebar closes after picking, so Fit Width rescales
+        // the pages while the jump is under way: it still lands on the annotation.
+        h.app.cfg.show_outline = true;
+        settle(&mut h);
+        let zoom_with_sidebar = h.app.view.zoom;
+        let e = entry(&h);
+        h.app.go_to_annotation(e.page, e.bounds, e.sel.clone());
+        h.app.cfg.show_outline = false;
+        settle(&mut h);
+        assert!(h.app.view.zoom > zoom_with_sidebar, "the pages got wider");
+        let (shown, at, vp) = visible(&h);
+        assert!(shown, "{at:?} not in {vp:?}");
+
+        // Zoomed in at the left edge: going to it scrolls sideways, and Back
+        // returns to the left edge as well as the old line.
+        h.key(Key::G, Modifiers::NONE);
+        h.key(Key::G, Modifiers::NONE);
+        settle(&mut h);
+        h.app.view.zoom_by(3.0);
+        settle(&mut h);
+        h.app.view.set_offset = Some(vec2(0.0, h.app.view.offset.y));
+        h.frame(vec![]);
+        let before = h.app.view.offset;
+        let e = entry(&h);
+        h.app.go_to_annotation(e.page, e.bounds, e.sel.clone());
+        settle(&mut h);
+        assert!(visible(&h).0);
+        assert!(h.app.view.offset.x > 100.0, "scrolled sideways");
+        h.app.go_back();
+        settle(&mut h);
+        let after = h.app.view.offset;
+        assert!((after - before).length() < 2.0, "{before:?} -> {after:?}");
+    }
+
+    #[test]
+    fn a_jump_from_the_bottom_still_lands_after_the_sidebar_closes() {
+        let dir = std::env::temp_dir().join(format!("ochre-bottom-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bottom.pdf");
+        reading_pdf(&path);
+        let ctx = egui::Context::default();
+        let app = App::new(&ctx, Some(path));
+        if app.worker.is_none() {
+            eprintln!("pdfium not available, skipping: {:?}", app.worker_error);
+            return;
+        }
+        let mut h = Harness { ctx, app, t: 0.0, mods: Modifiers::NONE, size: vec2(680.0, 500.0) };
+        h.wait_until("pages", |a| a.doc.as_ref().is_some_and(|d| !d.pages.is_empty()));
+        // An annotation near the bottom of the last page.
+        let page = 5;
+        h.app.exec(vec![Cmd::Add(Annotation::new(
+            page,
+            Style::new([0.9, 0.1, 0.1], 2.0, 1.0),
+            Kind::Shape { shape: ShapeKind::Rect, a: Pt::new(100.0, 40.0), b: Pt::new(200.0, 80.0) },
+        ))]);
+        let settle = |h: &mut Harness| {
+            for _ in 0..3 {
+                h.frame(vec![]);
+            }
+            h.wait_until("scroll settles", |a| a.view.scroll_target.is_none() && a.view.jump.is_none());
+            h.frame(vec![]);
+        };
+        // Sidebar open, scrolled to the very bottom, then pick it (the sidebar closes).
+        h.app.cfg.show_outline = true;
+        settle(&mut h);
+        h.key(Key::G, Modifiers::SHIFT);
+        settle(&mut h);
+        let e = h.app.annotation_entries().into_iter().find(|e| e.title == "Rectangle").unwrap();
+        h.app.go_to_annotation(e.page, e.bounds, e.sel.clone());
+        h.app.cfg.show_outline = false;
+        settle(&mut h);
+        let g = h.doc().pages[page];
+        let at = pos(h.app.view.to_screen(&g, page).apply(Pt::new(150.0, 60.0)));
+        assert!(h.app.view.viewport.contains(at), "{at:?} not in {:?}", h.app.view.viewport);
+    }
+
+    #[test]
+    fn page_tools_update_the_view_contents_links_and_thumbnails() {
+        use crate::config::SidebarTab;
+        let dir = std::env::temp_dir().join(format!("ochre-pagetools-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pagetools.pdf");
+        reading_pdf(&path);
+        let ctx = egui::Context::default();
+        let app = App::new(&ctx, Some(path));
+        if app.worker.is_none() {
+            eprintln!("pdfium not available, skipping: {:?}", app.worker_error);
+            return;
+        }
+        let mut h = Harness { ctx, app, t: 0.0, mods: Modifiers::NONE, size: vec2(1000.0, 1500.0) };
+        h.wait_until("pages", |a| a.doc.as_ref().is_some_and(|d| !d.pages.is_empty()));
+        h.frame(vec![]);
+        let reloaded = |a: &App| a.sent_generation == a.doc.as_ref().unwrap().generation && a.doc.as_ref().unwrap().links.len() == a.doc.as_ref().unwrap().pages.len();
+        let ctx = h.ctx.clone();
+        // Before: "Chapter" is page 3, and page 1's link goes to page 3.
+        assert_eq!(h.doc().outline[1].target, Some(Target::Page { page: 2, x: None, y: Some(792.0) }));
+
+        // Move page 3 to the front: the contents and the link follow it.
+        h.app.move_pages(&ctx, 2, 0);
+        h.wait_until("reload", reloaded);
+        h.frame(vec![]);
+        h.wait_until("outline from the new order", |a| a.doc.as_ref().unwrap().outline.get(1).and_then(|o| o.target.clone()) == Some(Target::Page { page: 0, x: None, y: Some(792.0) }));
+        assert_eq!(h.doc().links[1].len(), 1, "the link page is now second");
+        assert_eq!(h.doc().links[1][0].target, Target::Page { page: 0, x: None, y: Some(400.0) });
+        assert_eq!(h.app.pages_ui.selected, BTreeSet::from([0]), "the moved page stays selected");
+
+        // Rotate it: the view shows it turned.
+        h.app.rotate_pages(&ctx, true);
+        h.wait_until("rotated", |a| a.doc.as_ref().unwrap().pages[0].rotation == 90 && a.sent_generation == a.doc.as_ref().unwrap().generation);
+        h.wait_until("pdfium agrees", |a| a.doc.as_ref().unwrap().pages[0].display_size().0 > 700.0);
+
+        // Thumbnails render in the Pages tab.
+        h.app.cfg.show_outline = true;
+        h.app.cfg.sidebar_tab = SidebarTab::Pages;
+        h.wait_until("thumbnails", |a| a.pages_ui.thumbs.len() >= 2);
+
+        // Delete, then undo.
+        h.app.delete_pages(&ctx);
+        assert_eq!(h.doc().pages.len(), 5);
+        h.wait_until("reload", reloaded);
+        h.key(Key::Z, Modifiers::COMMAND);
+        assert_eq!(h.doc().pages.len(), 6);
+        h.wait_until("reload", reloaded);
+        for _ in 0..3 {
+            h.frame(vec![]);
+        }
+    }
+
+    #[test]
+    fn page_selection_extract_and_navigation_edge_cases() {
+        let dir = std::env::temp_dir().join(format!("ochre-pagecases-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (path, out) = (dir.join("cases.pdf"), dir.join("extracted.pdf"));
+        reading_pdf(&path);
+        let ctx = egui::Context::default();
+        let app = App::new(&ctx, Some(path));
+        if app.worker.is_none() {
+            eprintln!("pdfium not available, skipping: {:?}", app.worker_error);
+            return;
+        }
+        let mut h = Harness { ctx, app, t: 0.0, mods: Modifiers::NONE, size: vec2(1000.0, 1500.0) };
+        h.wait_until("pages", |a| a.doc.as_ref().is_some_and(|d| !d.pages.is_empty()));
+        h.frame(vec![]);
+        let ctx = h.ctx.clone();
+        let objs = |h: &Harness| h.doc().layout.iter().map(|s| s.obj).collect::<Vec<_>>();
+        let original = objs(&h);
+
+        // Shift-selection after deleting the selected last page: only pages that exist.
+        h.app.click_page(5, Modifiers::NONE);
+        h.app.delete_pages(&ctx);
+        h.frame(vec![]);
+        h.app.click_page(0, Modifiers::SHIFT);
+        assert_eq!(h.app.pages_ui.selected, BTreeSet::from([0]), "no stale anchor: just the clicked page");
+        h.app.click_page(2, Modifiers::SHIFT);
+        assert_eq!(h.app.pages_ui.selected, BTreeSet::from([0, 1, 2]));
+        assert!(h.app.pages_ui.selected.iter().all(|&p| p < 5));
+        h.key(Key::Z, Modifiers::COMMAND);
+        h.frame(vec![]);
+
+        // Extract page 1 (the only one with a link); move it to the end while the
+        // save dialog is open: page 1 as it was is what's saved, not what's first now.
+        h.app.click_page(0, Modifiers::NONE);
+        let target = out.clone();
+        h.app.extract_pages_with(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            vec![target]
+        });
+        h.app.move_pages(&ctx, 0, 6);
+        h.wait_until("extracted", |_| out.exists());
+        h.frame(vec![]);
+        let extracted = lopdf::Document::load(&out).unwrap();
+        assert_eq!(extracted.get_pages().len(), 1);
+        let got = lopdf::Document::load(&out).unwrap();
+        let page = *got.get_pages().values().next().unwrap();
+        // reading_pdf's pages differ only by page 1's link.
+        assert!(got.get_dictionary(page).unwrap().get(b"Annots").is_ok(), "page 1 (with its link), not the page now first");
+        assert_ne!(objs(&h), original, "the reorder happened");
+
+        // Editing a text box, then clicking a thumbnail: the edit is finished first.
+        h.app.set_tool(Tool::Text);
+        h.click(h.at(100.0, 200.0));
+        h.frame(vec![]);
+        h.frame(vec![Event::Text("Draft".into())]);
+        assert!(h.app.editing.is_some());
+        h.app.go_to_page(3);
+        assert!(h.app.editing.is_none(), "finished before going to the page");
+        h.frame(vec![Event::Text(" more".into())]);
+        let texts: Vec<String> = h.doc().annots.iter().filter_map(|a| match &a.kind {
+            Kind::Text { text, .. } => Some(text.clone()),
+            _ => None,
+        }).collect();
+        assert_eq!(texts, ["Draft"]);
+    }
+
+    #[test]
+    fn page_textures_never_exceed_the_gpu_limit() {
+        let g = PageGeom { bbox: [0.0, 0.0, 612.0, 792.0], rotation: 0 };
+        for max_side in [2048, 4096, 16384] {
+            for zoom in [1.0, 3.0, 8.0] {
+                let s = render_scale(&g, zoom, 2.0, max_side);
+                assert!((792.0 * s).ceil() as usize <= max_side, "zoom {zoom}, limit {max_side}: {}", 792.0 * s);
+            }
+        }
+    }
+
+    #[test]
+    fn status_bar_fits_a_narrow_window() {
+        let dir = std::env::temp_dir().join(format!("ochre-narrow-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("narrow.pdf");
+        text_pdf(&path);
+        let ctx = egui::Context::default();
+        let app = App::new(&ctx, Some(path));
+        if app.worker.is_none() {
+            eprintln!("pdfium not available, skipping: {:?}", app.worker_error);
+            return;
+        }
+        // The smallest window Ochre allows.
+        let mut h = Harness { ctx, app, t: 0.0, mods: Modifiers::NONE, size: vec2(480.0, 360.0) };
+        h.wait_until("pages", |a| a.doc.as_ref().is_some_and(|d| !d.pages.is_empty()));
+        for tool in [Tool::Select, Tool::Highlighter, Tool::Markup(MarkupKind::StrikeOut), Tool::Shape(ShapeKind::Arrow)] {
+            h.app.set_tool(tool);
+            for _ in 0..3 {
+                h.frame(vec![]);
+            }
+            let nav: Rect = h.ctx.data(|d| d.get_temp(egui::Id::new(crate::ui::chrome::STATUS_NAV_RECT))).unwrap();
+            assert!(nav.right() <= 480.0 + 0.5, "{tool:?}: page controls end at {}", nav.right());
+            let tool_end: f32 = h.ctx.data(|d| d.get_temp(egui::Id::new(crate::ui::chrome::STATUS_TOOL_END))).unwrap();
+            assert!(tool_end <= nav.left(), "{tool:?}: tool part ({tool_end}) runs into the page controls ({})", nav.left());
+        }
+    }
+
+    #[test]
     fn box_selection() {
         let dir = std::env::temp_dir().join(format!("ochre-box-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2457,7 +3082,7 @@ mod tests {
             eprintln!("pdfium not available, skipping: {:?}", app.worker_error);
             return;
         }
-        let mut h = Harness { ctx, app, t: 0.0, mods: Modifiers::NONE };
+        let mut h = Harness { ctx, app, t: 0.0, mods: Modifiers::NONE, size: vec2(1000.0, 1500.0) };
         h.wait_until("pages", |a| a.doc.as_ref().is_some_and(|d| !d.pages.is_empty()));
         h.frame(vec![]);
 
@@ -2534,7 +3159,7 @@ mod tests {
             eprintln!("pdfium not available, skipping: {:?}", app.worker_error);
             return;
         }
-        let mut h = Harness { ctx, app, t: 0.0, mods: Modifiers::NONE };
+        let mut h = Harness { ctx, app, t: 0.0, mods: Modifiers::NONE, size: vec2(1000.0, 1500.0) };
         h.wait_until("pages", |a| a.doc.as_ref().is_some_and(|d| !d.pages.is_empty()));
         h.wait_until("first render", |a| !a.tex.is_empty());
         assert_eq!(h.doc().foreign.len(), 1);

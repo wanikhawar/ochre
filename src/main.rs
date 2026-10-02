@@ -12,8 +12,12 @@ mod viewer;
 fn main() -> eframe::Result {
     // Every file given on the command line opens in its own tab.
     let paths: Vec<std::path::PathBuf> = std::env::args_os().skip(1).map(Into::into).collect();
+    let mut viewport = eframe::egui::ViewportBuilder::default();
+    if let Some(icon) = ui::brand::window_icon() {
+        viewport = viewport.with_icon(icon);
+    }
     let options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
+        viewport: viewport
             .with_title("Ochre")
             .with_app_id("ochre")
             .with_inner_size([1200.0, 900.0])

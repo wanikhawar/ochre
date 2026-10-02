@@ -219,7 +219,6 @@ pub fn new_id() -> String {
 /// select and (on explicit request) delete it; its PDF object is never rewritten.
 #[derive(Clone, Debug)]
 pub struct Foreign {
-    pub page: usize,
     /// Index in the page's `/Annots` array in the loaded file.
     pub index: usize,
     /// `/Annots` indices of its popup(s), removed together with it.
@@ -238,4 +237,68 @@ pub struct Foreign {
     /// Whether it's in the page's `/Annots` in the loaded file. A deleted one stays
     /// known, detached, after saving, so undo can put it back.
     pub attached: bool,
+    /// Its `/NM` (unique name), if it has one.
+    pub nm: Option<String>,
+    /// A text box's text (its `/Contents`, which isn't a comment there).
+    pub text: Option<String>,
+    /// The page object it's on.
+    pub page_obj: (u32, u16),
+}
+
+impl Foreign {
+    /// What kind of annotation it is, in plain words.
+    pub fn kind_name(&self) -> &str {
+        match self.subtype.as_str() {
+            "FreeText" => "Text box",
+            "Text" => "Sticky note",
+            "Ink" => "Drawing",
+            "Square" => "Rectangle",
+            "Circle" => "Ellipse",
+            "StrikeOut" => "Strike-out",
+            "PolyLine" => "Polyline",
+            "FileAttachment" => "Attachment",
+            other => other,
+        }
+    }
+}
+
+/// A page of the document as shown: which page object, turned how far. Page
+/// objects keep their numbers across our saves, so a layout stays meaningful
+/// after saving (and a deleted page can be put back).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PageSlot {
+    pub obj: (u32, u16),
+    /// Clockwise: 0, 90, 180 or 270.
+    pub rotation: u16,
+}
+
+/// What identifies an annotation in a file apart from its object number, which a
+/// program that rewrites the file may change or reuse for something else.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AnnotIdentity {
+    pub subtype: String,
+    pub nm: Option<String>,
+    /// `[x0, y0, x1, y1]` in user space.
+    pub rect: [f32; 4],
+}
+
+impl AnnotIdentity {
+    /// Whether two describe the same annotation: same unique name if both have one,
+    /// otherwise same type and position.
+    pub fn same(&self, other: &AnnotIdentity) -> bool {
+        if self.subtype != other.subtype {
+            return false;
+        }
+        match (&self.nm, &other.nm) {
+            (Some(a), Some(b)) => a == b,
+            (None, None) => self.rect.iter().zip(other.rect).all(|(a, b)| (a - b).abs() < 0.01),
+            _ => false,
+        }
+    }
+}
+
+impl Foreign {
+    pub fn identity(&self) -> AnnotIdentity {
+        AnnotIdentity { subtype: self.subtype.clone(), nm: self.nm.clone(), rect: self.rect }
+    }
 }

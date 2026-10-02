@@ -18,13 +18,68 @@ pub const PRIVATE_KEY: &[u8] = b"OchreData";
 /// Key used before the app was renamed (InkPDF); still read.
 pub const LEGACY_PRIVATE_KEY: &[u8] = b"InkPDFData";
 
-/// What we store under [`PRIVATE_KEY`]. `rect` is the `/Rect` we wrote: if another
-/// app later edits the annotation, `/Rect` no longer matches and we leave it alone.
+/// What we store under [`PRIVATE_KEY`]. `rect` and `written` record the
+/// annotation as we wrote it: if another app later edits it, they no longer match
+/// and we leave it to that app.
 #[derive(Serialize, Deserialize)]
 pub struct Private {
     pub v: u32,
     pub rect: [f32; 4],
     pub annot: Annotation,
+    /// Absent in files saved before 1.2.1, which are checked by `/Rect` alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub written: Option<Fingerprint>,
+}
+
+/// Entries other viewers change when they edit an annotation: its comment, color,
+/// modification date and appearance (which they redraw). The appearance is a hash
+/// of its drawing, so a program that just renumbers or recompresses the file's
+/// objects when saving doesn't count as an edit.
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+pub struct Fingerprint {
+    pub contents: Option<String>,
+    pub color: Option<Vec<f32>>,
+    pub modified: Option<String>,
+    pub appearance: Option<String>,
+}
+
+/// FNV-1a: a hash that stays the same across Rust versions and platforms.
+fn stable_hash(bytes: &[u8]) -> String {
+    let h = bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3));
+    format!("{h:016x}")
+}
+
+/// Hash of the drawing of an annotation's normal appearance stream.
+pub fn appearance_hash(doc: &Document, d: &Dictionary) -> Option<String> {
+    let id = d.get(b"AP").and_then(Object::as_dict).ok()?.get(b"N").and_then(Object::as_reference).ok()?;
+    let stream = doc.get_object(id).ok()?.as_stream().ok()?;
+    let content = stream.decompressed_content().unwrap_or_else(|_| stream.content.clone());
+    Some(stable_hash(&content))
+}
+
+impl Fingerprint {
+    /// `appearance` is the [`appearance_hash`] of `d`.
+    pub fn of(d: &Dictionary, appearance: Option<String>) -> Fingerprint {
+        Fingerprint {
+            contents: d.get(b"Contents").and_then(Object::as_str).ok().map(decode_text_string),
+            color: d
+                .get(b"C")
+                .and_then(Object::as_array)
+                .ok()
+                .map(|a| a.iter().filter_map(|v| v.as_float().ok()).collect()),
+            modified: d.get(b"M").and_then(Object::as_str).ok().map(|m| String::from_utf8_lossy(m).into_owned()),
+            appearance,
+        }
+    }
+
+    /// Equal, allowing for number rounding in the file.
+    pub fn same(&self, other: &Fingerprint) -> bool {
+        let colors = match (&self.color, &other.color) {
+            (Some(a), Some(b)) => a.len() == b.len() && a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-3),
+            (a, b) => a.is_none() && b.is_none(),
+        };
+        colors && self.contents == other.contents && self.modified == other.modified && self.appearance == other.appearance
+    }
 }
 
 fn num(v: f32) -> String {
@@ -420,6 +475,7 @@ pub fn add_annotation(doc: &mut Document, a: &Annotation, page: ObjectId) -> Obj
             },
         );
     }
+    let drawing = stable_hash(ops.as_bytes());
     let ap = Stream::new(
         dictionary! {
             "Type" => "XObject",
@@ -432,7 +488,7 @@ pub fn add_annotation(doc: &mut Document, a: &Annotation, page: ObjectId) -> Obj
     let ap_id = doc.add_object(ap);
     annot.set("AP", dictionary! { "N" => ap_id });
 
-    let private = Private { v: 1, rect, annot: a.clone() };
+    let private = Private { v: 1, rect, annot: a.clone(), written: Some(Fingerprint::of(&annot, Some(drawing))) };
     let json = serde_json::to_vec(&private).unwrap_or_default();
     annot.set(PRIVATE_KEY, Object::String(json, StringFormat::Hexadecimal));
     doc.add_object(annot)

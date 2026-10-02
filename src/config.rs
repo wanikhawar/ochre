@@ -19,6 +19,15 @@ pub struct ReadPos {
     pub fit: Option<Fit>,
 }
 
+/// Which list the sidebar shows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SidebarTab {
+    #[default]
+    Contents,
+    Annotations,
+    Pages,
+}
+
 /// How many files' reading positions are kept.
 const MAX_POSITIONS: usize = 200;
 
@@ -32,8 +41,9 @@ pub struct Config {
     pub recent: Vec<PathBuf>,
     /// Custom colors added to the palette.
     pub palette: Vec<[f32; 3]>,
-    /// Whether the table of contents sidebar is shown.
+    /// Whether the sidebar is shown (the name predates its Annotations tab).
     pub show_outline: bool,
+    pub sidebar_tab: SidebarTab,
     /// Reading position per file, most recent first.
     pub positions: Vec<ReadPos>,
 }
@@ -42,10 +52,11 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             styles: BTreeMap::new(),
-            stabilizer: 3.0,
+            stabilizer: crate::ui::chrome::MIN_STABILIZER,
             recent: Vec::new(),
             palette: Vec::new(),
             show_outline: false,
+            sidebar_tab: SidebarTab::Contents,
             positions: Vec::new(),
         }
     }
@@ -79,7 +90,7 @@ impl Config {
             .or_else(|| legacy_path().and_then(|p| std::fs::read_to_string(p).ok()))
             .and_then(|s| toml::from_str::<Config>(&s).ok())
             .map(|mut c| {
-                // Older versions allowed weaker smoothing; 3 px is now the minimum.
+                // Older versions allowed weaker smoothing; 9 px is now the minimum.
                 c.stabilizer = c.stabilizer.max(crate::ui::chrome::MIN_STABILIZER);
                 c
             })

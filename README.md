@@ -1,6 +1,9 @@
-<p align="center"><img src="packaging/ochre.svg" width="96" alt="Ochre icon"></p>
-
-# Ochre
+<h1 align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="packaging/ochre-wordmark-dark.svg">
+    <img src="packaging/ochre-wordmark.svg" width="300" alt="Ochre">
+  </picture>
+</h1>
 
 A fast, lightweight PDF reader and annotator for Linux, written in Rust (egui + pdfium).
 
@@ -14,7 +17,7 @@ A fast, lightweight PDF reader and annotator for Linux, written in Rust (egui + 
   - Shapes: tick, cross, rectangle, ellipse, line and arrow.
   - A tick or cross is placed with a single click.
   - Rectangles and ellipses can be filled, with a separate fill opacity.
-- **Tool settings** in a popup from the tool rail: palette, custom color picker with hex input, and width, size and opacity that you can drag or type.
+- **Tool settings** in a popup from the status bar's settings button: palette, custom color picker with hex input, and width, size and opacity that you can drag or type.
 - **Select**, move, resize, restyle and delete annotations, plus an eraser and undo/redo.
   - Drag a corner handle to resize (Shift keeps the proportions). Resizing a text box changes its font size.
   - Drag either end of a line or arrow.
@@ -27,7 +30,9 @@ A fast, lightweight PDF reader and annotator for Linux, written in Rust (egui + 
   - Annotations with a note show a badge; hover over it to read the note.
   - Notes are saved as standard `/Contents` comments, so Acrobat, Okular and others show them too. Notes on other apps' annotations are shown read-only.
 - **Vim-style navigation** and `/` search (smartcase, n / N).
-- **Contents sidebar** (F9) showing the PDF's table of contents, with the section you're reading highlighted.
+- **Page tools** in the sidebar's Pages tab: thumbnails (with your annotations) to go to a page, and to rotate, delete, reorder (drag) or extract pages to a new PDF. Select several with Ctrl+click / Shift+click; the tools act on the selection, or on the page in view. Annotations, the contents and links follow their pages, and it's all undoable, even after saving.
+- **Sidebar** (F9) with three tabs (contents, annotations, pages); the first two: the PDF's **contents**, with the section you're reading highlighted, and a list of all **annotations** by page (highlighted text, notes, other apps' annotations). Click one to go to it.
+- A **status bar** shows the active tool with a button for its settings (color, width, opacity), and the page and zoom controls, without covering the page.
 - **Links** inside the document work with the Select and Hand tools. Web and email links open in your browser or mail app. Alt+← or the Back button returns to where you were.
 - **Tabs:** every file opens in its own tab, from the Open dialog, Recent files, drag and drop (several at once), or the command line (`ochre a.pdf b.pdf`). Opening a file that's already open switches to its tab. Each tab keeps its own zoom, position, selection and search.
 - **Remembers your place:** each file reopens at the page and zoom where you left it.
@@ -95,11 +100,11 @@ Vim-style navigation works whenever you're not typing in a text field.
 
 | Key | Action |
 |---|---|
-| j / k (hold) | Scroll down / up |
+| j / k, arrow keys (hold) | Scroll (arrows nudge selected annotations instead) |
 | l / h | Next / previous page |
 | Ctrl+D / Ctrl+U | Half a screen down / up |
 | gg / G | First page / end of document |
-| / | Search (Enter to confirm, Esc to cancel) |
+| / | Search (Enter to confirm, Esc to cancel). Ctrl+F reopens it with the last query selected |
 | n / N | Next / previous match (wraps around) |
 | V / P / Shift+H / T / S / M / E | Select / Pen / Highlighter / Text / Shape / Text markup / Eraser |
 | Space + drag, middle drag | Pan |

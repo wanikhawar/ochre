@@ -1,0 +1,38 @@
+[package]
+name = "ochre-pdf"
+version = "1.0.0"
+edition = "2024"
+description = "A fast, lightweight PDF reader and annotator with smooth ink, text markup and vim-style navigation"
+license = "MIT"
+repository = "https://github.com/wanikhawar/ochre"
+readme = "README.md"
+keywords = ["pdf", "annotation", "viewer", "egui"]
+categories = ["gui", "graphics"]
+
+[[bin]]
+name = "ochre"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+crossbeam-channel = "0.5.17"
+directories = "6.0.0"
+eframe = { version = "0.36", default-features = false, features = ["glow", "wayland", "x11", "default_fonts"] }
+egui-phosphor = "0.14"
+lopdf = { version = "0.45", default-features = false }
+memchr = "2.8.3"
+pdfium-render = { version = "0.9", default-features = false, features = ["pdfium_latest"] }
+rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tiny-skia = "0.12"
+toml = "1.1.6"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[profile.dev.package."*"]
+opt-level = 2

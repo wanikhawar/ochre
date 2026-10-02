@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Ochre
+GenericName=PDF Reader & Annotator
+Comment=Read and annotate PDFs
+Exec=ochre %f
+Icon=ochre
+Terminal=false
+Categories=Office;Viewer;
+MimeType=application/pdf;
+StartupWMClass=ochre
+Keywords=pdf;annotate;highlight;reader;viewer;

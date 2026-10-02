@@ -25,7 +25,11 @@ fi
 
 install -Dm755 "$bin" "$PREFIX/bin/ochre"
 install -Dm644 "$lib" "$PREFIX/lib/ochre/libpdfium.so"
-install -Dm644 "$assets/ochre.desktop" "$PREFIX/share/applications/ochre.desktop"
+# Absolute path: app launchers often don't have ~/.local/bin on their PATH.
+mkdir -p "$PREFIX/share/applications"
+sed -e "s|^Exec=ochre |Exec=$PREFIX/bin/ochre |" -e "s|^TryExec=.*|TryExec=$PREFIX/bin/ochre|" \
+    "$assets/ochre.desktop" > "$PREFIX/share/applications/ochre.desktop"
+chmod 644 "$PREFIX/share/applications/ochre.desktop"
 install -Dm644 "$assets/ochre.svg" "$PREFIX/share/icons/hicolor/scalable/apps/ochre.svg"
 command -v update-desktop-database >/dev/null && update-desktop-database "$PREFIX/share/applications" || true
 command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -q "$PREFIX/share/icons/hicolor" 2>/dev/null || true

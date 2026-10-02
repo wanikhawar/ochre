@@ -4,6 +4,7 @@ Name=Ochre
 GenericName=PDF Reader & Annotator
 Comment=Read and annotate PDFs
 Exec=ochre %f
+TryExec=ochre
 Icon=ochre
 Terminal=false
 Categories=Office;Viewer;

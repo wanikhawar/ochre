@@ -1,10 +1,8 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
   <title id="title">Ochre</title>
-  <desc id="desc">An ochre-colored O and an umber pen nib on a folded parchment page.</desc>
-  <path fill="#FAF3E5" stroke="#E5D5B6" stroke-width="1.5" stroke-linejoin="round" d="M66 16h106l68 68v106c0 28-22 50-50 50H66c-28 0-50-22-50-50V66c0-28 22-50 50-50Z"/>
-  <path fill="#E8D7B3" d="M172 16v52c0 9 7 16 16 16h52Z"/>
-  <path fill="#C58A2E" fill-rule="evenodd" d="M117 56C79 56 52 84 52 124c0 42 26 69 64 69s65-27 65-69c0-40-25-68-64-68Zm0 26c22 0 35 16 35 43s-14 44-36 44-35-17-35-44 13-43 36-43Z"/>
-    <path fill="#75442B" stroke="#FAF3E5" stroke-width="8" stroke-linejoin="round" d="m184 117 27 27-40 40-36 18 16-37Z"/>
-    <path fill="none" stroke="#FAF3E5" stroke-width="3.5" stroke-linecap="round" d="m135 202 29-29"/>
-    <circle cx="164" cy="173" r="4.5" fill="#FAF3E5"/>
+  <desc id="desc">Two rings, amber and burnt orange, overlapping into one O.</desc>
+  <g style="isolation:isolate">
+    <path d="M16 96a80 80 0 1 0 160 0a80 80 0 1 0-160 0ZM53 96a43 43 0 1 1 86 0a43 43 0 1 1-86 0Z" fill="#F4B23C" fill-rule="evenodd"/>
+    <path d="M80 160a80 80 0 1 0 160 0a80 80 0 1 0-160 0ZM117 160a43 43 0 1 1 86 0a43 43 0 1 1-86 0Z" fill="#D2561E" fill-rule="evenodd" style="mix-blend-mode:multiply"/>
+  </g>
 </svg>

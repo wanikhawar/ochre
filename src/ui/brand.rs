@@ -7,10 +7,10 @@ use eframe::egui::{self, ImageSource, SizeHint};
 pub const ICON_SVG: &[u8] = include_bytes!("../../packaging/ochre.svg");
 pub const WORDMARK_SVG: &[u8] = include_bytes!("../../packaging/ochre-wordmark.svg");
 
-/// The wordmark's burnt umber, which is too dark on the dark theme...
-const UMBER: &str = "#75442B";
-/// ...where it's drawn in the icon's light parchment instead.
-const PARCHMENT: &str = "#E8D7B3";
+/// The wordmark's near-black lettering, which vanishes on the dark theme...
+const INK: &str = "#2A1F17";
+/// ...where it's drawn in warm cream instead.
+const CREAM: &str = "#F1E6D6";
 
 pub fn icon() -> ImageSource<'static> {
     ImageSource::Bytes { uri: "bytes://ochre.svg".into(), bytes: ICON_SVG.into() }
@@ -22,7 +22,7 @@ pub fn wordmark(dark: bool) -> ImageSource<'static> {
         return ImageSource::Bytes { uri: "bytes://ochre-wordmark.svg".into(), bytes: WORDMARK_SVG.into() };
     }
     static DARK: OnceLock<Vec<u8>> = OnceLock::new();
-    let bytes = DARK.get_or_init(|| String::from_utf8_lossy(WORDMARK_SVG).replace(UMBER, PARCHMENT).into_bytes());
+    let bytes = DARK.get_or_init(|| String::from_utf8_lossy(WORDMARK_SVG).replace(INK, CREAM).into_bytes());
     ImageSource::Bytes { uri: "bytes://ochre-wordmark-dark.svg".into(), bytes: bytes.as_slice().into() }
 }
 
@@ -49,8 +49,8 @@ mod tests {
     #[test]
     fn the_readmes_dark_wordmark_matches_the_wordmark() {
         let dark = include_str!("../../packaging/ochre-wordmark-dark.svg");
-        let expected = String::from_utf8_lossy(WORDMARK_SVG).replace(UMBER, PARCHMENT);
-        assert!(dark == expected, "regenerate packaging/ochre-wordmark-dark.svg from ochre-wordmark.svg ({UMBER} -> {PARCHMENT})");
+        let expected = String::from_utf8_lossy(WORDMARK_SVG).replace(INK, CREAM);
+        assert!(dark == expected, "regenerate packaging/ochre-wordmark-dark.svg from ochre-wordmark.svg ({INK} -> {CREAM})");
     }
 
     #[test]
@@ -60,17 +60,22 @@ mod tests {
         assert!(icon.rgba.chunks(4).any(|p| p[3] > 0), "not blank");
 
         let light = render(WORDMARK_SVG);
-        let dark_bytes = String::from_utf8_lossy(WORDMARK_SVG).replace(UMBER, PARCHMENT);
+        let dark_bytes = String::from_utf8_lossy(WORDMARK_SVG).replace(INK, CREAM);
         let dark = render(dark_bytes.as_bytes());
         assert_eq!(light.size, dark.size);
-        // The lettering (umber when light) is the darkest opaque color in the light
-        // version; in the dark version nothing that dark is left.
+        // The lettering (near-black when light) is the darkest opaque color in the light
+        // version; in the dark version nothing that dark is left. Only the lettering
+        // counts: the tile on its left is the same on both themes.
         let luma = |p: &egui::Color32| {
             let [r, g, b, _] = p.to_srgba_unmultiplied();
             (r as u32 * 3 + g as u32 * 6 + b as u32) / 10
         };
-        let darkest = |img: &egui::ColorImage| img.pixels.iter().filter(|p| p.a() == 255).map(luma).min().unwrap();
-        assert!(darkest(&light) < 100, "umber lettering: {}", darkest(&light));
-        assert!(darkest(&dark) > 100, "parchment lettering: {}", darkest(&dark));
+        let darkest = |img: &egui::ColorImage| {
+            let [w, _] = img.size;
+            let lettering = img.pixels.iter().enumerate().filter(|(i, _)| i % w > w * 2 / 5).map(|(_, p)| p);
+            lettering.filter(|p| p.a() == 255).map(luma).min().unwrap()
+        };
+        assert!(darkest(&light) < 100, "ink lettering: {}", darkest(&light));
+        assert!(darkest(&dark) > 100, "cream lettering: {}", darkest(&dark));
     }
 }

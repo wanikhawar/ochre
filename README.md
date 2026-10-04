@@ -9,6 +9,8 @@ A fast, lightweight PDF reader and annotator for Linux, written in Rust (egui + 
 
 *Ochre* is an earth pigment made of iron oxide (rust, more or less). Scribes and artists have marked up pages with it for centuries.
 
+![A tour of Ochre: highlighting, underlining and striking out text, pen ink, a text box, an arrow, ticks, notes, restyling a selection, page tools, tabs and search](docs/ochre-demo.gif)
+
 ## Features
 
 - **Freehand ink** (pen and highlighter) with smoothing: a stabilizer while drawing, then fitted to Bézier curves, with anti-aliased rendering (tiny-skia).
@@ -38,6 +40,18 @@ A fast, lightweight PDF reader and annotator for Linux, written in Rust (egui + 
 - **Tabs:** every file opens in its own tab, from the Open dialog, Recent files, drag and drop (several at once), or the command line (`ochre a.pdf b.pdf`). Opening a file that's already open switches to its tab. Each tab keeps its own zoom, position, selection and search.
 - **Remembers your place:** each file reopens at the page and zoom where you left it.
 - Zoom (fit width / fit page / Ctrl+wheel), recent files, and light and dark themes that follow the system.
+
+Highlights, notes, ink, a text box and shapes, with the contents in the sidebar:
+
+![Ochre with a highlight that has a note, an underline, pen ink, a text box, an arrow and ticks on the page, and the contents in the sidebar](docs/screenshots/annotate.png)
+
+Select several annotations to move or restyle them together; the sidebar lists every annotation and its note:
+
+![Three annotations selected, the style popup with palette, width, opacity and custom color picker, and the annotations list in the sidebar](docs/screenshots/select-and-style.png)
+
+Page thumbnails with your annotations, two files open in tabs, and search matches on the page:
+
+![The Pages tab with two pages selected and the page tools, two tabs, and a search for "pigment" with its matches outlined](docs/screenshots/pages-tabs-search.png)
 
 ## Annotations are standard PDF annotations
 

@@ -122,6 +122,9 @@ impl App {
                     {
                         self.save(&ctx, true);
                     }
+                    if icon_button(ui, ph::PRINTER, "Print… (Ctrl+P)", has_doc, false, 28.0).clicked() {
+                        self.open_print(&ctx);
+                    }
                     ui.add_space(4.0);
                     ui.separator();
                     let shown = has_doc && self.cfg.show_outline;

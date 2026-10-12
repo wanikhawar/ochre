@@ -11,6 +11,7 @@ use pdfium_render::prelude::*;
 
 use crate::annot::geometry::PageGeom;
 use crate::look::PageLook;
+use crate::print::render::{SheetSpec, apply_tone};
 
 pub enum Req {
     /// Load `bytes`, removing the given `/Annots` indices per page from the
@@ -31,6 +32,19 @@ pub enum Req {
     Text {
         generation: u64,
         page: usize,
+    },
+    /// A printed sheet for the print preview, `scale` pixels per point; `id` comes back with it.
+    Sheet {
+        generation: u64,
+        id: u64,
+        spec: SheetSpec,
+        scale: f32,
+    },
+    /// `bytes` again, with appearances drawn for form fields that ask for them
+    /// (`/NeedAppearances`), so they can be printed.
+    Appearances {
+        generation: u64,
+        bytes: Arc<Vec<u8>>,
     },
     /// Forget a loaded document (its tab was closed or it was reloaded).
     Close {
@@ -75,6 +89,8 @@ pub enum Resp {
     Failed { generation: u64, message: String },
     Rendered { generation: u64, page: usize, scale: f32, image: egui::ColorImage, thumb: bool, look: PageLook },
     Text { generation: u64, page: usize, chars: Vec<TextChar> },
+    Sheet { generation: u64, id: u64, image: egui::ColorImage },
+    Appearances { generation: u64, result: Result<Vec<u8>, String> },
 }
 
 impl Resp {
@@ -83,7 +99,9 @@ impl Resp {
             Resp::Loaded { generation, .. }
             | Resp::Failed { generation, .. }
             | Resp::Rendered { generation, .. }
-            | Resp::Text { generation, .. } => *generation,
+            | Resp::Text { generation, .. }
+            | Resp::Sheet { generation, .. }
+            | Resp::Appearances { generation, .. } => *generation,
         }
     }
 }
@@ -215,9 +233,11 @@ fn run(pdfium: &Pdfium, rx: Receiver<Job>) {
                 docs.remove(g);
             }
             queue.retain(|j| match &j.req {
-                Req::Load { generation, .. } | Req::Render { generation, .. } | Req::Text { generation, .. } => {
-                    !closed.contains(generation)
-                }
+                Req::Load { generation, .. }
+                | Req::Render { generation, .. }
+                | Req::Text { generation, .. }
+                | Req::Sheet { generation, .. }
+                | Req::Appearances { generation, .. } => !closed.contains(generation),
                 Req::Close { .. } => false,
             });
         }
@@ -226,7 +246,7 @@ fn run(pdfium: &Pdfium, rx: Receiver<Job>) {
         let pick = queue
             .iter()
             .position(|j| matches!(j.req, Req::Load { .. }))
-            .or_else(|| queue.iter().rposition(|j| matches!(j.req, Req::Render { .. })))
+            .or_else(|| queue.iter().rposition(|j| matches!(j.req, Req::Render { .. } | Req::Sheet { .. })))
             .unwrap_or(0);
         let Some(Job { req, reply, ctx }) = queue.remove(pick) else { continue };
         let resp = match req {
@@ -249,6 +269,16 @@ fn run(pdfium: &Pdfium, rx: Receiver<Job>) {
             Req::Text { generation, page } => {
                 let Some(d) = docs.get(&generation) else { continue };
                 Resp::Text { generation, page, chars: text(d, page).unwrap_or_default() }
+            }
+            Req::Sheet { generation, id, spec, scale } => {
+                let Some(d) = docs.get(&generation) else { continue };
+                match sheet(d, &spec, scale) {
+                    Some(image) => Resp::Sheet { generation, id, image },
+                    None => continue,
+                }
+            }
+            Req::Appearances { generation, bytes } => {
+                Resp::Appearances { generation, result: appearances(pdfium, &bytes).map_err(|e| e.to_string()) }
             }
             Req::Close { .. } => continue,
         };
@@ -277,21 +307,26 @@ fn load<'a>(pdfium: &'a Pdfium, bytes: &[u8], hide: &[Vec<usize>]) -> Result<(Pd
                 }
             }
         }
-        let b = page.boundaries().bounding().map(|b| b.bounds).unwrap_or(PdfRect::new_from_values(
-            0.0,
-            0.0,
-            page.height().value,
-            page.width().value,
-        ));
-        let rotation = match page.rotation().unwrap_or(PdfPageRenderRotation::None) {
-            PdfPageRenderRotation::None => 0,
-            PdfPageRenderRotation::Degrees90 => 90,
-            PdfPageRenderRotation::Degrees180 => 180,
-            PdfPageRenderRotation::Degrees270 => 270,
-        };
-        pages.push(PageGeom { bbox: [b.left().value, b.bottom().value, b.right().value, b.top().value], rotation });
+        pages.push(geom(&page));
     }
     Ok((doc, pages))
+}
+
+/// The page's box (media box cropped by the crop box) and rotation.
+fn geom(page: &PdfPage) -> PageGeom {
+    let b = page.boundaries().bounding().map(|b| b.bounds).unwrap_or(PdfRect::new_from_values(
+        0.0,
+        0.0,
+        page.height().value,
+        page.width().value,
+    ));
+    let rotation = match page.rotation().unwrap_or(PdfPageRenderRotation::None) {
+        PdfPageRenderRotation::None => 0,
+        PdfPageRenderRotation::Degrees90 => 90,
+        PdfPageRenderRotation::Degrees180 => 180,
+        PdfPageRenderRotation::Degrees270 => 270,
+    };
+    PageGeom { bbox: [b.left().value, b.bottom().value, b.right().value, b.top().value], rotation }
 }
 
 fn dest_target(d: &PdfDestination) -> Option<Target> {
@@ -368,6 +403,53 @@ fn render(doc: &PdfDocument, page: usize, scale: f32, look: PageLook) -> Result<
     let mut px = bitmap.as_rgba_bytes();
     look.map_rgba(&mut px);
     Ok(egui::ColorImage::from_rgba_unmultiplied([w, h], &px))
+}
+
+/// Draws every page with its form fields, which makes pdfium generate the
+/// appearances of fields that have none when the form asks for it, then saves.
+fn appearances(pdfium: &Pdfium, bytes: &[u8]) -> Result<Vec<u8>> {
+    let doc = pdfium.load_pdf_from_byte_vec(bytes.to_vec(), None)?;
+    let cfg = PdfRenderConfig::new().scale_page_by_factor(0.05).render_form_data(true).render_annotations(true);
+    for page in doc.pages().iter() {
+        page.render_with_config(&cfg)?;
+    }
+    Ok(doc.save_to_bytes()?)
+}
+
+/// A printed sheet: white paper with each page drawn on it by pdfium, placed
+/// as the print layout says.
+fn sheet(doc: &PdfDocument, spec: &SheetSpec, scale: f32) -> Option<egui::ColorImage> {
+    let pages = doc.pages();
+    let sizes: Vec<(f64, f64)> =
+        pages.iter().map(|p| geom(&p).display_size()).map(|(w, h)| (w as f64, h as f64)).collect();
+    let k = scale as f64;
+    let (w, h) = spec.pixel_size(&sizes, k);
+    let mut px = vec![255u8; w as usize * h as usize * 4];
+    {
+        let mut bitmap = PdfBitmap::from_bytes(w as i32, h as i32, PdfBitmapFormat::BGRA, &mut px).ok()?;
+        for p in spec.placements(&sizes, k) {
+            let Ok(page) = pages.get(p.page as PdfPageIndex) else { continue };
+            let [a, b, c, d, e, f] = p.matrix.0.map(|v| v as f32);
+            let [left, top, right, bottom] = p.clip.map(|v| v as i32);
+            let Ok(cfg) = PdfRenderConfig::new()
+                .scale_page_by_factor(1.0)
+                .clear_before_rendering(false)
+                .render_annotations(true)
+                .set_text_smoothing(true)
+                .set_image_smoothing(true)
+                .set_path_smoothing(true)
+                .transform(a, b, c, d, e, f)
+            else {
+                continue;
+            };
+            let _ = page.render_into_bitmap_with_config(&mut bitmap, &cfg.clip(left, top, right, bottom));
+        }
+    }
+    for p in px.as_chunks_mut::<4>().0 {
+        p.swap(0, 2); // BGRA -> RGBA
+    }
+    apply_tone(&spec.tone, &mut px);
+    Some(egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &px))
 }
 
 fn text(doc: &PdfDocument, page: usize) -> Result<Vec<TextChar>> {

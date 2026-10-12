@@ -23,8 +23,8 @@ pub const TOP_MARGIN: f32 = 24.0;
 const BOTTOM_MARGIN: f32 = 56.0;
 const GAP: f32 = 16.0;
 /// Max pixels per page texture (~64 MB RGBA).
-const MAX_PIXELS: f32 = 16.0e6;
-const MAX_SIDE: f32 = 8192.0;
+pub(crate) const MAX_PIXELS: f32 = 16.0e6;
+pub(crate) const MAX_SIDE: f32 = 8192.0;
 
 pub struct PageTex {
     pub tex: egui::TextureHandle,
@@ -4176,5 +4176,27 @@ mod tests {
         // It's not taken for the dark one, which stays pending.
         assert_eq!(h.app.pages_ui.thumbs[&0].key.2, PageLook::Sepia);
         assert_eq!(h.app.pages_ui.in_flight.get(&0).map(|k| k.2), Some(PageLook::Dark));
+    }
+
+    #[test]
+    fn ctrl_p_opens_printing_and_escape_comes_back() {
+        let dir = std::env::temp_dir().join(format!("ochre-print-open-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("print.pdf");
+        reading_pdf(&path);
+        let ctx = egui::Context::default();
+        let app = App::new(&ctx, Some(path));
+        if app.worker.is_none() {
+            eprintln!("pdfium not available, skipping: {:?}", app.worker_error);
+            return;
+        }
+        let mut h = Harness { ctx, app, t: 0.0, mods: Modifiers::NONE, size: vec2(1000.0, 900.0) };
+        h.wait_until("pages", |a| a.doc.as_ref().is_some_and(|d| !d.pages.is_empty()));
+        h.key(Key::P, Modifiers::COMMAND);
+        assert!(h.app.print.is_some());
+        h.wait_until("the print preview", |a| a.print.as_ref().and_then(|p| p.loaded_pages()) == Some(vec![6]));
+        h.key(Key::Escape, Modifiers::NONE);
+        assert!(h.app.print.is_none());
+        assert!(h.app.doc.is_some(), "back to the document");
     }
 }

@@ -45,6 +45,15 @@ A fast, lightweight PDF reader and annotator for Linux, written in Rust (egui + 
 - **Tabs:** every file opens in its own tab, from the Open dialog, Recent files, drag and drop (several at once), or the command line (`ochre a.pdf b.pdf`). Opening a file that's already open switches to its tab. Each tab keeps its own zoom, position, selection and search.
 - **Remembers your place:** each file reopens at the page and zoom where you left it.
 - **Page colors** for reading comfort, from the status bar or Ctrl+I: **Sepia** (aged paper and dark brown ink, like an old photo) or **Dark** (lightness inverted, hue kept, so colored text and highlights keep their colors). Annotations follow along. It only changes the display: the saved PDF keeps its colors.
+- **Printing** (Ctrl+P), with a live preview of the exact sheets in print order. Your annotations print too, saved or not.
+  - Page ranges (`1-3, 7, 10-`), or tick pages on the Pages tab; odd or even pages only.
+  - Copies with collate on or off, and **reverse order** (on by default, for printers that stack pages face up).
+  - 1, 2, 4, 6, 9 or 16 pages per sheet, orientation, scaling and rotation.
+  - **Booklets**: fold the printed stack in half and it reads like a book. Split thick ones into several thinner booklets, bind on the right for right-to-left text, and add a gutter at the fold.
+  - **Guided manual two-sided printing** for printers without a duplexer, with a calibration test and a note per printer on how the stack goes back in.
+  - Several documents in one job: add other open tabs or PDF files, drag them into order, and optionally start each on a new sheet.
+  - Every option the printer's driver offers (quality, color or grayscale, paper, media type and the advanced ones), presets, and each printer's last settings. The preview turns gray for grayscale, and follows the driver's brightness, contrast and color balance sliders (approximately: drivers don't publish their formulas).
+  - A count of the paper you'll use and how much n-up, two-sided and booklets save; double-click a sheet to see it full size; or save the result as a PDF.
 - Zoom (fit width / fit page / Ctrl+wheel), recent files, and light and dark themes that follow the system.
 
 Highlights, notes, ink, a text box and shapes, with the contents in the sidebar:
@@ -88,6 +97,8 @@ git clone https://github.com/wanikhawar/ochre
 cd ochre
 ./install.sh          # builds with cargo and downloads pdfium if needed
 ```
+
+Printing uses CUPS (the `cups` package), which almost every Linux desktop already has. Ochre runs without it; only printing needs it. Print settings and presets are kept in `~/.config/ochre/print.json`. If you use [Print Studio](https://github.com/wanikhawar/printstudio), its settings are copied over the first time.
 
 Either way you get:
 
@@ -143,6 +154,7 @@ Vim-style navigation works whenever you're not typing in a text field.
 | Delete | Delete selection |
 | Ctrl+Z, Ctrl+Shift+Z / Ctrl+Y | Undo, redo |
 | Ctrl+S, Ctrl+Shift+S | Save, save as |
+| Ctrl+P | Print (in the print screen: print; Esc goes back, F9 hides the settings) |
 | Ctrl+O, Ctrl+F | Open, search (keeps the last query) |
 | F9 | Show or hide the contents sidebar |
 | Ctrl+I | Page colors: normal, sepia, dark |
@@ -167,7 +179,8 @@ The tests cover:
 - geometry and stroke smoothing (including overshoot);
 - search;
 - the save round-trip, including preserving other apps' annotations and the original bytes;
-- a headless end-to-end run of every tool.
+- a headless end-to-end run of every tool;
+- printing: page order for every layout, the print-ready PDFs, annotations on paper, and a check that the preview matches the printed PDF pixel for pixel.
 
 To compare rendering with other viewers by eye:
 

@@ -6,6 +6,7 @@ mod config;
 mod doc;
 mod look;
 mod pdf;
+mod print;
 mod search;
 mod ui;
 mod viewer;

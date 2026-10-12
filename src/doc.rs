@@ -139,7 +139,7 @@ pub struct Doc {
 
 static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-fn next_generation() -> u64 {
+pub(crate) fn next_generation() -> u64 {
     GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 

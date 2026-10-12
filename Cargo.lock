@@ -1982,7 +1982,7 @@ dependencies = [
 
 [[package]]
 name = "ochre-pdf"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -1990,6 +1990,7 @@ dependencies = [
  "eframe",
  "egui-phosphor",
  "egui_extras",
+ "libloading",
  "lopdf",
  "memchr",
  "pdfium-render",

@@ -13,6 +13,7 @@ use crate::doc::{Cmd, Doc};
 use crate::look::PageLook;
 use crate::pdf::worker::{Req, Resp, Target, TextChar, Worker};
 use crate::search::Search;
+use crate::ui::print::{Outcome, PrintScreen};
 use crate::ui::theme;
 use crate::viewer::{Fit, Gesture, Jump, JumpX, Motion, NoteEdit, Overlay, PageTex, TextEditState, TextSel, View};
 
@@ -279,6 +280,8 @@ pub struct App {
     last_nudge: Option<(Vec<String>, f64, usize)>,
     /// A file dialog that's open, and where its answer arrives.
     dialog: Option<(FileDialog, crossbeam_channel::Receiver<Vec<PathBuf>>)>,
+    /// The print screen, while it's open (it takes over the window).
+    pub print: Option<PrintScreen>,
     ctx: egui::Context,
 }
 
@@ -355,6 +358,7 @@ impl App {
             last_paste: None,
             last_nudge: None,
             dialog: None,
+            print: None,
             ctx: ctx.clone(),
         };
         for p in paths {
@@ -1020,6 +1024,45 @@ impl App {
         }
     }
 
+    /// Opens the print screen for the active file, as it is now (unsaved changes included).
+    pub fn open_print(&mut self, ctx: &egui::Context) {
+        self.commit_edits();
+        let Some(doc) = &self.doc else { return };
+        match doc.current_bytes() {
+            Ok(bytes) => {
+                let tabs = (0..self.tabs.len())
+                    .filter(|&i| i != self.active)
+                    .filter_map(|i| Some((i, self.tab_doc(i)?.name())))
+                    .collect();
+                self.print = Some(PrintScreen::new(ctx, doc.name(), Arc::new(bytes), tabs));
+            }
+            Err(e) => self.set_status(ctx, format!("Can't print: {e:#}"), true),
+        }
+    }
+
+    /// One frame of the print screen, and what it asks for.
+    fn print_frame(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let Some(print) = &mut self.print else { return };
+        match print.show(ui) {
+            Some(Outcome::Close) => self.print = None,
+            Some(Outcome::Printed(msg)) => {
+                self.print = None;
+                self.set_status(&ctx, msg, false);
+            }
+            Some(Outcome::AddTab(i)) => {
+                let Some(doc) = self.tab_doc(i) else { return };
+                let (name, bytes) = (doc.name(), doc.current_bytes());
+                let Some(print) = &mut self.print else { return };
+                match bytes {
+                    Ok(b) => print.add_document(name, Arc::new(b)),
+                    Err(e) => self.set_status(&ctx, format!("Can't print {name}: {e:#}"), true),
+                }
+            }
+            None => {}
+        }
+    }
+
     /// Saves the active file; returns true on success. Save As asks for a file
     /// name first (without blocking) and saves when one is picked, returning false.
     pub(crate) fn save(&mut self, ctx: &egui::Context, save_as: bool) -> bool {
@@ -1121,7 +1164,7 @@ impl App {
                         Resp::Rendered { page, .. } => {
                             t.in_flight.remove(&page);
                         }
-                        Resp::Failed { .. } => {}
+                        Resp::Failed { .. } | Resp::Sheet { .. } | Resp::Appearances { .. } => {}
                     }
                 }
                 continue;
@@ -1404,6 +1447,10 @@ impl App {
         }
         if pressed(sc(cmd, Key::O)) {
             self.request_open(None);
+        }
+        if pressed(sc(cmd, Key::P)) && self.doc.is_some() {
+            self.open_print(ctx);
+            return;
         }
         if pressed(sc(cmd | Modifiers::SHIFT, Key::S)) {
             self.save(ctx, true);
@@ -1728,6 +1775,14 @@ impl App {
         let ctx = ui.ctx().clone();
         self.pump_worker(&ctx);
         self.poll_dialog(&ctx);
+        if self.print.is_some() {
+            self.print_frame(ui);
+            if self.print.is_some() {
+                self.window_title(&ctx, "Print");
+                self.close_requested(&ctx);
+                return;
+            }
+        }
 
         // Each dropped file opens in its own tab.
         let dropped: Vec<PathBuf> = ctx.input(|i| {
@@ -1770,19 +1825,30 @@ impl App {
         self.canvas_overlays(&ctx, canvas);
         self.dialogs(&ctx);
 
-        // Window title and close handling.
+        self.window_title(&ctx, "");
+        self.close_requested(&ctx);
+    }
+
+    /// "• file.pdf — Ochre", with `what` (e.g. "Print") before the file name.
+    fn window_title(&mut self, ctx: &egui::Context, what: &str) {
+        let what = if what.is_empty() { String::new() } else { format!("{what} — ") };
         let title = match &self.doc {
-            Some(d) => format!("{}{} — Ochre", if d.is_dirty() { "• " } else { "" }, d.name()),
+            Some(d) => format!("{what}{}{} — Ochre", if d.is_dirty() { "• " } else { "" }, d.name()),
             None => "Ochre".into(),
         };
         if title != self.title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
             self.title = title;
         }
+    }
+
+    /// Closing the window with unsaved changes asks first.
+    fn close_requested(&mut self, ctx: &egui::Context) {
         if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close {
             self.commit_edits();
             if self.any_dirty() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.print = None;
                 self.pending = Some(Pending::Close);
             }
         }

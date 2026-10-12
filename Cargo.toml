@@ -1,6 +1,6 @@
 [package]
 name = "ochre-pdf"
-version = "1.4.0"
+version = "1.5.0"
 edition = "2024"
 description = "A fast, lightweight PDF reader and annotator with smooth ink, text markup and vim-style navigation"
 license = "MIT"
@@ -21,6 +21,7 @@ eframe = { version = "0.36", default-features = false, features = ["glow", "wayl
 egui-phosphor = "0.14"
 egui_extras = { version = "0.36", default-features = false, features = ["svg"] }
 lopdf = { version = "0.45", default-features = false }
+libloading = "0.8"
 memchr = "2.8.3"
 pdfium-render = { version = "0.9", default-features = false, features = ["pdfium_latest"] }
 resvg = { version = "0.45", default-features = false }

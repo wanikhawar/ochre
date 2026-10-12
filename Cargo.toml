@@ -21,7 +21,7 @@ eframe = { version = "0.36", default-features = false, features = ["glow", "wayl
 egui-phosphor = "0.14"
 egui_extras = { version = "0.36", default-features = false, features = ["svg"] }
 lopdf = { version = "0.45", default-features = false }
-libloading = "0.8"
+libloading = "0.9"
 memchr = "2.8.3"
 pdfium-render = { version = "0.9", default-features = false, features = ["pdfium_latest"] }
 # Must match the resvg that egui_extras uses (see .github/dependabot.yml).

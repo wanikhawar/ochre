@@ -12,6 +12,11 @@ updates:
         patterns: ["eframe", "egui*"]
       patch:
         update-types: [patch]
+    ignore:
+      # resvg must be the version egui_extras uses (its SVG loader takes
+      # resvg's options type), so it moves by hand together with egui.
+      - dependency-name: resvg
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
 
   - package-ecosystem: github-actions
     directory: /

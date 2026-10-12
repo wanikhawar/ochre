@@ -24,8 +24,6 @@ lopdf = { version = "0.45", default-features = false }
 libloading = "0.9"
 memchr = "2.8.3"
 pdfium-render = { version = "0.9", default-features = false, features = ["pdfium_latest"] }
-# Must match the resvg that egui_extras uses (see .github/dependabot.yml).
-resvg = { version = "0.45", default-features = false }
 rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"

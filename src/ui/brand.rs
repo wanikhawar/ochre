@@ -29,7 +29,7 @@ pub fn wordmark(dark: bool) -> ImageSource<'static> {
 /// The app icon as pixels, for the window (taskbar, window switcher).
 pub fn window_icon() -> Option<egui::IconData> {
     let size = SizeHint::Size { width: 256, height: 256, maintain_aspect_ratio: true };
-    let image = egui_extras::image::load_svg_bytes_with_size(ICON_SVG, size, &resvg::usvg::Options::default()).ok()?;
+    let image = egui_extras::image::load_svg_bytes_with_size(ICON_SVG, size, &Default::default()).ok()?;
     let [width, height] = image.size;
     let rgba = image.pixels.iter().flat_map(|p| p.to_srgba_unmultiplied()).collect();
     Some(egui::IconData { rgba, width: width as u32, height: height as u32 })
@@ -41,7 +41,7 @@ mod tests {
 
     fn render(svg: &[u8]) -> egui::ColorImage {
         let size = SizeHint::Size { width: 300, height: 300, maintain_aspect_ratio: true };
-        egui_extras::image::load_svg_bytes_with_size(svg, size, &resvg::usvg::Options::default()).unwrap()
+        egui_extras::image::load_svg_bytes_with_size(svg, size, &Default::default()).unwrap()
     }
 
     /// The README shows `packaging/ochre-wordmark-dark.svg` on GitHub's dark theme:

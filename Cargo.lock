@@ -2004,7 +2004,6 @@ dependencies = [
  "lopdf",
  "memchr",
  "pdfium-render",
- "resvg",
  "rfd",
  "serde",
  "serde_json",

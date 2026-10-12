@@ -1517,6 +1517,8 @@ mod tests {
         };
         s.printer = Some("Somewhere".into());
         wait_loaded(&ctx, &mut s, &[1]);
+        // Loading can take many frames, each moving egui's clock on: open it now.
+        s.opened = ctx.input(|i| i.time);
         frame(&ctx, &mut s, key(egui::Key::P, egui::Modifiers::COMMAND));
         assert!(s.busy.is_none(), "too soon after opening");
         let out = frame(&ctx, &mut s, key(egui::Key::Escape, egui::Modifiers::NONE));

@@ -161,9 +161,7 @@ fn fit_cubic(d: &[Pt], t1: Pt, t2: Pt, max_err: f32, out: &mut Vec<Pt>, depth: u
 
 /// Largest distance from points along the curve to the input polyline.
 fn deviation(b: &[Pt; 4], d: &[Pt]) -> f32 {
-    (1..16)
-        .map(|i| super::geometry::dist_to_polyline(bezier_at(b, i as f32 / 16.0), d))
-        .fold(0.0, f32::max)
+    (1..16).map(|i| super::geometry::dist_to_polyline(bezier_at(b, i as f32 / 16.0), d)).fold(0.0, f32::max)
 }
 
 fn chord_params(d: &[Pt]) -> Vec<f32> {
@@ -270,8 +268,7 @@ mod tests {
     #[test]
     fn fitted_curve_stays_within_tolerance() {
         // A noisy-free sine wave sampled like a mouse would.
-        let raw: Vec<Pt> =
-            (0..400).map(|i| Pt::new(i as f32 * 0.5, (i as f32 * 0.03).sin() * 40.0)).collect();
+        let raw: Vec<Pt> = (0..400).map(|i| Pt::new(i as f32 * 0.5, (i as f32 * 0.03).sin() * 40.0)).collect();
         let curve = finish_stroke(&raw, 1.0);
         assert_eq!((curve.len() - 1) % 3, 0);
         assert!(curve.len() < raw.len() / 4, "fit should compress: {}", curve.len());
@@ -336,8 +333,19 @@ mod overshoot {
         let curves: Vec<(&'static str, Curve)> = vec![
             ("loops", Box::new(|t: f32| Pt::new(t * 120.0 + 14.0 * (t * 25.0).cos(), 18.0 * (t * 25.0).sin()))),
             ("s-curve", Box::new(|t: f32| Pt::new(30.0 * (t * 6.3).sin(), t * 80.0))),
-            ("scribble", Box::new(|t: f32| Pt::new(t * 60.0 + 8.0 * (t * 40.0).sin(), 25.0 * (t * 13.0).sin() * (t * 3.0).cos()))),
-            ("tight e", Box::new(|t: f32| { let a = t * 9.0; Pt::new(t * 40.0 + 7.0 * a.cos(), 7.0 * a.sin()) })),
+            (
+                "scribble",
+                Box::new(|t: f32| {
+                    Pt::new(t * 60.0 + 8.0 * (t * 40.0).sin(), 25.0 * (t * 13.0).sin() * (t * 3.0).cos())
+                }),
+            ),
+            (
+                "tight e",
+                Box::new(|t: f32| {
+                    let a = t * 9.0;
+                    Pt::new(t * 40.0 + 7.0 * a.cos(), 7.0 * a.sin())
+                }),
+            ),
         ];
         curves
             .into_iter()

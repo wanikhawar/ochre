@@ -1,9 +1,7 @@
 //! Anti-aliased rasterization of annotations with tiny-skia. Text boxes are
 //! drawn by egui instead (tiny-skia has no text support).
 
-use tiny_skia::{
-    Color, FillRule, LineCap, LineJoin, Paint, Path, PathBuilder, PixmapMut, Stroke, Transform,
-};
+use tiny_skia::{Color, FillRule, LineCap, LineJoin, Paint, Path, PathBuilder, PixmapMut, Stroke, Transform};
 
 use super::geometry::{arrow_head, ellipse_points, mark_strokes};
 use super::model::{Annotation, Kind, MarkupKind, Pt, ShapeKind, Style};
@@ -66,13 +64,8 @@ pub fn draw(pm: &mut PixmapMut, a: &Annotation, t: Transform) {
         }
         Kind::Shape { shape, a: p, b: q } => {
             let path = match shape {
-                ShapeKind::Rect => tiny_skia::Rect::from_ltrb(
-                    p.x.min(q.x),
-                    p.y.min(q.y),
-                    p.x.max(q.x),
-                    p.y.max(q.y),
-                )
-                .map(PathBuilder::from_rect),
+                ShapeKind::Rect => tiny_skia::Rect::from_ltrb(p.x.min(q.x), p.y.min(q.y), p.x.max(q.x), p.y.max(q.y))
+                    .map(PathBuilder::from_rect),
                 ShapeKind::Ellipse => polyline_path(&ellipse_points(*p, *q, 96), true),
                 ShapeKind::Line => polyline_path(&[*p, *q], false),
                 ShapeKind::Check | ShapeKind::Cross => {
@@ -177,7 +170,8 @@ mod tests {
         // Alpha at the crossing equals alpha on a plain part of the stroke.
         let plain = alpha(25, 25);
         assert!(plain > 100 && plain < 140, "plain alpha {plain}");
-        let cross_alpha = (40..=60).flat_map(|x| (40..=60).map(move |y| (x, y))).map(|(x, y)| alpha(x, y)).max().unwrap();
+        let cross_alpha =
+            (40..=60).flat_map(|x| (40..=60).map(move |y| (x, y))).map(|(x, y)| alpha(x, y)).max().unwrap();
         assert!(cross_alpha <= plain + 2, "crossing alpha {cross_alpha} vs {plain}");
     }
 }

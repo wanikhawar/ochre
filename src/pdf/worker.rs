@@ -14,12 +14,26 @@ use crate::annot::geometry::PageGeom;
 pub enum Req {
     /// Load `bytes`, removing the given `/Annots` indices per page from the
     /// in-memory copy so pdfium doesn't draw them.
-    Load { generation: u64, bytes: Arc<Vec<u8>>, hide: Vec<Vec<usize>> },
+    Load {
+        generation: u64,
+        bytes: Arc<Vec<u8>>,
+        hide: Vec<Vec<usize>>,
+    },
     /// `thumb`: for the page thumbnails, not the page view.
-    Render { generation: u64, page: usize, scale: f32, thumb: bool },
-    Text { generation: u64, page: usize },
+    Render {
+        generation: u64,
+        page: usize,
+        scale: f32,
+        thumb: bool,
+    },
+    Text {
+        generation: u64,
+        page: usize,
+    },
     /// Forget a loaded document (its tab was closed or it was reloaded).
-    Close { generation: u64 },
+    Close {
+        generation: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -139,20 +153,22 @@ fn bind_pdfium() -> Result<Pdfium> {
         dirs.push(std::path::Path::new(&home).join(".local/lib/ochre"));
     }
     if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent() {
-            dirs.push(dir.to_path_buf());
-            dirs.push(dir.join("lib"));
-            dirs.push(dir.join("../lib/ochre"));
-            for up in dir.ancestors().take(4) {
-                dirs.push(up.join("vendor/pdfium/lib"));
-            }
+        && let Some(dir) = exe.parent()
+    {
+        dirs.push(dir.to_path_buf());
+        dirs.push(dir.join("lib"));
+        dirs.push(dir.join("../lib/ochre"));
+        for up in dir.ancestors().take(4) {
+            dirs.push(up.join("vendor/pdfium/lib"));
         }
+    }
     for dir in &dirs {
         let lib = Pdfium::pdfium_platform_library_name_at_path(dir);
         if lib.exists()
-            && let Ok(b) = Pdfium::bind_to_library(&lib) {
-                return Ok(Pdfium::new(b));
-            }
+            && let Ok(b) = Pdfium::bind_to_library(&lib)
+        {
+            return Ok(Pdfium::new(b));
+        }
     }
     Pdfium::bind_to_system_library().map(Pdfium::new).map_err(|e| {
         anyhow!(
@@ -263,10 +279,7 @@ fn load<'a>(pdfium: &'a Pdfium, bytes: &[u8], hide: &[Vec<usize>]) -> Result<(Pd
             PdfPageRenderRotation::Degrees180 => 180,
             PdfPageRenderRotation::Degrees270 => 270,
         };
-        pages.push(PageGeom {
-            bbox: [b.left().value, b.bottom().value, b.right().value, b.top().value],
-            rotation,
-        });
+        pages.push(PageGeom { bbox: [b.left().value, b.bottom().value, b.right().value, b.top().value], rotation });
     }
     Ok((doc, pages))
 }
@@ -301,7 +314,8 @@ fn outline(doc: &PdfDocument) -> Vec<OutlineItem> {
                 return;
             }
             let title = b.title().unwrap_or_default().split_whitespace().collect::<Vec<_>>().join(" ");
-            let target = b.destination().as_ref().and_then(dest_target).or_else(|| b.action().as_ref().and_then(action_target));
+            let target =
+                b.destination().as_ref().and_then(dest_target).or_else(|| b.action().as_ref().and_then(action_target));
             out.push(OutlineItem { title, level, target });
             walk(b.first_child(), level + 1, out);
             cur = b.next_sibling();
@@ -318,7 +332,11 @@ fn links(doc: &PdfDocument, page: usize) -> Vec<Link> {
     p.links()
         .iter()
         .filter_map(|l| {
-            let target = l.destination().as_ref().and_then(dest_target).or_else(|| l.action().as_ref().and_then(action_target))?;
+            let target = l
+                .destination()
+                .as_ref()
+                .and_then(dest_target)
+                .or_else(|| l.action().as_ref().and_then(action_target))?;
             let r = l.rect().ok()?;
             let [x0, y0, x1, y1] = [r.left().value, r.bottom().value, r.right().value, r.top().value];
             Some(Link { rect: [x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)], target })
@@ -353,4 +371,3 @@ fn text(doc: &PdfDocument, page: usize) -> Result<Vec<TextChar>> {
         })
         .collect())
 }
-

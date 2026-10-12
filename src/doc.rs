@@ -15,14 +15,24 @@ use crate::pdf::worker::{Link, OutlineItem};
 #[derive(Clone, Debug)]
 pub enum Cmd {
     Add(Annotation),
-    Remove { annot: Annotation, index: usize },
-    Modify { before: Annotation, after: Annotation },
+    Remove {
+        annot: Annotation,
+        index: usize,
+    },
+    Modify {
+        before: Annotation,
+        after: Annotation,
+    },
     /// Hide an annotation made by other software (removed from the file on save).
     DeleteForeign(usize),
     /// Rotate, delete or reorder pages: the page layout goes from `before` to
     /// `after`. `removed` are our annotations on deleted pages (with their indices
     /// in the list), put back on undo. Annotations' page numbers are renumbered.
-    Pages { before: Vec<PageSlot>, after: Vec<PageSlot>, removed: Vec<(usize, Annotation)> },
+    Pages {
+        before: Vec<PageSlot>,
+        after: Vec<PageSlot>,
+        removed: Vec<(usize, Annotation)>,
+    },
 }
 
 /// Three-way merge of one annotation changed here (`base` -> `mine`) and elsewhere
@@ -303,7 +313,8 @@ impl Doc {
             return Arc::clone(b);
         }
         let none = BTreeSet::new();
-        let bytes = build(&self.bytes, &self.edits(&none), true).map(Arc::new).unwrap_or_else(|_| Arc::clone(&self.bytes));
+        let bytes =
+            build(&self.bytes, &self.edits(&none), true).map(Arc::new).unwrap_or_else(|_| Arc::clone(&self.bytes));
         self.preview = Some((self.generation, Arc::clone(&bytes)));
         bytes
     }
@@ -436,7 +447,12 @@ impl Doc {
                         .collect();
                     let links = to
                         .iter()
-                        .map(|t| from.iter().position(|f| f.obj == t.obj).and_then(|i| self.links.get(i).cloned()).unwrap_or_default())
+                        .map(|t| {
+                            from.iter()
+                                .position(|f| f.obj == t.obj)
+                                .and_then(|i| self.links.get(i).cloned())
+                                .unwrap_or_default()
+                        })
                         .collect();
                     self.set_pages(pages);
                     self.links = links;
@@ -476,9 +492,10 @@ impl Doc {
     /// same annotation, and applies it. Used to merge e.g. slider drags into one step.
     pub fn amend_last_modify(&mut self, after: Annotation) {
         if let Some([Cmd::Modify { after: last, .. }]) = self.undo.last_mut().map(Vec::as_mut_slice)
-            && last.id == after.id {
-                *last = after.clone();
-            }
+            && last.id == after.id
+        {
+            *last = after.clone();
+        }
         if let Some(i) = self.index_of(&after.id) {
             self.annots[i] = after.clone();
             self.touch(after.page);
@@ -577,9 +594,14 @@ impl Doc {
         }
         // Pages are matched by page object: the file this window loaded (`base`),
         // this window's layout, and the new version may number them differently.
-        let (base_pages, my_layout, new_pages) = (self.scan.pages.clone(), self.layout.clone(), fresh.scan.pages.clone());
+        let (base_pages, my_layout, new_pages) =
+            (self.scan.pages.clone(), self.layout.clone(), fresh.scan.pages.clone());
         let pages_edited_here = my_layout != base_pages;
-        let cant = |why: &str| anyhow::anyhow!("the file was changed elsewhere and can't be combined with your changes: {why}. Use Save As to keep your version");
+        let cant = |why: &str| {
+            anyhow::anyhow!(
+                "the file was changed elsewhere and can't be combined with your changes: {why}. Use Save As to keep your version"
+            )
+        };
         if pages_edited_here && new_pages != base_pages {
             return Err(cant("pages were rearranged both here and there"));
         }
@@ -592,7 +614,11 @@ impl Doc {
         let base_to_new = |a: &Annotation| -> Option<Annotation> {
             Some(Annotation { page: new_index(base_pages.get(a.page)?.obj)?, ..a.clone() })
         };
-        let mine: Vec<Annotation> = self.annots.iter().map(|a| as_base(a).ok_or_else(|| cant("a page was brought back here"))).collect::<Result<_>>()?;
+        let mine: Vec<Annotation> = self
+            .annots
+            .iter()
+            .map(|a| as_base(a).ok_or_else(|| cant("a page was brought back here")))
+            .collect::<Result<_>>()?;
         // This window's changes, each with the version it started from.
         let base = |id: &str| self.saved.iter().find(|s| s.id == id).and_then(base_to_new);
         let removed: Vec<Annotation> =
@@ -605,9 +631,10 @@ impl Doc {
         if pages_edited_here {
             // Their new or changed annotations on pages deleted here would be lost.
             let kept: Vec<_> = my_layout.iter().map(|s| s.obj).collect();
-            let theirs_lost = fresh.annots.iter().any(|a| {
-                !kept.contains(&new_pages[a.page].obj) && self.saved.iter().find(|s| s.id == a.id) != Some(a)
-            });
+            let theirs_lost = fresh
+                .annots
+                .iter()
+                .any(|a| !kept.contains(&new_pages[a.page].obj) && self.saved.iter().find(|s| s.id == a.id) != Some(a));
             if theirs_lost {
                 return Err(cant("annotations were added there to a page deleted here"));
             }
@@ -746,7 +773,10 @@ impl Doc {
         } else {
             self.layout
                 .iter()
-                .map(|s| PageGeom { bbox: self.boxes.get(&s.obj).copied().unwrap_or([0.0, 0.0, 612.0, 792.0]), rotation: s.rotation })
+                .map(|s| PageGeom {
+                    bbox: self.boxes.get(&s.obj).copied().unwrap_or([0.0, 0.0, 612.0, 792.0]),
+                    rotation: s.rotation,
+                })
                 .collect()
         };
         self.set_pages(pages);
@@ -786,7 +816,14 @@ impl Doc {
             if deleted {
                 self.deleted_foreign.insert(j);
             }
-            self.foreign.push(Foreign { attached: false, index: 0, popups: Vec::new(), obj: Some(obj), popup_objs, ..f });
+            self.foreign.push(Foreign {
+                attached: false,
+                index: 0,
+                popups: Vec::new(),
+                obj: Some(obj),
+                popup_objs,
+                ..f
+            });
         }
         let remap = |steps: Vec<Vec<Cmd>>| -> Vec<Vec<Cmd>> {
             steps
@@ -866,10 +903,26 @@ mod tests {
                 },
             ),
             Annotation::new(0, s, Kind::Shape { shape: ShapeKind::Rect, a: Pt::new(1.0, 2.0), b: Pt::new(30.0, 40.0) }),
-            Annotation::new(0, s, Kind::Shape { shape: ShapeKind::Ellipse, a: Pt::new(1.0, 2.0), b: Pt::new(30.0, 40.0) }),
-            Annotation::new(0, s, Kind::Shape { shape: ShapeKind::Arrow, a: Pt::new(1.0, 2.0), b: Pt::new(30.0, 40.0) }),
-            Annotation::new(0, s, Kind::Shape { shape: ShapeKind::Check, a: Pt::new(50.0, 70.0), b: Pt::new(66.0, 54.0) }),
-            Annotation::new(0, s, Kind::Shape { shape: ShapeKind::Cross, a: Pt::new(80.0, 70.0), b: Pt::new(96.0, 54.0) }),
+            Annotation::new(
+                0,
+                s,
+                Kind::Shape { shape: ShapeKind::Ellipse, a: Pt::new(1.0, 2.0), b: Pt::new(30.0, 40.0) },
+            ),
+            Annotation::new(
+                0,
+                s,
+                Kind::Shape { shape: ShapeKind::Arrow, a: Pt::new(1.0, 2.0), b: Pt::new(30.0, 40.0) },
+            ),
+            Annotation::new(
+                0,
+                s,
+                Kind::Shape { shape: ShapeKind::Check, a: Pt::new(50.0, 70.0), b: Pt::new(66.0, 54.0) },
+            ),
+            Annotation::new(
+                0,
+                s,
+                Kind::Shape { shape: ShapeKind::Cross, a: Pt::new(80.0, 70.0), b: Pt::new(96.0, 54.0) },
+            ),
             Annotation::new(
                 0,
                 Style::new([0.0; 3], 12.0, 1.0),
@@ -1018,12 +1071,15 @@ mod tests {
             "Type" => "Annot", "Subtype" => "Popup", "Parent" => square,
             "Rect" => vec![500.into(), 500.into(), 600.into(), 560.into()],
         });
-        doc.objects.insert(square, Object::Dictionary(dictionary! {
-            "Type" => "Annot", "Subtype" => "Square", "NM" => Object::string_literal("onlyoffice-1"),
-            "Rect" => vec![400.into(), 400.into(), 500.into(), 500.into()],
-            "Contents" => Object::string_literal("Check this"), "Popup" => popup,
-            "AP" => dictionary! { "N" => ap },
-        }));
+        doc.objects.insert(
+            square,
+            Object::Dictionary(dictionary! {
+                "Type" => "Annot", "Subtype" => "Square", "NM" => Object::string_literal("onlyoffice-1"),
+                "Rect" => vec![400.into(), 400.into(), 500.into(), 500.into()],
+                "Contents" => Object::string_literal("Check this"), "Popup" => popup,
+                "AP" => dictionary! { "N" => ap },
+            }),
+        );
         let page = doc.add_object(dictionary! {
             "Type" => "Page", "Parent" => pages_id,
             "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
@@ -1182,7 +1238,8 @@ mod tests {
     fn names_on_disk(path: &Path) -> Vec<String> {
         let d = lopdf::Document::load(path).unwrap();
         let (_, page) = d.get_pages().into_iter().next().unwrap();
-        let annots = d.get_dictionary(page).unwrap().get(b"Annots").and_then(|a| a.as_array().cloned()).unwrap_or_default();
+        let annots =
+            d.get_dictionary(page).unwrap().get(b"Annots").and_then(|a| a.as_array().cloned()).unwrap_or_default();
         annots
             .iter()
             .filter_map(|o| d.dereference(o).ok()?.1.as_dict().ok().cloned())
@@ -1282,10 +1339,15 @@ mod tests {
         doc.exec(kinds.iter().cloned().map(Cmd::Add).collect());
         doc.save_to(&path).unwrap();
         rewrite(&path, |_, dict| {
-            let Ok(raw) = dict.get(crate::pdf::write::PRIVATE_KEY).and_then(|r| r.as_str()).map(<[u8]>::to_vec) else { return };
+            let Ok(raw) = dict.get(crate::pdf::write::PRIVATE_KEY).and_then(|r| r.as_str()).map(<[u8]>::to_vec) else {
+                return;
+            };
             let mut json: serde_json::Value = serde_json::from_slice(&raw).unwrap();
             json.as_object_mut().unwrap().remove("written");
-            dict.set(crate::pdf::write::PRIVATE_KEY, lopdf::Object::String(serde_json::to_vec(&json).unwrap(), lopdf::StringFormat::Hexadecimal));
+            dict.set(
+                crate::pdf::write::PRIVATE_KEY,
+                lopdf::Object::String(serde_json::to_vec(&json).unwrap(), lopdf::StringFormat::Hexadecimal),
+            );
         });
         assert_eq!(Doc::open(&path).unwrap().annots, kinds);
     }
@@ -1456,13 +1518,19 @@ mod tests {
             }
             pages.push(doc.add_object(page));
         }
-        doc.objects.insert(middle, Object::Dictionary(dictionary! {
-            "Type" => "Pages", "Parent" => root, "Count" => 4, "Resources" => resources,
-            "Kids" => pages[1..].iter().map(|&p| p.into()).collect::<Vec<Object>>(),
-        }));
-        doc.objects.insert(root, Object::Dictionary(dictionary! {
-            "Type" => "Pages", "Count" => 5, "Kids" => vec![pages[0].into(), middle.into()],
-        }));
+        doc.objects.insert(
+            middle,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages", "Parent" => root, "Count" => 4, "Resources" => resources,
+                "Kids" => pages[1..].iter().map(|&p| p.into()).collect::<Vec<Object>>(),
+            }),
+        );
+        doc.objects.insert(
+            root,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages", "Count" => 5, "Kids" => vec![pages[0].into(), middle.into()],
+            }),
+        );
         let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => root });
         doc.trailer.set("Root", catalog);
         let mut out = Vec::new();
@@ -1479,7 +1547,12 @@ mod tests {
                 let page = d.get_dictionary(id).unwrap();
                 // Every page must have what it used to inherit, wherever it is now.
                 let media = page.get(b"MediaBox").unwrap().as_array().unwrap();
-                assert!(page.has(b"Resources") || d.get_dictionary(page.get(b"Parent").unwrap().as_reference().unwrap()).unwrap().has(b"Resources"));
+                assert!(
+                    page.has(b"Resources")
+                        || d.get_dictionary(page.get(b"Parent").unwrap().as_reference().unwrap())
+                            .unwrap()
+                            .has(b"Resources")
+                );
                 let rotate = page.get(b"Rotate").and_then(|r| r.as_i64()).unwrap_or(0);
                 (media[2].as_float().unwrap() as i64, rotate)
             })
@@ -1552,7 +1625,10 @@ mod tests {
         doc.extract_pages(&[1, 2].into_iter().collect(), &out).unwrap();
         assert_eq!(page_widths(&out), [(510, 0), (520, 270)]);
         let extracted = Doc::open(&out).unwrap();
-        assert_eq!(extracted.annots.iter().map(|a| (a.id.as_str(), a.page)).collect::<Vec<_>>(), [(mark.id.as_str(), 0)]);
+        assert_eq!(
+            extracted.annots.iter().map(|a| (a.id.as_str(), a.page)).collect::<Vec<_>>(),
+            [(mark.id.as_str(), 0)]
+        );
         assert_eq!(extracted.foreign.iter().map(|f| f.nm.clone()).collect::<Vec<_>>(), [Some("theirs-1".to_string())]);
         assert!(doc.is_dirty(), "the original is untouched");
         assert_eq!(page_widths(&path).len(), 5);
@@ -1681,7 +1757,9 @@ mod tests {
         let ids: Vec<_> = d
             .objects
             .iter()
-            .filter(|(_, o)| o.as_dict().is_ok_and(|d| d.get(b"Subtype").and_then(|s| s.as_name()).ok() == Some(b"Ink")))
+            .filter(|(_, o)| {
+                o.as_dict().is_ok_and(|d| d.get(b"Subtype").and_then(|s| s.as_name()).ok() == Some(b"Ink"))
+            })
             .map(|(id, _)| *id)
             .collect();
         for id in ids {
@@ -1712,7 +1790,9 @@ mod rotated_sample {
         let mut doc = Doc::open(&path).unwrap();
         let st = |c| Style { fill: Some([1.0, 0.86, 0.0]), fill_opacity: 0.4, ..Style::new(c, 3.0, 1.0) };
         let mut cmds = Vec::new();
-        for (i, shape) in [ShapeKind::Rect, ShapeKind::Ellipse, ShapeKind::Check, ShapeKind::Cross].into_iter().enumerate() {
+        for (i, shape) in
+            [ShapeKind::Rect, ShapeKind::Ellipse, ShapeKind::Check, ShapeKind::Cross].into_iter().enumerate()
+        {
             let x = 80.0 + i as f32 * 130.0;
             let (a, b) = if matches!(shape, ShapeKind::Check | ShapeKind::Cross) {
                 (Pt::new(x, 740.0), Pt::new(x + 60.0, 680.0))
@@ -1729,7 +1809,14 @@ mod rotated_sample {
         let text = Annotation::new(
             0,
             Style::new([0.1, 0.35, 0.9], 18.0, 1.0),
-            Kind::Text { origin: Pt::new(100.0, 400.0), right: Pt::new(1.0, 0.0), down: Pt::new(0.0, -1.0), text: "Rotated text".into(), width: None, height: None },
+            Kind::Text {
+                origin: Pt::new(100.0, 400.0),
+                right: Pt::new(1.0, 0.0),
+                down: Pt::new(0.0, -1.0),
+                text: "Rotated text".into(),
+                width: None,
+                height: None,
+            },
         );
         let text = text.rotated(text.center(), 0.5);
         cmds.push(Cmd::Add(text));
@@ -1744,7 +1831,10 @@ mod rotated_sample {
         let page = d.add_object(dictionary! {
             "Type" => "Page", "Parent" => pages, "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
         });
-        d.objects.insert(pages, Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1 }));
+        d.objects.insert(
+            pages,
+            Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1 }),
+        );
         let cat = d.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages });
         d.trailer.set("Root", cat);
         let mut v = Vec::new();
@@ -1799,24 +1889,54 @@ mod visual {
                 Style::new([1.0, 0.86, 0.0], 14.0, 0.4),
                 Kind::Ink {
                     curve: finish_stroke(
-                        &(0..200).map(|i| Pt::new(80.0 + i as f32 * 1.5, 360.0 + (i as f32 * 0.05).sin() * 8.0)).collect::<Vec<_>>(),
+                        &(0..200)
+                            .map(|i| Pt::new(80.0 + i as f32 * 1.5, 360.0 + (i as f32 * 0.05).sin() * 8.0))
+                            .collect::<Vec<_>>(),
                         1.0,
                     ),
                     highlighter: true,
                 },
             )),
-            Cmd::Add(Annotation::new(0, Style { fill: Some([1.0, 0.86, 0.0]), fill_opacity: 0.5, ..Style::new([0.86, 0.15, 0.15], 2.0, 1.0) }, Kind::Shape { shape: ShapeKind::Ellipse, a: Pt::new(300.0, 420.0), b: Pt::new(420.0, 490.0) })),
-            Cmd::Add(Annotation::new(0, Style::new([0.15, 0.65, 0.25], 2.5, 1.0), Kind::Shape { shape: ShapeKind::Arrow, a: Pt::new(450.0, 400.0), b: Pt::new(540.0, 470.0) })),
-            Cmd::Add(Annotation::new(0, Style { fill: Some([0.55, 0.25, 0.85]), fill_opacity: 0.2, ..Style::new([0.55, 0.25, 0.85], 2.0, 0.8) }, Kind::Shape { shape: ShapeKind::Rect, a: Pt::new(60.0, 250.0), b: Pt::new(250.0, 320.0) })),
+            Cmd::Add(Annotation::new(
+                0,
+                Style { fill: Some([1.0, 0.86, 0.0]), fill_opacity: 0.5, ..Style::new([0.86, 0.15, 0.15], 2.0, 1.0) },
+                Kind::Shape { shape: ShapeKind::Ellipse, a: Pt::new(300.0, 420.0), b: Pt::new(420.0, 490.0) },
+            )),
+            Cmd::Add(Annotation::new(
+                0,
+                Style::new([0.15, 0.65, 0.25], 2.5, 1.0),
+                Kind::Shape { shape: ShapeKind::Arrow, a: Pt::new(450.0, 400.0), b: Pt::new(540.0, 470.0) },
+            )),
+            Cmd::Add(Annotation::new(
+                0,
+                Style { fill: Some([0.55, 0.25, 0.85]), fill_opacity: 0.2, ..Style::new([0.55, 0.25, 0.85], 2.0, 0.8) },
+                Kind::Shape { shape: ShapeKind::Rect, a: Pt::new(60.0, 250.0), b: Pt::new(250.0, 320.0) },
+            )),
             Cmd::Add(Annotation::new(
                 0,
                 Style::new([1.0, 0.86, 0.0], 1.0, 0.4),
-                Kind::Markup { markup: MarkupKind::Highlight, quads: vec![[Pt::new(72.0, 733.0), Pt::new(300.0, 733.0), Pt::new(72.0, 718.0), Pt::new(300.0, 718.0)]] },
+                Kind::Markup {
+                    markup: MarkupKind::Highlight,
+                    quads: vec![[
+                        Pt::new(72.0, 733.0),
+                        Pt::new(300.0, 733.0),
+                        Pt::new(72.0, 718.0),
+                        Pt::new(300.0, 718.0),
+                    ]],
+                },
             )),
             Cmd::Add(Annotation::new(
                 0,
                 Style::new([0.86, 0.15, 0.15], 1.0, 1.0),
-                Kind::Markup { markup: MarkupKind::StrikeOut, quads: vec![[Pt::new(72.0, 718.0), Pt::new(300.0, 718.0), Pt::new(72.0, 703.0), Pt::new(300.0, 703.0)]] },
+                Kind::Markup {
+                    markup: MarkupKind::StrikeOut,
+                    quads: vec![[
+                        Pt::new(72.0, 718.0),
+                        Pt::new(300.0, 718.0),
+                        Pt::new(72.0, 703.0),
+                        Pt::new(300.0, 703.0),
+                    ]],
+                },
             )),
         ];
         for (page, g) in [(0usize, pages[0]), (1, pages[1])] {
@@ -1830,7 +1950,11 @@ mod visual {
                     origin,
                     right: inv.apply_vec(Pt::new(1.0, 0.0)),
                     down: inv.apply_vec(Pt::new(0.0, 1.0)),
-                    text: format!("Typed note on page {} (rotation {})\nSecond line: café — “quotes”", page + 1, g.rotation),
+                    text: format!(
+                        "Typed note on page {} (rotation {})\nSecond line: café — “quotes”",
+                        page + 1,
+                        g.rotation
+                    ),
                     width: None,
                     height: None,
                 },

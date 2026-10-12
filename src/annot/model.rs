@@ -103,7 +103,10 @@ pub enum MarkupKind {
 pub enum Kind {
     /// Freehand stroke as a cubic Bézier chain: `[p0, c1, c2, p1, c1, c2, p2, ...]`
     /// (length `3n + 1`). A single point is a dot.
-    Ink { curve: Vec<Pt>, highlighter: bool },
+    Ink {
+        curve: Vec<Pt>,
+        highlighter: bool,
+    },
     /// Text box. `origin` is the top-left corner as seen on screen, `right`/`down`
     /// are unit vectors in user space pointing right/down on screen, so text stays
     /// upright on rotated pages. `style.width` is the font size. With a `width`
@@ -119,9 +122,16 @@ pub enum Kind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         height: Option<f32>,
     },
-    Shape { shape: ShapeKind, a: Pt, b: Pt },
+    Shape {
+        shape: ShapeKind,
+        a: Pt,
+        b: Pt,
+    },
     /// Quads as `[upper-left, upper-right, lower-left, lower-right]` (PDF QuadPoints order).
-    Markup { markup: MarkupKind, quads: Vec<[Pt; 4]> },
+    Markup {
+        markup: MarkupKind,
+        quads: Vec<[Pt; 4]>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -218,10 +228,7 @@ impl Annotation {
 pub fn new_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let t = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{NM_PREFIX}{t:x}-{n:x}-{:x}", std::process::id())
 }

@@ -103,7 +103,8 @@ fn style(dark: bool) -> egui::Style {
     v.window_stroke = Stroke::new(1.0, p.border);
     v.window_corner_radius = CornerRadius::same(12);
     v.menu_corner_radius = CornerRadius::same(8);
-    v.window_shadow = Shadow { offset: [0, 8], blur: 28, spread: 0, color: Color32::from_black_alpha(if dark { 110 } else { 45 }) };
+    v.window_shadow =
+        Shadow { offset: [0, 8], blur: 28, spread: 0, color: Color32::from_black_alpha(if dark { 110 } else { 45 }) };
     v.popup_shadow = soft_shadow(dark);
     v.extreme_bg_color = p.field;
     v.text_edit_bg_color = Some(p.field);

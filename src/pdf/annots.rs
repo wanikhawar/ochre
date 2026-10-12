@@ -11,7 +11,10 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use lopdf::{Dictionary, Document, IncrementalDocument, Object, ObjectId};
 
-use super::write::{Fingerprint, LEGACY_PRIVATE_KEY, appearance_hash, PRIVATE_KEY, Private, add_annotation, decode_text_string, dict_rect};
+use super::write::{
+    Fingerprint, LEGACY_PRIVATE_KEY, PRIVATE_KEY, Private, add_annotation, appearance_hash, decode_text_string,
+    dict_rect,
+};
 use crate::annot::model::{AnnotIdentity, Annotation, Foreign, Kind, LEGACY_NM_PREFIX, NM_PREFIX, PageSlot};
 
 #[derive(Default)]
@@ -64,7 +67,12 @@ fn identity(d: &Dictionary) -> Option<AnnotIdentity> {
 impl Scan {
     /// Per page of `layout`: `/Annots` indices that must not be drawn by pdfium
     /// (ours, which we draw ourselves, and other apps' ones the user deleted).
-    pub fn hidden(&self, foreign: &[Foreign], deleted_foreign: &BTreeSet<usize>, layout: &[PageSlot]) -> Vec<Vec<usize>> {
+    pub fn hidden(
+        &self,
+        foreign: &[Foreign],
+        deleted_foreign: &BTreeSet<usize>,
+        layout: &[PageSlot],
+    ) -> Vec<Vec<usize>> {
         layout
             .iter()
             .map(|slot| {
@@ -209,7 +217,8 @@ pub fn scan(doc: &Document) -> Scan {
         .objects
         .iter()
         .filter(|(id, o)| {
-            !listed.contains(id) && o.as_dict().is_ok_and(|d| d.get(b"Type").and_then(Object::as_name).ok() == Some(b"Page"))
+            !listed.contains(id)
+                && o.as_dict().is_ok_and(|d| d.get(b"Type").and_then(Object::as_name).ok() == Some(b"Page"))
         })
         .map(|(id, _)| *id)
         .collect();

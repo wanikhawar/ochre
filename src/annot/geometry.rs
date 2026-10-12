@@ -25,14 +25,7 @@ impl Affine {
     }
     /// `self` followed by scale `s` and translation `(tx, ty)`.
     pub fn then_scale_translate(&self, s: f32, tx: f32, ty: f32) -> Affine {
-        Affine {
-            a: self.a * s,
-            b: self.b * s,
-            c: self.c * s,
-            d: self.d * s,
-            e: self.e * s + tx,
-            f: self.f * s + ty,
-        }
+        Affine { a: self.a * s, b: self.b * s, c: self.c * s, d: self.d * s, e: self.e * s + tx, f: self.f * s + ty }
     }
     pub fn to_skia(self) -> tiny_skia::Transform {
         tiny_skia::Transform::from_row(self.a, self.b, self.c, self.d, self.e, self.f)
@@ -173,11 +166,11 @@ const HELV_WIDTHS: [u16; 95] = [
     278, 278, 355, 556, 556, 889, 667, 191, 333, 333, 389, 584, 278, 333, 278, 278, // ' '..'/'
     556, 556, 556, 556, 556, 556, 556, 556, 556, 556, // 0-9
     278, 278, 584, 584, 584, 556, 1015, // ':'..'@'
-    667, 667, 722, 722, 667, 611, 778, 722, 278, 500, 667, 556, 833, 722, 778, 667, 778, 722, 667,
-    611, 722, 667, 944, 667, 667, 611, // A-Z
+    667, 667, 722, 722, 667, 611, 778, 722, 278, 500, 667, 556, 833, 722, 778, 667, 778, 722, 667, 611, 722, 667, 944,
+    667, 667, 611, // A-Z
     278, 278, 278, 469, 556, 333, // '['..'`'
-    556, 556, 500, 556, 556, 278, 556, 556, 222, 222, 500, 222, 833, 556, 556, 556, 556, 333, 500,
-    278, 556, 500, 722, 500, 500, 500, // a-z
+    556, 556, 500, 556, 556, 278, 556, 556, 222, 222, 500, 222, 833, 556, 556, 556, 556, 333, 500, 278, 556, 500, 722,
+    500, 500, 500, // a-z
     334, 260, 334, 584, // '{'..'~'
 ];
 
@@ -255,7 +248,8 @@ pub fn text_lines(text: &str, size: f32, width: Option<f32>) -> Vec<(std::ops::R
 /// Size `(width, height)` of a text box in points, in its own (screen-aligned) frame.
 pub fn text_box_size(text: &str, size: f32, width: Option<f32>, height: Option<f32>) -> (f32, f32) {
     let lines = text_lines(text, size, width);
-    let w = width.unwrap_or_else(|| lines.iter().map(|(r, _)| helv_text_width(&text[r.clone()], size)).fold(0.0, f32::max));
+    let w =
+        width.unwrap_or_else(|| lines.iter().map(|(r, _)| helv_text_width(&text[r.clone()], size)).fold(0.0, f32::max));
     let h = (lines.len() as f32 * size * TEXT_LINE_HEIGHT).max(height.unwrap_or(0.0));
     (w + 2.0 * TEXT_PAD, h + 2.0 * TEXT_PAD)
 }
@@ -404,10 +398,9 @@ pub fn distance(a: &Annotation, p: Pt) -> f32 {
                 ShapeKind::Rect => dist_to_polyline(p, &rect_points(*s, *e)),
                 ShapeKind::Ellipse => dist_to_polyline(p, &ellipse_points(*s, *e, 64)),
                 ShapeKind::Line => dist_to_segment(p, *s, *e),
-                ShapeKind::Check | ShapeKind::Cross => mark_strokes(*shape, *s, *e)
-                    .iter()
-                    .map(|l| dist_to_polyline(p, l))
-                    .fold(f32::INFINITY, f32::min),
+                ShapeKind::Check | ShapeKind::Cross => {
+                    mark_strokes(*shape, *s, *e).iter().map(|l| dist_to_polyline(p, l)).fold(f32::INFINITY, f32::min)
+                }
                 ShapeKind::Arrow => {
                     let head = arrow_head(*s, *e, a.style.width);
                     dist_to_segment(p, *s, *e)
@@ -421,10 +414,7 @@ pub fn distance(a: &Annotation, p: Pt) -> f32 {
             if quads.iter().any(|q| point_in_quad(p, q)) {
                 0.0
             } else {
-                quads
-                    .iter()
-                    .map(|q| dist_to_polyline(p, &[q[0], q[1], q[3], q[2], q[0]]))
-                    .fold(f32::INFINITY, f32::min)
+                quads.iter().map(|q| dist_to_polyline(p, &[q[0], q[1], q[3], q[2], q[0]])).fold(f32::INFINITY, f32::min)
             }
         }
     }
@@ -448,7 +438,10 @@ mod tests {
         assert_eq!(shown("one two\nthree", None), [line("one two", true), line("three", false)]);
         // "one two" is 35.02 points wide in 10 pt Helvetica; spaces stay at the end of their line.
         assert_eq!(shown("one two three", Some(36.0)), [line("one two ", false), line("three", false)]);
-        assert_eq!(shown("one two three", Some(30.0)), [line("one ", false), line("two ", false), line("three", false)]);
+        assert_eq!(
+            shown("one two three", Some(30.0)),
+            [line("one ", false), line("two ", false), line("three", false)]
+        );
         // A word longer than the width is split; at least one letter goes on each line.
         assert_eq!(shown("abcdefgh", Some(22.0)), [line("abcd", false), line("efgh", false)]);
         assert_eq!(shown("WW", Some(1.0)), [line("W", false), line("W", false)]);
@@ -457,7 +450,8 @@ mod tests {
         // Lines and breaks account for every byte, so the editor's cursor lines up.
         let text = "Ünïcode wörds wrap\ntoo, even sehrlangewörter";
         let lines = text_lines(text, 10.0, Some(40.0));
-        let joined: String = lines.iter().map(|(r, hard)| format!("{}{}", &text[r.clone()], if *hard { "\n" } else { "" })).collect();
+        let joined: String =
+            lines.iter().map(|(r, hard)| format!("{}{}", &text[r.clone()], if *hard { "\n" } else { "" })).collect();
         assert_eq!(joined, text);
         // The box is as wide as set, and as tall as its lines.
         let (w, h) = text_box_size("one two three", 10.0, Some(30.0), None);
@@ -506,7 +500,10 @@ mod tests {
             // Short stroke down to the lowest point, then a long stroke up to the top right.
             assert!(on_screen[1].y > on_screen[0].y && on_screen[1].y > on_screen[2].y, "rotation {rotation}");
             assert!(on_screen[2].x > on_screen[1].x && on_screen[1].x > on_screen[0].x, "rotation {rotation}");
-            assert!((on_screen[2].x - 120.0).abs() < 1e-3 && (on_screen[2].y - 100.0).abs() < 1e-3, "rotation {rotation}");
+            assert!(
+                (on_screen[2].x - 120.0).abs() < 1e-3 && (on_screen[2].y - 100.0).abs() < 1e-3,
+                "rotation {rotation}"
+            );
         }
     }
 
@@ -516,12 +513,19 @@ mod tests {
         for rotation in [0, 90, 180, 270] {
             let g = PageGeom { bbox: [0.0, 0.0, 600.0, 800.0], rotation };
             let u = |x, y| g.to_user().apply(Pt::new(x, y));
-            let a = Annotation::new(0, style, Kind::Shape { shape: ShapeKind::Rect, a: u(100.0, 100.0), b: u(200.0, 150.0) });
+            let a = Annotation::new(
+                0,
+                style,
+                Kind::Shape { shape: ShapeKind::Rect, a: u(100.0, 100.0), b: u(200.0, 150.0) },
+            );
             // Twice as wide on screen, same height, anchored at the on-screen top-left.
             let s = scaled(&a, &g, Pt::new(100.0, 100.0), 2.0, 1.0);
             let Kind::Shape { a: p, b: q, .. } = s.kind else { panic!() };
             let (p, q) = (g.to_display().apply(p), g.to_display().apply(q));
-            assert!(close(p, Pt::new(100.0, 100.0)) && close(q, Pt::new(300.0, 150.0)), "rotation {rotation}: {p:?} {q:?}");
+            assert!(
+                close(p, Pt::new(100.0, 100.0)) && close(q, Pt::new(300.0, 150.0)),
+                "rotation {rotation}: {p:?} {q:?}"
+            );
         }
     }
 

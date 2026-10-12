@@ -453,7 +453,11 @@ impl App {
         let Some((text, n)) = self.clip_text() else { return false };
         ctx.copy_text(text);
         self.last_paste = None;
-        self.set_status(ctx, if n == 1 { "Copied 1 annotation".into() } else { format!("Copied {n} annotations") }, false);
+        self.set_status(
+            ctx,
+            if n == 1 { "Copied 1 annotation".into() } else { format!("Copied {n} annotations") },
+            false,
+        );
         true
     }
 
@@ -593,9 +597,10 @@ impl App {
             return (g.style, Some(Tool::Pen));
         }
         if let (Some(Selection::Ours(id)), Some(doc)) = (&self.selection, &self.doc)
-            && let Some(a) = doc.get(id) {
-                return (a.style, Some(tool_of(a)));
-            }
+            && let Some(a) = doc.get(id)
+        {
+            return (a.style, Some(tool_of(a)));
+        }
         (self.tool_style(self.tool), None)
     }
 
@@ -675,9 +680,10 @@ impl App {
             return;
         };
         if let Some(e) = &mut self.editing
-            && e.id.as_deref() == Some(id.as_str()) {
-                e.style = style;
-            }
+            && e.id.as_deref() == Some(id.as_str())
+        {
+            e.style = style;
+        }
         let Some(doc) = &mut self.doc else { return };
         let Some(i) = doc.index_of(&id) else { return };
         let before = doc.annots[i].clone();
@@ -711,8 +717,7 @@ impl App {
 
     /// Records the position of every open file.
     fn remember_all_positions(&mut self) {
-        let background: Vec<ReadPos> =
-            self.tabs.iter().filter_map(|t| read_pos(t.doc.as_ref()?, &t.view)).collect();
+        let background: Vec<ReadPos> = self.tabs.iter().filter_map(|t| read_pos(t.doc.as_ref()?, &t.view)).collect();
         for pos in background {
             self.cfg.set_position(pos);
         }
@@ -859,7 +864,9 @@ impl App {
                         let at = g.to_display().apply(crate::annot::model::Pt::new(x.unwrap_or(g.bbox[0]), *y));
                         Jump { page: *page, y: at.y.max(0.0), margin: 12.0, x: JumpX::Keep, animate: true }
                     }
-                    None => Jump { page: *page, y: 0.0, margin: crate::viewer::TOP_MARGIN, x: JumpX::Keep, animate: true },
+                    None => {
+                        Jump { page: *page, y: 0.0, margin: crate::viewer::TOP_MARGIN, x: JumpX::Keep, animate: true }
+                    }
                 };
                 self.view.jump = Some(jump);
             }
@@ -952,7 +959,8 @@ impl App {
             }
             FileDialog::SaveAs(doc_path) => {
                 let Some(target) = paths.into_iter().next() else { return };
-                let Some(i) = (0..self.tabs.len()).find(|&i| self.tab_doc(i).is_some_and(|d| d.path == doc_path)) else {
+                let Some(i) = (0..self.tabs.len()).find(|&i| self.tab_doc(i).is_some_and(|d| d.path == doc_path))
+                else {
                     self.set_status(ctx, "Not saved: that file was closed", true);
                     return;
                 };
@@ -1039,7 +1047,11 @@ impl App {
                 let mut msg = match &outcome {
                     o if o.conflicts > 0 => format!(
                         "Saved. {} edited both here and elsewhere: both versions were kept",
-                        if o.conflicts == 1 { "1 annotation was".to_string() } else { format!("{} annotations were", o.conflicts) }
+                        if o.conflicts == 1 {
+                            "1 annotation was".to_string()
+                        } else {
+                            format!("{} annotations were", o.conflicts)
+                        }
                     ),
                     o if o.combined => "Saved, together with changes saved meanwhile from elsewhere".into(),
                     _ => "Saved".into(),
@@ -1063,18 +1075,15 @@ impl App {
         self.follow_layout();
         let Some(worker) = &self.worker else { return };
         if let Some(doc) = &mut self.doc
-            && doc.generation != self.sent_generation {
-                if self.sent_generation != 0 {
-                    worker.send(Req::Close { generation: self.sent_generation });
-                }
-                worker.send(Req::Load {
-                    generation: doc.generation,
-                    bytes: doc.render_bytes(),
-                    hide: doc.hidden(),
-                });
-                self.sent_generation = doc.generation;
-                self.in_flight.clear();
+            && doc.generation != self.sent_generation
+        {
+            if self.sent_generation != 0 {
+                worker.send(Req::Close { generation: self.sent_generation });
             }
+            worker.send(Req::Load { generation: doc.generation, bytes: doc.render_bytes(), hide: doc.hidden() });
+            self.sent_generation = doc.generation;
+            self.in_flight.clear();
+        }
         let responses: Vec<Resp> = worker.rx.try_iter().collect();
         for resp in responses {
             // Results for a background tab are kept there (renders are redone on return).
@@ -1220,7 +1229,11 @@ impl App {
             self.follow_layout();
             self.pages_ui.selected.clear();
             let n = pages.len();
-            let msg = if n == 1 { "Deleted 1 page (Ctrl+Z brings it back)".into() } else { format!("Deleted {n} pages (Ctrl+Z brings them back)") };
+            let msg = if n == 1 {
+                "Deleted 1 page (Ctrl+Z brings it back)".into()
+            } else {
+                format!("Deleted {n} pages (Ctrl+Z brings them back)")
+            };
             self.set_status(ctx, msg, false);
         } else {
             self.set_status(ctx, "A document needs at least one page", true);
@@ -1311,7 +1324,9 @@ impl App {
         let (Some(worker), Some(doc)) = (&self.worker, &self.doc) else { return };
         let Some(g) = doc.pages.get(page) else { return };
         let key = (doc.generation, doc.page_rev.get(page).copied().unwrap_or(0));
-        if self.pages_ui.thumbs.get(&page).is_some_and(|t| t.key == key) || self.pages_ui.in_flight.get(&page) == Some(&key) {
+        if self.pages_ui.thumbs.get(&page).is_some_and(|t| t.key == key)
+            || self.pages_ui.in_flight.get(&page) == Some(&key)
+        {
             return;
         }
         let scale = THUMB_WIDTH * self.ctx.pixels_per_point() / g.display_size().0.max(1.0);
@@ -1396,7 +1411,8 @@ impl App {
                 self.close_tab(self.active);
             }
             // Ctrl+A: all our annotations on the current page (Select tool).
-            if self.tool == Tool::Select && pressed(sc(cmd, Key::A))
+            if self.tool == Tool::Select
+                && pressed(sc(cmd, Key::A))
                 && let Some(doc) = &self.doc
             {
                 let page = self.view.current_page;
@@ -1428,7 +1444,11 @@ impl App {
             // Ctrl+C / X / V arrive as events rather than key presses. Copy takes the
             // page text if some is selected, else the selected annotations.
             let clip_events: Vec<egui::Event> = ctx.input(|i| {
-                i.events.iter().filter(|e| matches!(e, egui::Event::Copy | egui::Event::Cut | egui::Event::Paste(_))).cloned().collect()
+                i.events
+                    .iter()
+                    .filter(|e| matches!(e, egui::Event::Copy | egui::Event::Cut | egui::Event::Paste(_)))
+                    .cloned()
+                    .collect()
             });
             for e in clip_events {
                 match e {
@@ -1681,7 +1701,9 @@ impl App {
         self.poll_dialog(&ctx);
 
         // Each dropped file opens in its own tab.
-        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect()
+        });
         for path in dropped {
             self.request_open(Some(path));
         }

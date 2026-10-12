@@ -7,8 +7,8 @@ use lopdf::{Dictionary, Document, Object, ObjectId, Stream, StringFormat, dictio
 use serde::{Deserialize, Serialize};
 
 use crate::annot::geometry::{
-    TEXT_ASCENT, TEXT_LINE_HEIGHT, TEXT_PAD, arrow_head, bounds, box_corners, flatten_bezier, mark_lines,
-    mark_strokes, text_lines,
+    TEXT_ASCENT, TEXT_LINE_HEIGHT, TEXT_PAD, arrow_head, bounds, box_corners, flatten_bezier, mark_lines, mark_strokes,
+    text_lines,
 };
 use crate::annot::model::{Annotation, Kind, MarkupKind, Pt, ShapeKind};
 use crate::annot::raster::{markup_line, markup_thickness};
@@ -78,7 +78,10 @@ impl Fingerprint {
             (Some(a), Some(b)) => a.len() == b.len() && a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-3),
             (a, b) => a.is_none() && b.is_none(),
         };
-        colors && self.contents == other.contents && self.modified == other.modified && self.appearance == other.appearance
+        colors
+            && self.contents == other.contents
+            && self.modified == other.modified
+            && self.appearance == other.appearance
     }
 }
 
@@ -118,10 +121,8 @@ pub fn decode_text_string(b: &[u8]) -> String {
 }
 
 fn pdf_date() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+    let secs =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
     let (days, rem) = (secs.div_euclid(86400), secs.rem_euclid(86400));
     // Civil-from-days (Howard Hinnant).
     let z = days + 719468;
@@ -249,10 +250,7 @@ pub fn add_annotation(doc: &mut Document, a: &Annotation, page: ObjectId) -> Obj
             multiply = *highlighter;
             let flat = flatten_bezier(curve, 8);
             annot.set("Subtype", "Ink");
-            annot.set(
-                "InkList",
-                Object::Array(vec![reals(flat.iter().flat_map(|p| [p.x, p.y]))]),
-            );
+            annot.set("InkList", Object::Array(vec![reals(flat.iter().flat_map(|p| [p.x, p.y]))]));
             annot.set("C", reals(a.style.color));
             annot.set("BS", border(w));
             let _ = writeln!(ops, "{color} RG {} w 1 J 1 j", num(w));
@@ -413,10 +411,7 @@ pub fn add_annotation(doc: &mut Document, a: &Annotation, page: ObjectId) -> Obj
             font = true;
             annot.set("Subtype", "FreeText");
             annot.set("Contents", text_string(text));
-            annot.set(
-                "DA",
-                Object::string_literal(format!("/Helv {} Tf {color} rg", num(w))),
-            );
+            annot.set("DA", Object::string_literal(format!("/Helv {} Tf {color} rg", num(w))));
             annot.set("BS", border(0.0));
             annot.set("Q", 0);
             // Text matrix: x along screen-right, y along screen-up.

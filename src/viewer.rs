@@ -4,8 +4,8 @@
 use std::sync::Arc;
 
 use eframe::egui::{
-    self, Color32, CursorIcon, Event, FontId, Key, Modifiers, Painter, PointerButton, Pos2, Rect,
-    Sense, Stroke, StrokeKind, Vec2, pos2, vec2,
+    self, Color32, CursorIcon, Event, FontId, Key, Modifiers, Painter, PointerButton, Pos2, Rect, Sense, Stroke,
+    StrokeKind, Vec2, pos2, vec2,
 };
 
 use crate::annot::geometry::{self, Affine, PageGeom, TEXT_ASCENT, TEXT_LINE_HEIGHT, TEXT_PAD};
@@ -138,27 +138,74 @@ fn badge_center(r: Rect) -> Pos2 {
 
 pub enum Gesture {
     None,
-    Ink { page: usize, brush: LazyBrush, raw: Vec<Pt>, highlighter: bool, style: Style },
-    Shape { page: usize, shape: ShapeKind, a: Pt, b: Pt, style: Style },
-    Markup { page: usize, markup: MarkupKind, start: usize, end: usize, style: Style },
-    Erase { removed: Vec<Cmd> },
+    Ink {
+        page: usize,
+        brush: LazyBrush,
+        raw: Vec<Pt>,
+        highlighter: bool,
+        style: Style,
+    },
+    Shape {
+        page: usize,
+        shape: ShapeKind,
+        a: Pt,
+        b: Pt,
+        style: Style,
+    },
+    Markup {
+        page: usize,
+        markup: MarkupKind,
+        start: usize,
+        end: usize,
+        style: Style,
+    },
+    Erase {
+        removed: Vec<Cmd>,
+    },
     /// Dragging the selection: several annotations when moving a group, one otherwise.
-    Edit { before: Vec<Annotation>, current: Vec<Annotation>, op: EditOp },
+    Edit {
+        before: Vec<Annotation>,
+        current: Vec<Annotation>,
+        op: EditOp,
+    },
     /// Dragging a selection box (user space of `page`). With `add`, what it touches
     /// is added to `base`, the selection it started with.
-    Marquee { page: usize, start: Pt, end: Pt, add: bool, base: Vec<String> },
-    Pan { last: Pos2 },
+    Marquee {
+        page: usize,
+        start: Pt,
+        end: Pt,
+        add: bool,
+        base: Vec<String>,
+    },
+    Pan {
+        last: Pos2,
+    },
     /// Pressed on a link: a click follows it; dragging instead selects text from
     /// `char` (Select tool) or pans (Hand tool).
-    Link { target: Target, start: Pos2, page: usize, char: Option<usize> },
+    Link {
+        target: Target,
+        start: Pos2,
+        page: usize,
+        char: Option<usize>,
+    },
     /// Dragging out a text selection with the Select tool. `click` is what a plain
     /// click (no drag) selects instead, e.g. another app's highlight over the text.
-    SelectText { click: Option<Selection> },
+    SelectText {
+        click: Option<Selection>,
+    },
     /// Dragging out a new text box's width with the Text tool (user space).
-    TextBox { page: usize, start: Pt, end: Pt, style: Style },
+    TextBox {
+        page: usize,
+        start: Pt,
+        end: Pt,
+        style: Style,
+    },
     /// Dragging a size handle of the text box being typed; `grab` is how far
     /// (points, right and down) from the box's edges it was pressed.
-    TextResize { grip: TextGrip, grab: Pt },
+    TextResize {
+        grip: TextGrip,
+        grab: Pt,
+    },
 }
 
 /// Selected page text: an inclusive range of pdfium character indices.
@@ -304,8 +351,11 @@ impl View {
     /// gap above a page counts as part of it (`y` is then negative).
     pub fn position(&self) -> Option<(usize, f32)> {
         let top = self.viewport.top();
-        let page =
-            self.page_rects.iter().position(|r| r.bottom() > top + TOP_MARGIN).or(self.page_rects.len().checked_sub(1))?;
+        let page = self
+            .page_rects
+            .iter()
+            .position(|r| r.bottom() > top + TOP_MARGIN)
+            .or(self.page_rects.len().checked_sub(1))?;
         Some((page, (top - self.page_rects[page].top()) / self.zoom))
     }
 
@@ -620,8 +670,14 @@ pub fn markup_text(chars: &[TextChar], quads: &[[Pt; 4]]) -> String {
         let (x, y) = ((c.rect[0] + c.rect[2]) / 2.0, (c.rect[1] + c.rect[3]) / 2.0);
         quads.iter().any(|q| {
             let (xs, ys) = (q.map(|p| p.x), q.map(|p| p.y));
-            let (x0, x1) = (xs.iter().copied().fold(f32::INFINITY, f32::min), xs.iter().copied().fold(f32::NEG_INFINITY, f32::max));
-            let (y0, y1) = (ys.iter().copied().fold(f32::INFINITY, f32::min), ys.iter().copied().fold(f32::NEG_INFINITY, f32::max));
+            let (x0, x1) = (
+                xs.iter().copied().fold(f32::INFINITY, f32::min),
+                xs.iter().copied().fold(f32::NEG_INFINITY, f32::max),
+            );
+            let (y0, y1) = (
+                ys.iter().copied().fold(f32::INFINITY, f32::min),
+                ys.iter().copied().fold(f32::NEG_INFINITY, f32::max),
+            );
             x >= x0 && x <= x1 && y >= y0 && y <= y1
         })
     };
@@ -714,10 +770,11 @@ impl App {
         }
         let (zoom_delta, hover) = ctx.input(|i| (i.zoom_delta(), i.pointer.hover_pos()));
         if zoom_delta != 1.0
-            && let Some(h) = hover.filter(|h| vp.contains(*h)) {
-                self.view.fit = None;
-                new_zoom = Some((self.view.zoom * zoom_delta, h));
-            }
+            && let Some(h) = hover.filter(|h| vp.contains(*h))
+        {
+            self.view.fit = None;
+            new_zoom = Some((self.view.zoom * zoom_delta, h));
+        }
         if let Some((z, anchor)) = new_zoom {
             self.apply_zoom(&pages, z.clamp(0.1, 8.0), anchor, now);
         }
@@ -755,7 +812,13 @@ impl App {
             .min_by(|&a, &b| {
                 let d = |k: usize| {
                     let (top, h) = (old.origins[k].y, old.sizes[k].y);
-                    if c.y < top { top - c.y } else if c.y > top + h { c.y - top - h } else { 0.0 }
+                    if c.y < top {
+                        top - c.y
+                    } else if c.y > top + h {
+                        c.y - top - h
+                    } else {
+                        0.0
+                    }
                 };
                 d(a).total_cmp(&d(b))
             })
@@ -804,7 +867,11 @@ impl App {
                 // Scroll sideways only if the span isn't already in view.
                 let (l, r) = (o.x + x0 * zoom, o.x + x1 * zoom);
                 let off = self.view.offset.x;
-                j.x = if l < off + 16.0 || r > off + vp.width() - 16.0 { JumpX::Center((x0 + x1) / 2.0) } else { JumpX::Keep };
+                j.x = if l < off + 16.0 || r > off + vp.width() - 16.0 {
+                    JumpX::Center((x0 + x1) / 2.0)
+                } else {
+                    JumpX::Keep
+                };
             }
             let x = match j.x {
                 JumpX::Center(c) => o.x + c * zoom - vp.width() / 2.0,
@@ -948,9 +1015,7 @@ impl App {
             .filter(|&i| Rect::from_min_size(lay.origins[i].to_pos2(), lay.sizes[i]).intersects(vis_area))
             .collect();
         let probe = viewport.top() + viewport.height() * 0.3;
-        self.view.current_page = (0..n)
-            .find(|&i| lay.origins[i].y + lay.sizes[i].y + GAP > probe)
-            .unwrap_or(0);
+        self.view.current_page = (0..n).find(|&i| lay.origins[i].y + lay.sizes[i].y + GAP > probe).unwrap_or(0);
 
         let page_shadow = egui::Shadow {
             offset: [0, 2],
@@ -1027,9 +1092,10 @@ impl App {
             return;
         }
         let rev = doc.page_rev.get(page).copied().unwrap_or(0);
-        let fresh = self.overlay.get(&page).is_some_and(|o| {
-            o.rev == rev && o.exclude == exclude && ((o.scale - want).abs() < 0.005 || !settled)
-        });
+        let fresh = self
+            .overlay
+            .get(&page)
+            .is_some_and(|o| o.rev == rev && o.exclude == exclude && ((o.scale - want).abs() < 0.005 || !settled));
         if !fresh {
             let g = &doc.pages[page];
             let (w, h) = g.display_size();
@@ -1360,7 +1426,10 @@ impl App {
             let aff = self.view.to_screen(&doc.pages[*page], *page);
             let (a, b) = (pos(aff.apply(*start)), pos(aff.apply(*end)));
             let h = style.width * TEXT_LINE_HEIGHT * self.view.zoom + 2.0 * TEXT_PAD * self.view.zoom;
-            let r = Rect::from_min_size(pos2(a.x.min(b.x), a.y.min(b.y)), vec2((b.x - a.x).abs(), (b.y - a.y).abs().max(h)));
+            let r = Rect::from_min_size(
+                pos2(a.x.min(b.x), a.y.min(b.y)),
+                vec2((b.x - a.x).abs(), (b.y - a.y).abs().max(h)),
+            );
             painter.rect_stroke(r, 2.0, Stroke::new(1.0, crate::ui::theme::ACCENT), StrokeKind::Outside);
         }
         let live: Option<Annotation> = match &self.gesture {
@@ -1405,7 +1474,8 @@ impl App {
             _ => live.into_iter().collect(),
         };
         let affs: Vec<Affine> = live.iter().map(|a| self.view.to_screen(&doc.pages[a.page], a.page)).collect();
-        let Some(bounds) = live.iter().zip(&affs).map(|(a, aff)| screen_bounds(a, aff)).reduce(|x, y| x.union(y)) else {
+        let Some(bounds) = live.iter().zip(&affs).map(|(a, aff)| screen_bounds(a, aff)).reduce(|x, y| x.union(y))
+        else {
             return;
         };
         let bbox = bounds.expand(2.0).intersect(painter.clip_rect());
@@ -1451,12 +1521,16 @@ impl App {
                 Event::PointerButton { pos, button, pressed: true, modifiers } if hovered => {
                     if button == PointerButton::Extra1 {
                         self.go_back();
-                    } else if button == PointerButton::Primary && !panning_key && self.tool == Tool::Hand
+                    } else if button == PointerButton::Primary
+                        && !panning_key
+                        && self.tool == Tool::Hand
                         && let Some((target, page)) = self.link_at(pos)
                     {
                         self.commit_edits();
                         self.gesture = Gesture::Link { target, start: pos, page, char: None };
-                    } else if button == PointerButton::Middle || (button == PointerButton::Primary && (panning_key || self.tool == Tool::Hand)) {
+                    } else if button == PointerButton::Middle
+                        || (button == PointerButton::Primary && (panning_key || self.tool == Tool::Hand))
+                    {
                         self.commit_edits();
                         self.gesture = Gesture::Pan { last: pos };
                     } else if button == PointerButton::Primary {
@@ -1485,7 +1559,9 @@ impl App {
                 (Gesture::Pan { .. }, _) => CursorIcon::Grabbing,
                 (Gesture::Link { .. }, _) => CursorIcon::PointingHand,
                 (Gesture::Marquee { .. }, _) => CursorIcon::Crosshair,
-                (Gesture::None, Tool::Hand) if !panning_key && resp.hover_pos().is_some_and(|p| self.link_at(p).is_some()) => {
+                (Gesture::None, Tool::Hand)
+                    if !panning_key && resp.hover_pos().is_some_and(|p| self.link_at(p).is_some()) =>
+                {
                     CursorIcon::PointingHand
                 }
                 _ if panning_key || self.tool == Tool::Hand => CursorIcon::Grab,
@@ -1536,27 +1612,34 @@ impl App {
                 _ => CursorIcon::Default,
             };
             ctx.set_cursor_icon(icon);
-            if self.tool == Tool::Eraser && !panning_key
-                && let Some(p) = resp.hover_pos().or(ctx.pointer_latest_pos()) {
-                    let r = self.tool_style(Tool::Eraser).width / 2.0;
-                    ui.painter().circle(p, r, Color32::from_white_alpha(60), Stroke::new(1.0, Color32::from_gray(90)));
-                }
+            if self.tool == Tool::Eraser
+                && !panning_key
+                && let Some(p) = resp.hover_pos().or(ctx.pointer_latest_pos())
+            {
+                let r = self.tool_style(Tool::Eraser).width / 2.0;
+                ui.painter().circle(p, r, Color32::from_white_alpha(60), Stroke::new(1.0, Color32::from_gray(90)));
+            }
         }
         if matches!(self.tool, Tool::Markup(_) | Tool::Select | Tool::Highlighter)
-            && let Some(p) = resp.hover_pos().and_then(|p| self.view.page_at(p, true)) {
-                self.request_text(p);
-            }
+            && let Some(p) = resp.hover_pos().and_then(|p| self.view.page_at(p, true))
+        {
+            self.request_text(p);
+        }
         // Hovering a note badge (or, with Select, an annotation with a note) shows the
         // note; hovering a link shows where it goes.
-        let tip = resp.hover_pos().filter(|_| matches!(self.gesture, Gesture::None) && self.note_edit.is_none()).and_then(|p| {
-            self.note_at(p).or_else(|| {
-                let follows = matches!(self.tool, Tool::Select | Tool::Hand) && (self.tool == Tool::Hand || self.hit(p).is_none());
-                self.link_at(p).filter(|_| follows && !panning_key).map(|(t, _)| match t {
-                    Target::Page { page, .. } => format!("Go to page {}", page + 1),
-                    Target::Uri(uri) => uri,
+        let tip = resp
+            .hover_pos()
+            .filter(|_| matches!(self.gesture, Gesture::None) && self.note_edit.is_none())
+            .and_then(|p| {
+                self.note_at(p).or_else(|| {
+                    let follows = matches!(self.tool, Tool::Select | Tool::Hand)
+                        && (self.tool == Tool::Hand || self.hit(p).is_none());
+                    self.link_at(p).filter(|_| follows && !panning_key).map(|(t, _)| match t {
+                        Target::Page { page, .. } => format!("Go to page {}", page + 1),
+                        Target::Uri(uri) => uri,
+                    })
                 })
-            })
-        });
+            });
         if let Some(note) = tip {
             resp.clone().on_hover_ui_at_pointer(|ui| {
                 ui.set_max_width(320.0);
@@ -1648,7 +1731,9 @@ impl App {
             })
             .collect();
         out.extend(doc.foreign.iter().enumerate().filter_map(|(i, f)| {
-            let page = doc.foreign_page(i).filter(|&p| p < doc.pages.len() && f.selectable && !doc.deleted_foreign.contains(&i))?;
+            let page = doc
+                .foreign_page(i)
+                .filter(|&p| p < doc.pages.len() && f.selectable && !doc.deleted_foreign.contains(&i))?;
             Some(AnnotEntry {
                 page,
                 bounds: shown(page, f.rect),
@@ -1802,13 +1887,8 @@ impl App {
                 }
                 let mut brush = LazyBrush::new(self.cfg.stabilizer);
                 brush.update(Pt::new(p.x, p.y));
-                self.gesture = Gesture::Ink {
-                    page,
-                    brush,
-                    raw: vec![u],
-                    highlighter: self.tool == Tool::Highlighter,
-                    style,
-                };
+                self.gesture =
+                    Gesture::Ink { page, brush, raw: vec![u], highlighter: self.tool == Tool::Highlighter, style };
             }
             Tool::Shape(shape) => self.gesture = Gesture::Shape { page, shape, a: u, b: u, style },
             Tool::Markup(markup) => {
@@ -1900,7 +1980,9 @@ impl App {
                 // Text markup sits on the text: dragging over it selects text, and a
                 // plain click selects the markup. Other annotations move when dragged.
                 let movable = match &hit {
-                    Some(Selection::Ours(id)) => doc.get(id).filter(|a| !matches!(a.kind, Kind::Markup { .. })).cloned(),
+                    Some(Selection::Ours(id)) => {
+                        doc.get(id).filter(|a| !matches!(a.kind, Kind::Markup { .. })).cloned()
+                    }
                     _ => None,
                 };
                 if let Some(a) = &movable {
@@ -1981,7 +2063,8 @@ impl App {
                     let d = u.sub(e.origin);
                     let (sets_w, sets_h) = grip.sets();
                     if sets_w {
-                        e.width = Some((d.dot(e.right) - grab.x - 2.0 * TEXT_PAD).max(min_text_width(e.style.width, zoom)));
+                        e.width =
+                            Some((d.dot(e.right) - grab.x - 2.0 * TEXT_PAD).max(min_text_width(e.style.width, zoom)));
                     }
                     if sets_h {
                         e.height = Some((d.dot(e.down) - grab.y - 2.0 * TEXT_PAD).max(min_text_height(e.style.width)));
@@ -2096,11 +2179,7 @@ impl App {
         let Some(page) = self.view.page_at(p, true) else { return };
         let u = self.view.to_user(&doc.pages[page], page, p);
         let Gesture::Erase { removed } = &mut self.gesture else { return };
-        while let Some(index) = doc
-            .annots
-            .iter()
-            .rposition(|a| a.page == page && geometry::distance(a, u) <= radius)
-        {
+        while let Some(index) = doc.annots.iter().rposition(|a| a.page == page && geometry::distance(a, u) <= radius) {
             let cmd = Cmd::Remove { annot: doc.annots[index].clone(), index };
             doc.apply(&cmd, true);
             removed.push(cmd);
@@ -2203,8 +2282,14 @@ impl App {
         let Some(e) = self.editing.take() else { return };
         let Some(doc) = &self.doc else { return };
         let text = e.text.trim_end().to_string();
-        let kind =
-            Kind::Text { origin: e.origin, right: e.right, down: e.down, text: text.clone(), width: e.width, height: e.height };
+        let kind = Kind::Text {
+            origin: e.origin,
+            right: e.right,
+            down: e.down,
+            text: text.clone(),
+            width: e.width,
+            height: e.height,
+        };
         let cmd = match &e.id {
             Some(id) => {
                 let Some(index) = doc.index_of(id) else { return };
@@ -2425,10 +2510,8 @@ mod tests {
                 doc.add_object(page).into()
             })
             .collect();
-        doc.objects.insert(
-            pages_id,
-            Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => kids, "Count" => 3 }),
-        );
+        doc.objects
+            .insert(pages_id, Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => kids, "Count" => 3 }));
         let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
         doc.trailer.set("Root", catalog);
         doc.save(path).unwrap();
@@ -2539,19 +2622,31 @@ mod tests {
         // Outlines: Intro (page 1), Chapter (page 3) with a child Section (page 3, y 400).
         let [outlines, intro, chapter, section] = [(); 4].map(|_| doc.new_object_id());
         let title = |t: &str| Object::string_literal(t);
-        doc.objects.insert(outlines, Object::Dictionary(dictionary! {
-            "Type" => "Outlines", "First" => intro, "Last" => chapter, "Count" => 3,
-        }));
-        doc.objects.insert(intro, Object::Dictionary(dictionary! {
-            "Title" => title("Intro"), "Parent" => outlines, "Next" => chapter, "Dest" => xyz(0, 792),
-        }));
-        doc.objects.insert(chapter, Object::Dictionary(dictionary! {
-            "Title" => title("Chapter"), "Parent" => outlines, "Prev" => intro,
-            "First" => section, "Last" => section, "Count" => 1, "Dest" => xyz(2, 792),
-        }));
-        doc.objects.insert(section, Object::Dictionary(dictionary! {
-            "Title" => title("Section"), "Parent" => chapter, "Dest" => xyz(2, 400),
-        }));
+        doc.objects.insert(
+            outlines,
+            Object::Dictionary(dictionary! {
+                "Type" => "Outlines", "First" => intro, "Last" => chapter, "Count" => 3,
+            }),
+        );
+        doc.objects.insert(
+            intro,
+            Object::Dictionary(dictionary! {
+                "Title" => title("Intro"), "Parent" => outlines, "Next" => chapter, "Dest" => xyz(0, 792),
+            }),
+        );
+        doc.objects.insert(
+            chapter,
+            Object::Dictionary(dictionary! {
+                "Title" => title("Chapter"), "Parent" => outlines, "Prev" => intro,
+                "First" => section, "Last" => section, "Count" => 1, "Dest" => xyz(2, 792),
+            }),
+        );
+        doc.objects.insert(
+            section,
+            Object::Dictionary(dictionary! {
+                "Title" => title("Section"), "Parent" => chapter, "Dest" => xyz(2, 400),
+            }),
+        );
         let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id, "Outlines" => outlines });
         doc.trailer.set("Root", catalog);
         doc.save(path).unwrap();
@@ -2574,7 +2669,11 @@ mod tests {
         h.frame(vec![]);
 
         // A box near the top of page 1, copied.
-        let rect = Annotation::new(0, Style::new([1.0, 0.0, 0.0], 2.0, 1.0), Kind::Shape { shape: ShapeKind::Rect, a: Pt::new(100.0, 680.0), b: Pt::new(200.0, 740.0) });
+        let rect = Annotation::new(
+            0,
+            Style::new([1.0, 0.0, 0.0], 2.0, 1.0),
+            Kind::Shape { shape: ShapeKind::Rect, a: Pt::new(100.0, 680.0), b: Pt::new(200.0, 740.0) },
+        );
         h.app.exec(vec![Cmd::Add(rect.clone())]);
         h.app.select(Some(Selection::Ours(rect.id.clone())));
         let (clip, _) = h.app.clip_text().unwrap();
@@ -2633,7 +2732,8 @@ mod tests {
         h.wait_until("pages", |a| a.doc.as_ref().is_some_and(|d| !d.pages.is_empty()));
         h.frame(vec![]);
         let zoom = h.app.view.zoom;
-        let text_of = |h: &Harness| h.doc().annots.iter().rev().find(|a| matches!(a.kind, Kind::Text { .. })).cloned().unwrap();
+        let text_of =
+            |h: &Harness| h.doc().annots.iter().rev().find(|a| matches!(a.kind, Kind::Text { .. })).cloned().unwrap();
         let width_of = |a: &Annotation| match a.kind {
             Kind::Text { width, .. } => width,
             _ => panic!(),
@@ -2642,7 +2742,8 @@ mod tests {
             Kind::Text { height, .. } => height,
             _ => panic!(),
         };
-        let grip = |h: &Harness, which| h.app.editing.as_ref().unwrap().handles.iter().find(|x| x.0 == which).unwrap().1;
+        let grip =
+            |h: &Harness, which| h.app.editing.as_ref().unwrap().handles.iter().find(|x| x.0 == which).unwrap().1;
         // The editor shows as many lines as the finished box: its height is theirs.
         let editor_lines = |h: &Harness| {
             let e = h.app.editing.as_ref().unwrap();
@@ -2717,7 +2818,8 @@ mod tests {
         h.app.set_tool(Tool::Select);
         h.app.select(Some(Selection::Ours(boxed.id.clone())));
         h.frame(vec![]);
-        let side = |h: &Harness, i| h.app.handles(&text_of(h)).into_iter().find(|x| x.0 == Handle::TextSide(i)).unwrap().1;
+        let side =
+            |h: &Harness, i| h.app.handles(&text_of(h)).into_iter().find(|x| x.0 == Handle::TextSide(i)).unwrap().1;
         let w0 = width_of(&boxed).unwrap();
         let r = side(&h, 1);
         h.drag(&[r, r - vec2(20.0, 0.0), r - vec2(40.0, 0.0)]);
@@ -2765,7 +2867,11 @@ mod tests {
             .objects
             .values()
             .filter_map(|o| o.as_stream().ok())
-            .map(|st| String::from_utf8_lossy(&st.decompressed_content().unwrap_or_else(|_| st.content.clone())).matches(" Tj").count())
+            .map(|st| {
+                String::from_utf8_lossy(&st.decompressed_content().unwrap_or_else(|_| st.content.clone()))
+                    .matches(" Tj")
+                    .count()
+            })
             .max()
             .unwrap();
         assert_eq!(shows, wider, "one text line per shown line");
@@ -3053,7 +3159,10 @@ mod tests {
         h.key(Key::ArrowDown, Modifiers::SHIFT);
         let Kind::Shape { a: moved, .. } = get(&h, &rect).kind else { panic!() };
         let Kind::Shape { a: orig, .. } = start.kind else { panic!() };
-        assert!((moved.x - orig.x - 3.0).abs() < 1e-3 && (moved.y - orig.y + 10.0).abs() < 1e-3, "{orig:?} -> {moved:?}");
+        assert!(
+            (moved.x - orig.x - 3.0).abs() < 1e-3 && (moved.y - orig.y + 10.0).abs() < 1e-3,
+            "{orig:?} -> {moved:?}"
+        );
         h.key(Key::Z, Modifiers::COMMAND);
         assert_eq!(get(&h, &rect), start);
 
@@ -3065,9 +3174,12 @@ mod tests {
         assert!(h.app.save(&ctx, false));
         assert_eq!(get(&h, &rect), rotated);
         let d = lopdf::Document::load(&path).unwrap();
-        assert!(d.objects.values().filter_map(|o| o.as_dict().ok()).any(|d| {
-            d.get(b"Subtype").and_then(|s| s.as_name()).ok() == Some(b"Polygon")
-        }));
+        assert!(
+            d.objects
+                .values()
+                .filter_map(|o| o.as_dict().ok())
+                .any(|d| { d.get(b"Subtype").and_then(|s| s.as_name()).ok() == Some(b"Polygon") })
+        );
         assert!(h.doc().can_undo(), "history kept after saving");
         h.key(Key::Z, Modifiers::COMMAND);
         assert_eq!(get(&h, &rect).angle, start.angle);
@@ -3185,7 +3297,8 @@ mod tests {
 
         // Holding the down arrow scrolls; releasing stops.
         let hold = |h: &mut Harness, key: Key, frames: usize| {
-            let ev = |pressed| Event::Key { key, physical_key: None, pressed, repeat: false, modifiers: Modifiers::NONE };
+            let ev =
+                |pressed| Event::Key { key, physical_key: None, pressed, repeat: false, modifiers: Modifiers::NONE };
             h.frame(vec![ev(true)]);
             for _ in 0..frames {
                 h.frame(vec![]);
@@ -3267,7 +3380,8 @@ mod tests {
         h.app.set_tool(Tool::Shape(ShapeKind::Rect));
         h.drag(&[h.at(540.0, 100.0), h.at(560.0, 110.0), h.at(580.0, 120.0)]);
         h.app.set_tool(Tool::Select);
-        let entry = |h: &Harness, title: &str| h.app.annotation_entries().into_iter().find(|e| e.title == title).unwrap();
+        let entry =
+            |h: &Harness, title: &str| h.app.annotation_entries().into_iter().find(|e| e.title == title).unwrap();
 
         // Editing the text box, then picking the rectangle in the list: the edit is
         // finished, and typing no longer goes into the text box.
@@ -3430,7 +3544,10 @@ mod tests {
         let mut h = Harness { ctx, app, t: 0.0, mods: Modifiers::NONE, size: vec2(1000.0, 1500.0) };
         h.wait_until("pages", |a| a.doc.as_ref().is_some_and(|d| !d.pages.is_empty()));
         h.frame(vec![]);
-        let reloaded = |a: &App| a.sent_generation == a.doc.as_ref().unwrap().generation && a.doc.as_ref().unwrap().links.len() == a.doc.as_ref().unwrap().pages.len();
+        let reloaded = |a: &App| {
+            a.sent_generation == a.doc.as_ref().unwrap().generation
+                && a.doc.as_ref().unwrap().links.len() == a.doc.as_ref().unwrap().pages.len()
+        };
         let ctx = h.ctx.clone();
         // Before: "Chapter" is page 3, and page 1's link goes to page 3.
         assert_eq!(h.doc().outline[1].target, Some(Target::Page { page: 2, x: None, y: Some(792.0) }));
@@ -3439,14 +3556,19 @@ mod tests {
         h.app.move_pages(&ctx, 2, 0);
         h.wait_until("reload", reloaded);
         h.frame(vec![]);
-        h.wait_until("outline from the new order", |a| a.doc.as_ref().unwrap().outline.get(1).and_then(|o| o.target.clone()) == Some(Target::Page { page: 0, x: None, y: Some(792.0) }));
+        h.wait_until("outline from the new order", |a| {
+            a.doc.as_ref().unwrap().outline.get(1).and_then(|o| o.target.clone())
+                == Some(Target::Page { page: 0, x: None, y: Some(792.0) })
+        });
         assert_eq!(h.doc().links[1].len(), 1, "the link page is now second");
         assert_eq!(h.doc().links[1][0].target, Target::Page { page: 0, x: None, y: Some(400.0) });
         assert_eq!(h.app.pages_ui.selected, BTreeSet::from([0]), "the moved page stays selected");
 
         // Rotate it: the view shows it turned.
         h.app.rotate_pages(&ctx, true);
-        h.wait_until("rotated", |a| a.doc.as_ref().unwrap().pages[0].rotation == 90 && a.sent_generation == a.doc.as_ref().unwrap().generation);
+        h.wait_until("rotated", |a| {
+            a.doc.as_ref().unwrap().pages[0].rotation == 90 && a.sent_generation == a.doc.as_ref().unwrap().generation
+        });
         h.wait_until("pdfium agrees", |a| a.doc.as_ref().unwrap().pages[0].display_size().0 > 700.0);
 
         // Thumbnails render in the Pages tab.
@@ -3513,7 +3635,10 @@ mod tests {
         let got = lopdf::Document::load(&out).unwrap();
         let page = *got.get_pages().values().next().unwrap();
         // reading_pdf's pages differ only by page 1's link.
-        assert!(got.get_dictionary(page).unwrap().get(b"Annots").is_ok(), "page 1 (with its link), not the page now first");
+        assert!(
+            got.get_dictionary(page).unwrap().get(b"Annots").is_ok(),
+            "page 1 (with its link), not the page now first"
+        );
         assert_ne!(objs(&h), original, "the reorder happened");
 
         // Editing a text box, then clicking a thumbnail: the edit is finished first.
@@ -3525,10 +3650,15 @@ mod tests {
         h.app.go_to_page(3);
         assert!(h.app.editing.is_none(), "finished before going to the page");
         h.frame(vec![Event::Text(" more".into())]);
-        let texts: Vec<String> = h.doc().annots.iter().filter_map(|a| match &a.kind {
-            Kind::Text { text, .. } => Some(text.clone()),
-            _ => None,
-        }).collect();
+        let texts: Vec<String> = h
+            .doc()
+            .annots
+            .iter()
+            .filter_map(|a| match &a.kind {
+                Kind::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
         assert_eq!(texts, ["Draft"]);
     }
 
@@ -3558,7 +3688,9 @@ mod tests {
         // The smallest window Ochre allows.
         let mut h = Harness { ctx, app, t: 0.0, mods: Modifiers::NONE, size: vec2(480.0, 360.0) };
         h.wait_until("pages", |a| a.doc.as_ref().is_some_and(|d| !d.pages.is_empty()));
-        for tool in [Tool::Select, Tool::Highlighter, Tool::Markup(MarkupKind::StrikeOut), Tool::Shape(ShapeKind::Arrow)] {
+        for tool in
+            [Tool::Select, Tool::Highlighter, Tool::Markup(MarkupKind::StrikeOut), Tool::Shape(ShapeKind::Arrow)]
+        {
             h.app.set_tool(tool);
             for _ in 0..3 {
                 h.frame(vec![]);
@@ -3566,7 +3698,11 @@ mod tests {
             let nav: Rect = h.ctx.data(|d| d.get_temp(egui::Id::new(crate::ui::chrome::STATUS_NAV_RECT))).unwrap();
             assert!(nav.right() <= 480.0 + 0.5, "{tool:?}: page controls end at {}", nav.right());
             let tool_end: f32 = h.ctx.data(|d| d.get_temp(egui::Id::new(crate::ui::chrome::STATUS_TOOL_END))).unwrap();
-            assert!(tool_end <= nav.left(), "{tool:?}: tool part ({tool_end}) runs into the page controls ({})", nav.left());
+            assert!(
+                tool_end <= nav.left(),
+                "{tool:?}: tool part ({tool_end}) runs into the page controls ({})",
+                nav.left()
+            );
         }
     }
 
@@ -3744,7 +3880,12 @@ mod tests {
         h.click(h.at(450.0, 150.0));
         assert!(h.app.note_edit.is_none());
         assert_eq!(h.doc().get(&rect.id).unwrap().note, "Check this figure");
-        assert_eq!(h.app.note_at(badge_center(screen_bounds(&h.doc().annots[1], &h.app.view.to_screen(&h.doc().pages[0], 0)))).as_deref(), Some("Check this figure"));
+        assert_eq!(
+            h.app
+                .note_at(badge_center(screen_bounds(&h.doc().annots[1], &h.app.view.to_screen(&h.doc().pages[0], 0))))
+                .as_deref(),
+            Some("Check this figure")
+        );
 
         // Eraser removes our ink but never touches the foreign annotation.
         h.app.set_tool(Tool::Eraser);
@@ -3799,7 +3940,8 @@ mod tests {
         h.frame(vec![]);
         assert!(h.app.view.offset.y.abs() < 1.0);
         // Holding j scrolls down; releasing stops.
-        let press = |key, pressed| Event::Key { key, physical_key: None, pressed, repeat: false, modifiers: Modifiers::NONE };
+        let press =
+            |key, pressed| Event::Key { key, physical_key: None, pressed, repeat: false, modifiers: Modifiers::NONE };
         h.frame(vec![press(Key::J, true)]);
         for _ in 0..10 {
             h.frame(vec![]);
@@ -3894,18 +4036,31 @@ mod tests {
         h.drag(&[h.at(73.0, 685.0), h.at(120.0, 690.0), h.at(200.0, 680.0)]);
         let a = h.doc().annots.last().unwrap().clone();
         assert_eq!(h.doc().annots.len(), n + 1);
-        let Kind::Markup { markup: MarkupKind::Highlight, quads } = &a.kind else { panic!("expected text highlight, got {:?}", a.kind) };
+        let Kind::Markup { markup: MarkupKind::Highlight, quads } = &a.kind else {
+            panic!("expected text highlight, got {:?}", a.kind)
+        };
         assert_eq!(quads.len(), 1, "one straight line");
         assert_eq!((a.style.color, a.style.opacity), (hl_style.color, hl_style.opacity));
         h.drag(&[h.at(100.0, 600.0), h.at(150.0, 620.0), h.at(200.0, 600.0)]);
-        assert!(matches!(h.doc().annots.last().unwrap().kind, Kind::Ink { highlighter: true, .. }), "freehand off text");
+        assert!(
+            matches!(h.doc().annots.last().unwrap().kind, Kind::Ink { highlighter: true, .. }),
+            "freehand off text"
+        );
         let alt = Modifiers { alt: true, ..Modifiers::NONE };
         let start = h.at(73.0, 685.0);
         h.frame(vec![Event::PointerMoved(start)]);
-        h.frame(vec![Event::PointerButton { pos: start, button: PointerButton::Primary, pressed: true, modifiers: alt }]);
+        h.frame(vec![Event::PointerButton {
+            pos: start,
+            button: PointerButton::Primary,
+            pressed: true,
+            modifiers: alt,
+        }]);
         h.frame(vec![Event::PointerMoved(h.at(150.0, 700.0))]);
         h.button(h.at(150.0, 700.0), false);
-        assert!(matches!(h.doc().annots.last().unwrap().kind, Kind::Ink { highlighter: true, .. }), "Alt forces freehand");
+        assert!(
+            matches!(h.doc().annots.last().unwrap().kind, Kind::Ink { highlighter: true, .. }),
+            "Alt forces freehand"
+        );
 
         // Tick: a single click places a standard-size, upright mark.
         h.app.set_tool(Tool::Shape(ShapeKind::Check));
@@ -3942,4 +4097,3 @@ mod tests {
         h.frame(vec![]);
     }
 }
-

@@ -50,7 +50,10 @@ mod tests {
     fn the_readmes_dark_wordmark_matches_the_wordmark() {
         let dark = include_str!("../../packaging/ochre-wordmark-dark.svg");
         let expected = String::from_utf8_lossy(WORDMARK_SVG).replace(INK, CREAM);
-        assert!(dark == expected, "regenerate packaging/ochre-wordmark-dark.svg from ochre-wordmark.svg ({INK} -> {CREAM})");
+        assert!(
+            dark == expected,
+            "regenerate packaging/ochre-wordmark-dark.svg from ochre-wordmark.svg ({INK} -> {CREAM})"
+        );
     }
 
     #[test]

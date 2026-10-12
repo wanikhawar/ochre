@@ -2,8 +2,7 @@
 //! pills, status toast and the welcome screen.
 
 use eframe::egui::{
-    self, Align, Align2, Color32, FontId, Id, Layout, Pos2, Rect, Response, RichText, Sense, Stroke,
-    Vec2, pos2, vec2,
+    self, Align, Align2, Color32, FontId, Id, Layout, Pos2, Rect, Response, RichText, Sense, Stroke, Vec2, pos2, vec2,
 };
 use egui::{KeyboardShortcut, Modifiers, Popup, PopupCloseBehavior, SetOpenCommand};
 use egui_phosphor::regular as ph;
@@ -118,7 +117,8 @@ impl App {
                     if icon_button(ui, ph::FLOPPY_DISK, "Save (Ctrl+S)", dirty, false, 28.0).clicked() {
                         self.save(&ctx, false);
                     }
-                    if icon_button(ui, ph::FILE_ARROW_DOWN, "Save as… (Ctrl+Shift+S)", has_doc, false, 28.0).clicked() {
+                    if icon_button(ui, ph::FILE_ARROW_DOWN, "Save as… (Ctrl+Shift+S)", has_doc, false, 28.0).clicked()
+                    {
                         self.save(&ctx, true);
                     }
                     ui.add_space(4.0);
@@ -131,7 +131,16 @@ impl App {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let (can_undo, can_redo) =
                             self.doc.as_ref().map(|d| (d.can_undo(), d.can_redo())).unwrap_or_default();
-                        if icon_button(ui, ph::MAGNIFYING_GLASS, "Search (/ or Ctrl+F)", has_doc, self.search.open, 28.0).clicked() {
+                        if icon_button(
+                            ui,
+                            ph::MAGNIFYING_GLASS,
+                            "Search (/ or Ctrl+F)",
+                            has_doc,
+                            self.search.open,
+                            28.0,
+                        )
+                        .clicked()
+                        {
                             if self.search.open {
                                 self.close_search();
                             } else {
@@ -140,7 +149,8 @@ impl App {
                         }
                         ui.add_space(4.0);
                         ui.separator();
-                        if icon_button(ui, ph::ARROW_U_UP_RIGHT, "Redo (Ctrl+Shift+Z)", can_redo, false, 28.0).clicked() {
+                        if icon_button(ui, ph::ARROW_U_UP_RIGHT, "Redo (Ctrl+Shift+Z)", can_redo, false, 28.0).clicked()
+                        {
                             self.redo();
                         }
                         if icon_button(ui, ph::ARROW_U_UP_LEFT, "Undo (Ctrl+Z)", can_undo, false, 28.0).clicked() {
@@ -180,7 +190,14 @@ impl App {
         let total: f32 = wanted.iter().sum();
         let fit = if total > strip.width() { (strip.width() / total).max(0.0) } else { 1.0 };
         let widths: Vec<f32> = wanted.iter().map(|w| (w * fit).max(120.0f32.min(*w))).collect();
-        let lefts: Vec<f32> = widths.iter().scan(0.0, |x, w| { let l = *x; *x += w; Some(l) }).collect();
+        let lefts: Vec<f32> = widths
+            .iter()
+            .scan(0.0, |x, w| {
+                let l = *x;
+                *x += w;
+                Some(l)
+            })
+            .collect();
         let overflow = (widths.iter().sum::<f32>() - strip.width()).max(0.0);
         if self.reveal_tab {
             // Bring the active tab into view.
@@ -246,7 +263,8 @@ impl App {
             }
 
             let text_color = if active { p.text } else { p.weak };
-            let clip = Rect::from_min_max(pos2(rect.left() + 12.0, rect.top()), pos2(close_rect.left() - 2.0, rect.bottom()));
+            let clip =
+                Rect::from_min_max(pos2(rect.left() + 12.0, rect.top()), pos2(close_rect.left() - 2.0, rect.bottom()));
             let mut job = egui::text::LayoutJob::simple_singleline(name, FontId::proportional(13.0), text_color);
             job.wrap = egui::text::TextWrapping::truncate_at_width(clip.width());
             let galley = painter.layout_job(job);
@@ -270,14 +288,17 @@ impl App {
             }
         }
         // Fade the edges when tabs are scrolled out of view.
-        for (edge, shown) in [(strip.left(), self.tab_scroll > 0.5), (strip.right(), self.tab_scroll < overflow - 0.5)] {
+        for (edge, shown) in [(strip.left(), self.tab_scroll > 0.5), (strip.right(), self.tab_scroll < overflow - 0.5)]
+        {
             if shown && overflow > 0.0 {
                 let dir = if edge == strip.left() { 1.0 } else { -1.0 };
                 let fade = Rect::from_two_pos(pos2(edge, strip.top()), pos2(edge + dir * 16.0, strip.bottom()));
                 let mut mesh = egui::Mesh::default();
                 let (solid, clear) = (p.bar, p.bar.gamma_multiply(0.0));
                 let (l, r) = if dir > 0.0 { (solid, clear) } else { (clear, solid) };
-                for (pos, color) in [(fade.left_top(), l), (fade.right_top(), r), (fade.right_bottom(), r), (fade.left_bottom(), l)] {
+                for (pos, color) in
+                    [(fade.left_top(), l), (fade.right_top(), r), (fade.right_bottom(), r), (fade.left_bottom(), l)]
+                {
                     mesh.colored_vertex(pos, color);
                 }
                 mesh.add_triangle(0, 1, 2);
@@ -317,7 +338,13 @@ impl App {
             let clip = Rect::from_min_max(pos2(text_x, rect.top()), rect.right_bottom() - vec2(8.0, 0.0));
             let painter = painter.with_clip_rect(clip);
             painter.text(pos2(text_x, rect.top() + 7.0), Align2::LEFT_TOP, name, FontId::proportional(13.5), p.text);
-            painter.text(pos2(text_x, rect.bottom() - 6.0), Align2::LEFT_BOTTOM, dir, FontId::proportional(11.0), p.weak);
+            painter.text(
+                pos2(text_x, rect.bottom() - 6.0),
+                Align2::LEFT_BOTTOM,
+                dir,
+                FontId::proportional(11.0),
+                p.weak,
+            );
             if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                 self.request_open(Some(path));
                 if menu {
@@ -426,14 +453,26 @@ impl App {
                     // Names when they fit next to the close button, else icons.
                     let names_width: f32 = tabs
                         .iter()
-                        .map(|(_, _, l)| ui.fonts_mut(|f| f.layout_no_wrap(l.to_string(), FontId::proportional(14.0), p.text).size().x) + 18.0)
+                        .map(|(_, _, l)| {
+                            ui.fonts_mut(|f| {
+                                f.layout_no_wrap(l.to_string(), FontId::proportional(14.0), p.text).size().x
+                            }) + 18.0
+                        })
                         .sum();
                     let with_names = names_width + 30.0 <= ui.available_width();
                     for (tab, icon, label) in tabs {
                         let on = self.cfg.sidebar_tab == tab;
-                        let text = RichText::new(if with_names { label } else { icon }).color(if on { p.text } else { p.weak });
+                        let text = RichText::new(if with_names { label } else { icon }).color(if on {
+                            p.text
+                        } else {
+                            p.weak
+                        });
                         let text = if on { text.strong() } else { text };
-                        let resp = ui.add(egui::Button::new(text).fill(if on { p.hover } else { Color32::TRANSPARENT }).corner_radius(5));
+                        let resp = ui.add(
+                            egui::Button::new(text)
+                                .fill(if on { p.hover } else { Color32::TRANSPARENT })
+                                .corner_radius(5),
+                        );
                         let resp = if with_names { resp } else { resp.on_hover_text(label) };
                         if resp.clicked() {
                             self.cfg.sidebar_tab = tab;
@@ -487,9 +526,8 @@ impl App {
                 }
                 let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::click());
                 // A collapsed entry stands in for the current entry hidden inside it.
-                let contains_current = current.is_some_and(|c| {
-                    c > i && items[i + 1..=c].iter().all(|n| n.level > item.level)
-                });
+                let contains_current =
+                    current.is_some_and(|c| c > i && items[i + 1..=c].iter().all(|n| n.level > item.level));
                 let active = current == Some(i) || (has_children && !open && contains_current);
                 let bg = if active {
                     p.accent_tint
@@ -517,9 +555,16 @@ impl App {
                 };
                 let painter = ui.painter();
                 let page_w = painter
-                    .text(rect.right_center() - vec2(6.0, 0.0), Align2::RIGHT_CENTER, &page, FontId::proportional(11.5), p.weak)
+                    .text(
+                        rect.right_center() - vec2(6.0, 0.0),
+                        Align2::RIGHT_CENTER,
+                        &page,
+                        FontId::proportional(11.5),
+                        p.weak,
+                    )
                     .width();
-                let title_clip = Rect::from_min_max(pos2(text_x, rect.top()), pos2(rect.right() - page_w - 12.0, rect.bottom()));
+                let title_clip =
+                    Rect::from_min_max(pos2(text_x, rect.top()), pos2(rect.right() - page_w - 12.0, rect.bottom()));
                 let color = if active && ui.visuals().dark_mode { Color32::WHITE } else { p.text };
                 let galley = painter.layout_no_wrap(item.title.clone(), FontId::proportional(13.0), color);
                 let truncated = galley.size().x > title_clip.width();
@@ -575,7 +620,17 @@ impl App {
         for page in need_text {
             self.request_text(page);
         }
-        ui.label(weak(ui, format!("{} on {} pages", entries.len(), entries.iter().map(|e| e.page).collect::<std::collections::BTreeSet<_>>().len())).small());
+        ui.label(
+            weak(
+                ui,
+                format!(
+                    "{} on {} pages",
+                    entries.len(),
+                    entries.iter().map(|e| e.page).collect::<std::collections::BTreeSet<_>>().len()
+                ),
+            )
+            .small(),
+        );
         ui.add_space(2.0);
         let mut picked = None;
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
@@ -697,7 +752,8 @@ impl App {
             let mut rows = Vec::with_capacity(n);
             for (i, &(w, h)) in sizes.iter().enumerate() {
                 let height = width * h / w.max(1.0);
-                let (row, resp) = ui.allocate_exact_size(vec2(ui.available_width(), height + 26.0), Sense::click_and_drag());
+                let (row, resp) =
+                    ui.allocate_exact_size(vec2(ui.available_width(), height + 26.0), Sense::click_and_drag());
                 rows.push(row);
                 let is_selected = self.pages_ui.selected.contains(&i);
                 let current = self.view.current_page == i;
@@ -709,7 +765,8 @@ impl App {
                     } else if resp.hovered() {
                         painter.rect_filled(row, 6.0, p.hover);
                     }
-                    let img = Rect::from_min_size(pos2(row.center().x - width / 2.0, row.top() + 5.0), vec2(width, height));
+                    let img =
+                        Rect::from_min_size(pos2(row.center().x - width / 2.0, row.top() + 5.0), vec2(width, height));
                     painter.rect_filled(img, 0.0, Color32::WHITE);
                     if let Some(t) = self.pages_ui.thumbs.get(&i) {
                         let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
@@ -719,7 +776,11 @@ impl App {
                     painter.rect_stroke(img, 0.0, border, egui::StrokeKind::Outside);
                     let label = RichText::new(format!("{}", i + 1)).size(12.0);
                     let label = if current { label.color(ACCENT).strong() } else { label.color(p.weak) };
-                    let g = painter.layout_no_wrap(label.text().to_owned(), FontId::proportional(12.0), if current { ACCENT } else { p.weak });
+                    let g = painter.layout_no_wrap(
+                        label.text().to_owned(),
+                        FontId::proportional(12.0),
+                        if current { ACCENT } else { p.weak },
+                    );
                     painter.galley(pos2(row.center().x - g.size().x / 2.0, img.bottom() + 4.0), g, p.weak);
                 }
                 if resp.clicked() && self.click_page(i, ui.input(|i| i.modifiers)) {
@@ -744,7 +805,13 @@ impl App {
                     ui.painter().hline(x, y, Stroke::new(3.0, ACCENT));
                     // Scroll when dragging near the top or bottom edge.
                     let clip = ui.clip_rect();
-                    let edge = if at.y < clip.top() + 30.0 { 8.0 } else if at.y > clip.bottom() - 30.0 { -8.0 } else { 0.0 };
+                    let edge = if at.y < clip.top() + 30.0 {
+                        8.0
+                    } else if at.y > clip.bottom() - 30.0 {
+                        -8.0
+                    } else {
+                        0.0
+                    };
                     if edge != 0.0 {
                         ui.scroll_with_delta(vec2(0.0, edge));
                         ctx.request_repaint();
@@ -789,7 +856,9 @@ impl App {
             .filter_map(|(i, item)| match &item.target {
                 Some(Target::Page { page, x, y }) => {
                     let g = doc.pages.get(*page)?;
-                    let top = y.map_or(0.0, |y| g.to_display().apply(crate::annot::model::Pt::new(x.unwrap_or(g.bbox[0]), y)).y);
+                    let top = y.map_or(0.0, |y| {
+                        g.to_display().apply(crate::annot::model::Pt::new(x.unwrap_or(g.bbox[0]), y)).y
+                    });
                     Some((i, (*page, top)))
                 }
                 _ => None,
@@ -800,7 +869,6 @@ impl App {
     }
 
     // ------------------------------------------------------------ status bar
-
 
     /// Bar along the bottom: the active tool (or selection) with its settings on
     /// the left, page and zoom controls on the right. It has its own strip, so it
@@ -859,7 +927,9 @@ impl App {
         if tool.has_color() {
             summary.push(format!("{:.0}%", style.opacity * 100.0));
         }
-        let text_width = |t: &str, size: f32| ui.fonts_mut(|f| f.layout_no_wrap(t.to_owned(), FontId::proportional(size), p.text).size().x);
+        let text_width = |t: &str, size: f32| {
+            ui.fonts_mut(|f| f.layout_no_wrap(t.to_owned(), FontId::proportional(size), p.text).size().x)
+        };
         let name_w = text_width(&name, 14.0) + 26.0;
         let summary_w = text_width(&summary.join(" · "), 12.5) + 58.0;
         let compact_button = 50.0;
@@ -908,9 +978,16 @@ impl App {
     pub fn canvas_overlays(&mut self, ctx: &egui::Context, canvas: Rect) {
         let narrow = canvas.width() < 980.0;
         if self.properties_visible() {
-            self.pill(ctx, "props", canvas, Align2::CENTER_TOP, pos2(canvas.center().x, canvas.top() + 8.0), |app, ui| {
-                app.properties(ui);
-            });
+            self.pill(
+                ctx,
+                "props",
+                canvas,
+                Align2::CENTER_TOP,
+                pos2(canvas.center().x, canvas.top() + 8.0),
+                |app, ui| {
+                    app.properties(ui);
+                },
+            );
         }
         if self.search.open {
             let y = canvas.top() + if narrow && self.properties_visible() { 46.0 } else { 8.0 };
@@ -933,7 +1010,13 @@ impl App {
                     let resp = icon_button(ui, "", label, true, false, 24.0);
                     // Icon drawn in the color it will use.
                     let c = rgb(app.tool_style(Tool::Markup(m)).color);
-                    ui.painter().text(resp.rect.center(), Align2::CENTER_CENTER, tool_icon(Tool::Markup(m)), FontId::proportional(13.0), c);
+                    ui.painter().text(
+                        resp.rect.center(),
+                        Align2::CENTER_CENTER,
+                        tool_icon(Tool::Markup(m)),
+                        FontId::proportional(13.0),
+                        c,
+                    );
                     if resp.clicked() {
                         app.markup_selection(m);
                     }
@@ -1097,7 +1180,13 @@ impl App {
         let c = pos2(rect.left() + 11.0, rect.center().y);
         ui.painter().circle_filled(c, 7.0, rgb(current));
         ui.painter().circle_stroke(c, 7.5, Stroke::new(1.0, p.weak));
-        ui.painter().text(rect.right_center() - vec2(6.0, 0.0), Align2::CENTER_CENTER, ph::CARET_DOWN, FontId::proportional(9.0), p.weak);
+        ui.painter().text(
+            rect.right_center() - vec2(6.0, 0.0),
+            Align2::CENTER_CENTER,
+            ph::CARET_DOWN,
+            FontId::proportional(9.0),
+            p.weak,
+        );
         let resp = resp.on_hover_text("Markup color").on_hover_cursor(egui::CursorIcon::PointingHand);
         Popup::menu(&resp).close_behavior(PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
             ui.set_width(236.0);
@@ -1148,7 +1237,8 @@ impl App {
             ui.add_space(4.0);
             ui.separator();
         }
-        let fillable = group.as_ref().map_or(matches!(tool, Tool::Shape(ShapeKind::Rect | ShapeKind::Ellipse)), |g| g.fillable);
+        let fillable =
+            group.as_ref().map_or(matches!(tool, Tool::Shape(ShapeKind::Rect | ShapeKind::Ellipse)), |g| g.fillable);
         let width_label = group.as_ref().map_or(tool.width_label(), |g| g.width_label);
         let text_size = tool == Tool::Text || group.as_ref().is_some_and(|g| g.text_size);
         if fillable {
@@ -1224,10 +1314,7 @@ impl App {
             self.page_input = cur.to_string();
         }
         let r = ui.add(
-            egui::TextEdit::singleline(&mut self.page_input)
-                .id(id)
-                .desired_width(30.0)
-                .horizontal_align(Align::Center),
+            egui::TextEdit::singleline(&mut self.page_input).id(id).desired_width(30.0).horizontal_align(Align::Center),
         );
         if r.lost_focus()
             && ui.input(|i| i.key_pressed(egui::Key::Enter))

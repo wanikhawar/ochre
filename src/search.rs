@@ -29,7 +29,8 @@ struct PageIndex {
 
 impl PageIndex {
     fn new(chars: &[TextChar]) -> Self {
-        let mut idx = PageIndex { exact: String::new(), lower: String::new(), exact_map: Vec::new(), lower_map: Vec::new() };
+        let mut idx =
+            PageIndex { exact: String::new(), lower: String::new(), exact_map: Vec::new(), lower_map: Vec::new() };
         let mut last_space = true;
         for (i, c) in chars.iter().enumerate() {
             let ch = if c.ch.is_whitespace() || c.ch.is_control() { ' ' } else { c.ch };
@@ -146,7 +147,8 @@ impl App {
 
     pub fn close_search(&mut self) {
         let indexes = std::mem::take(&mut self.search.indexes);
-        self.search = crate::search::Search { indexes, query: std::mem::take(&mut self.search.query), ..Default::default() };
+        self.search =
+            crate::search::Search { indexes, query: std::mem::take(&mut self.search.query), ..Default::default() };
     }
 
     /// Indexes newly extracted pages and scans the ones not yet searched for this query.

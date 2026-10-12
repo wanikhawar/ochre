@@ -1,9 +1,7 @@
 //! Compact color picker: palette swatches, a saturation/value square, a hue
 //! bar and a hex field.
 
-use eframe::egui::{
-    self, Color32, Id, Mesh, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2, ecolor::Hsva, pos2, vec2,
-};
+use eframe::egui::{self, Color32, Id, Mesh, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2, ecolor::Hsva, pos2, vec2};
 
 use super::theme::{self, ACCENT};
 use crate::app::rgb;
@@ -35,7 +33,12 @@ fn swatch(ui: &mut egui::Ui, c: [f32; 3], selected: bool) -> egui::Response {
 
 /// Palette grid. Custom colors can be removed with a right-click; the last
 /// cell saves the current color. Returns true if `color` changed.
-pub fn palette(ui: &mut egui::Ui, color: &mut [f32; 3], builtin: &[[f32; 3]], custom: &mut Vec<[f32; 3]>) -> (bool, bool) {
+pub fn palette(
+    ui: &mut egui::Ui,
+    color: &mut [f32; 3],
+    builtin: &[[f32; 3]],
+    custom: &mut Vec<[f32; 3]>,
+) -> (bool, bool) {
     let mut changed = false;
     let mut custom_changed = false;
     let cols = 7;
@@ -241,7 +244,10 @@ pub fn fill_presets(ui: &mut egui::Ui, fill: &mut Option<[f32; 3]>, outline: [f3
                         }
                         painter.circle_stroke(r.center(), 8.5, Stroke::new(1.0, p.weak));
                         let d = vec2(6.0, -6.0);
-                        painter.line_segment([r.center() - d, r.center() + d], Stroke::new(1.5, Color32::from_rgb(0xDC, 0x3C, 0x3C)));
+                        painter.line_segment(
+                            [r.center() - d, r.center() + d],
+                            Stroke::new(1.5, Color32::from_rgb(0xDC, 0x3C, 0x3C)),
+                        );
                         resp.on_hover_cursor(egui::CursorIcon::PointingHand)
                     }
                 };

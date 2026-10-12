@@ -13,6 +13,7 @@ use crate::annot::model::{MarkupKind, ShapeKind};
 use crate::app::{App, PALETTE, Selection, Tool, rgb};
 use crate::config::SidebarTab;
 use crate::doc::Doc;
+use crate::look::PageLook;
 use crate::pdf::worker::Target;
 use crate::viewer::{Fit, Gesture};
 
@@ -767,7 +768,7 @@ impl App {
                     }
                     let img =
                         Rect::from_min_size(pos2(row.center().x - width / 2.0, row.top() + 5.0), vec2(width, height));
-                    painter.rect_filled(img, 0.0, Color32::WHITE);
+                    painter.rect_filled(img, 0.0, self.cfg.page_look.paper());
                     if let Some(t) = self.pages_ui.thumbs.get(&i) {
                         let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
                         painter.image(t.tex.id(), img, uv, Color32::WHITE);
@@ -1344,6 +1345,44 @@ impl App {
         if icon_button(ui, ph::CORNERS_OUT, "Fit page", true, fit == Some(Fit::Page), 22.0).clicked() {
             self.view.fit = Some(Fit::Page);
         }
+        ui.separator();
+        self.page_look_button(ui);
+    }
+
+    /// The page colors button, with a menu of Normal, Sepia and Dark.
+    fn page_look_button(&mut self, ui: &mut egui::Ui) {
+        let p = theme::current(ui.ctx());
+        let look = self.cfg.page_look;
+        let tip = format!("Page colors: {} (Ctrl+I)", look.label());
+        let resp = icon_button(ui, ph::CIRCLE_HALF_TILT, &tip, true, look != PageLook::Normal, 22.0);
+        Popup::menu(&resp).align(egui::RectAlign::TOP_END).gap(6.0).show(|ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            for l in PageLook::ALL {
+                let (row, r) = ui.allocate_exact_size(vec2(150.0, 30.0), Sense::click());
+                let painter = ui.painter();
+                if l == look {
+                    painter.rect_filled(row, 6.0, p.accent_tint);
+                } else if r.hovered() {
+                    painter.rect_filled(row, 6.0, p.hover);
+                }
+                // A little page in these colors, with a line of its text.
+                let page = Rect::from_center_size(pos2(row.left() + 18.0, row.center().y), vec2(16.0, 20.0));
+                painter.rect_filled(page, 2.0, l.paper());
+                painter.rect_stroke(page, 2.0, Stroke::new(1.0, p.weak), egui::StrokeKind::Outside);
+                painter.text(page.center(), Align2::CENTER_CENTER, "A", FontId::proportional(11.0), l.ink());
+                let color = if l == look { ACCENT } else { p.text };
+                painter.text(
+                    pos2(page.right() + 10.0, row.center().y),
+                    Align2::LEFT_CENTER,
+                    l.label(),
+                    FontId::proportional(14.0),
+                    color,
+                );
+                if r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    self.set_page_look(l);
+                }
+            }
+        });
     }
 
     /// Transient status message, plus a persistent notice for read-only files.

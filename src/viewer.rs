@@ -14,6 +14,7 @@ use crate::annot::raster;
 use crate::annot::smoothing::{LazyBrush, catmull_rom, finish_stroke};
 use crate::app::{App, Selection, Tool};
 use crate::doc::Cmd;
+use crate::look::PageLook;
 use crate::pdf::worker::{Target, TextChar};
 
 const MARGIN: f32 = 24.0;
@@ -29,6 +30,7 @@ pub struct PageTex {
     pub tex: egui::TextureHandle,
     pub scale: f32,
     pub generation: u64,
+    pub look: PageLook,
 }
 
 pub struct Overlay {
@@ -36,6 +38,7 @@ pub struct Overlay {
     scale: f32,
     rev: u64,
     exclude: Vec<String>,
+    look: PageLook,
 }
 
 pub struct TextEditState {
@@ -1034,16 +1037,17 @@ impl App {
             _ => Vec::new(),
         };
 
+        let look = self.cfg.page_look;
         for &i in &visible {
             let rect = self.view.page_rects[i];
             painter.add(page_shadow.as_shape(rect, 0));
-            painter.rect_filled(rect, 0.0, Color32::WHITE);
+            painter.rect_filled(rect, 0.0, look.paper());
             let want = render_scale(&pages[i], self.view.zoom, ppp, max_side);
             let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
             let need = match self.tex.get(&i) {
                 Some(t) => {
                     painter.image(t.tex.id(), rect, uv, Color32::WHITE);
-                    t.generation != generation || ((t.scale - want).abs() > 0.005 && settled)
+                    t.generation != generation || t.look != look || ((t.scale - want).abs() > 0.005 && settled)
                 }
                 None => true,
             };
@@ -1092,10 +1096,10 @@ impl App {
             return;
         }
         let rev = doc.page_rev.get(page).copied().unwrap_or(0);
-        let fresh = self
-            .overlay
-            .get(&page)
-            .is_some_and(|o| o.rev == rev && o.exclude == exclude && ((o.scale - want).abs() < 0.005 || !settled));
+        let look = self.cfg.page_look;
+        let fresh = self.overlay.get(&page).is_some_and(|o| {
+            o.rev == rev && o.exclude == exclude && o.look == look && ((o.scale - want).abs() < 0.005 || !settled)
+        });
         if !fresh {
             let g = &doc.pages[page];
             let (w, h) = g.display_size();
@@ -1103,7 +1107,7 @@ impl App {
             if let Some(mut pm) = tiny_skia::Pixmap::new(pw.max(1), ph.max(1)) {
                 let t = g.to_display().then_scale_translate(want, 0.0, 0.0).to_skia();
                 for a in &annots {
-                    raster::draw(&mut pm.as_mut(), a, t);
+                    raster::draw(&mut pm.as_mut(), &look.map_annot(a), t);
                 }
                 let image = egui::ColorImage::from_rgba_premultiplied([pw as usize, ph as usize], pm.data());
                 let opts = egui::TextureOptions::LINEAR;
@@ -1113,10 +1117,11 @@ impl App {
                         o.scale = want;
                         o.rev = rev;
                         o.exclude = exclude.to_vec();
+                        o.look = look;
                     }
                     None => {
                         let tex = ctx.load_texture(format!("overlay{page}"), image, opts);
-                        self.overlay.insert(page, Overlay { tex, scale: want, rev, exclude: exclude.to_vec() });
+                        self.overlay.insert(page, Overlay { tex, scale: want, rev, exclude: exclude.to_vec(), look });
                     }
                 }
             }
@@ -1139,7 +1144,8 @@ impl App {
             }
             let a = self.edited(&a.id).unwrap_or(a);
             if let Kind::Text { origin, right, down, text, width, .. } = &a.kind {
-                draw_text(painter, &aff, self.view.zoom, *origin, *right, *down, text, *width, &a.style);
+                let style = self.cfg.page_look.map_style(&a.style);
+                draw_text(painter, &aff, self.view.zoom, *origin, *right, *down, text, *width, &style);
             }
         }
     }
@@ -1493,7 +1499,7 @@ impl App {
                 e: (aff.e - bbox.min.x) * ppp,
                 f: (aff.f - bbox.min.y) * ppp,
             };
-            raster::draw(&mut pm.as_mut(), a, t.to_skia());
+            raster::draw(&mut pm.as_mut(), &self.cfg.page_look.map_annot(a), t.to_skia());
         }
         let image = egui::ColorImage::from_rgba_premultiplied([pw as usize, ph as usize], pm.data());
         let opts = egui::TextureOptions::LINEAR;
@@ -2328,7 +2334,7 @@ impl App {
             }
         };
         let font = FontId::new(size * zoom, egui::FontFamily::Name("annot".into()));
-        let (col, wrap) = (color(&e.style), e.width);
+        let (col, wrap) = (color(&self.cfg.page_look.map_style(&e.style)), e.width);
         // Laid out exactly as it's drawn once done (and saved).
         let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, _wrap_width: f32| {
             text_galley(ui.painter(), buf.as_str(), &font, col, size, zoom, wrap)
@@ -4095,5 +4101,47 @@ mod tests {
         assert_eq!(reopened.foreign.len(), 1);
         h.wait_until("reload after save", |a| a.sent_generation == a.doc.as_ref().unwrap().generation);
         h.frame(vec![]);
+    }
+
+    #[test]
+    fn page_colors_rerender_pages_and_leave_the_file_alone() {
+        use crate::config::SidebarTab;
+        let dir = std::env::temp_dir().join(format!("ochre-look-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("look.pdf");
+        text_pdf(&path);
+        let ctx = egui::Context::default();
+        let app = App::new(&ctx, Some(path.clone()));
+        if app.worker.is_none() {
+            eprintln!("pdfium not available, skipping: {:?}", app.worker_error);
+            return;
+        }
+        let mut h = Harness { ctx, app, t: 0.0, mods: Modifiers::NONE, size: vec2(1000.0, 1500.0) };
+        h.wait_until("pages", |a| a.doc.as_ref().is_some_and(|d| !d.pages.is_empty()));
+        h.wait_until("page rendered", |a| a.tex.get(&0).is_some_and(|t| t.look == PageLook::Normal));
+        h.app.set_tool(Tool::Pen);
+        h.drag(&[h.at(100.0, 500.0), h.at(150.0, 520.0), h.at(200.0, 500.0)]);
+        let ink = h.doc().annots[0].style;
+        h.app.cfg.show_outline = true;
+        h.app.cfg.sidebar_tab = SidebarTab::Pages;
+        h.wait_until("thumbnail", |a| a.pages_ui.thumbs.get(&0).is_some_and(|t| t.key.2 == PageLook::Normal));
+
+        // Ctrl+I cycles Normal -> Sepia -> Dark; the page, its annotations and the
+        // thumbnail follow.
+        for look in [PageLook::Sepia, PageLook::Dark] {
+            h.key(Key::I, Modifiers::COMMAND);
+            assert_eq!(h.app.cfg.page_look, look);
+            h.wait_until("page in the new colors", |a| a.tex.get(&0).is_some_and(|t| t.look == look));
+            h.wait_until("overlay in the new colors", |a| a.overlay.get(&0).is_some_and(|o| o.look == look));
+            h.wait_until("thumbnail in the new colors", |a| a.pages_ui.thumbs.get(&0).is_some_and(|t| t.key.2 == look));
+        }
+
+        // Only the display changes: the annotation keeps its color, also when saved.
+        assert_eq!(h.doc().annots[0].style, ink);
+        let ctx = h.ctx.clone();
+        assert!(h.app.save(&ctx, false));
+        assert_eq!(Doc::open(&path).unwrap().annots[0].style.color, ink.color);
+        h.key(Key::I, Modifiers::COMMAND);
+        assert_eq!(h.app.cfg.page_look, PageLook::Normal);
     }
 }

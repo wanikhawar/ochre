@@ -1114,7 +1114,13 @@ mod tests {
             let wait = || w.rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
             w.send(Req::Load { generation: doc.generation, bytes: doc.render_bytes(), hide: doc.hidden() });
             let Resp::Loaded { .. } = wait() else { panic!("load failed") };
-            w.send(Req::Render { generation: doc.generation, page: 0, scale: 1.0, thumb: false });
+            w.send(Req::Render {
+                generation: doc.generation,
+                page: 0,
+                scale: 1.0,
+                thumb: false,
+                look: crate::look::PageLook::Normal,
+            });
             let Resp::Rendered { image, .. } = wait() else { panic!("render failed") };
             let px = image.pixels[(792 - 450) * image.size[0] + 402];
             Some(px.g() > 100 && px.r() < 100)
@@ -1978,7 +1984,13 @@ mod visual {
         worker.send(Req::Load { generation: doc.generation, bytes: doc.bytes.clone(), hide: vec![] });
         let _ = wait(&worker);
         for page in 0..2 {
-            worker.send(Req::Render { generation: doc.generation, page, scale: 1.5, thumb: false });
+            worker.send(Req::Render {
+                generation: doc.generation,
+                page,
+                scale: 1.5,
+                thumb: false,
+                look: crate::look::PageLook::Normal,
+            });
             let Resp::Rendered { image, .. } = wait(&worker) else { panic!() };
             let [w, h] = image.size;
             let mut pm = tiny_skia::Pixmap::new(w as u32, h as u32).unwrap();
@@ -1996,6 +2008,22 @@ mod visual {
                 crate::annot::raster::draw(&mut ov.as_mut(), a, t);
             }
             ov.save_png(out.join(format!("ours-p{}.png", page + 1))).unwrap();
+        }
+
+        // Page 1 in each page look, as the app shows it: pdfium without our
+        // annotations, recolored, with ours drawn on top in mapped colors.
+        worker.send(Req::Load { generation: doc.generation, bytes: doc.bytes.clone(), hide: doc.hidden() });
+        let _ = wait(&worker);
+        for look in crate::look::PageLook::ALL {
+            worker.send(Req::Render { generation: doc.generation, page: 0, scale: 1.5, thumb: false, look });
+            let Resp::Rendered { image, .. } = wait(&worker) else { panic!() };
+            let image = crate::app::with_annotations(image, &doc, 0, look);
+            let [w, h] = image.size;
+            let mut pm = tiny_skia::Pixmap::new(w as u32, h as u32).unwrap();
+            for (dst, src) in pm.pixels_mut().iter_mut().zip(&image.pixels) {
+                *dst = tiny_skia::ColorU8::from_rgba(src.r(), src.g(), src.b(), 255).premultiply();
+            }
+            pm.save_png(out.join(format!("look-{}-p1.png", look.label().to_lowercase()))).unwrap();
         }
     }
 }

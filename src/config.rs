@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::annot::model::Style;
+use crate::look::PageLook;
 use crate::viewer::Fit;
 
 /// Where a file was left: the page at the top of the window and how far down it
@@ -46,6 +47,8 @@ pub struct Config {
     pub sidebar_tab: SidebarTab,
     /// Reading position per file, most recent first.
     pub positions: Vec<ReadPos>,
+    /// Page colors (normal, sepia or dark), for every file.
+    pub page_look: PageLook,
 }
 
 impl Default for Config {
@@ -58,6 +61,7 @@ impl Default for Config {
             show_outline: false,
             sidebar_tab: SidebarTab::Contents,
             positions: Vec::new(),
+            page_look: PageLook::Normal,
         }
     }
 }

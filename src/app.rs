@@ -10,6 +10,7 @@ use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers};
 use crate::annot::model::{Annotation, Kind, MarkupKind, Pt, ShapeKind, Style};
 use crate::config::{Config, ReadPos};
 use crate::doc::{Cmd, Doc};
+use crate::look::PageLook;
 use crate::pdf::worker::{Req, Resp, Target, TextChar, Worker};
 use crate::search::Search;
 use crate::ui::theme;
@@ -159,7 +160,7 @@ pub struct Tab {
     sent_generation: u64,
     view: View,
     tex: HashMap<usize, PageTex>,
-    in_flight: HashMap<usize, (f32, u64)>,
+    in_flight: HashMap<usize, (f32, u64, PageLook)>,
     overlay: HashMap<usize, Overlay>,
     text_chars: HashMap<usize, Vec<TextChar>>,
     text_requested: HashSet<usize>,
@@ -172,15 +173,15 @@ pub struct Tab {
 /// A page thumbnail, and what it was made from.
 pub struct Thumb {
     pub tex: egui::TextureHandle,
-    /// pdfium generation and the page's annotation revision.
-    pub key: (u64, u64),
+    /// pdfium generation, the page's annotation revision, and the page colors.
+    pub key: (u64, u64, PageLook),
 }
 
 /// State of the Pages sidebar tab.
 #[derive(Default)]
 pub struct PagesUi {
     pub thumbs: HashMap<usize, Thumb>,
-    pub in_flight: HashMap<usize, (u64, u64)>,
+    pub in_flight: HashMap<usize, (u64, u64, PageLook)>,
     /// Selected pages, and where a Shift+click range starts.
     pub selected: std::collections::BTreeSet<usize>,
     pub anchor: Option<usize>,
@@ -228,7 +229,7 @@ pub struct App {
     pub last_shape: ShapeKind,
     pub last_markup: MarkupKind,
     pub tex: HashMap<usize, PageTex>,
-    pub in_flight: HashMap<usize, (f32, u64)>,
+    pub in_flight: HashMap<usize, (f32, u64, PageLook)>,
     pub overlay: HashMap<usize, Overlay>,
     pub live_tex: Option<egui::TextureHandle>,
     pub text_chars: HashMap<usize, Vec<TextChar>>,
@@ -1128,13 +1129,13 @@ impl App {
                     self.load_error = Some(message);
                     self.close_active_tab();
                 }
-                Resp::Rendered { generation, page, image, thumb: true, .. } => {
+                Resp::Rendered { generation, page, image, thumb: true, look, .. } => {
                     let key = self.pages_ui.in_flight.remove(&page);
                     if generation != doc.generation || page >= doc.pages.len() {
                         continue;
                     }
-                    let image = with_annotations(image, doc, page);
-                    let key = key.unwrap_or((generation, 0));
+                    let image = with_annotations(image, doc, page, look);
+                    let key = key.unwrap_or((generation, 0, look));
                     let opts = egui::TextureOptions::LINEAR;
                     match self.pages_ui.thumbs.get_mut(&page) {
                         Some(t) => {
@@ -1147,7 +1148,7 @@ impl App {
                         }
                     }
                 }
-                Resp::Rendered { generation, page, scale, image, .. } => {
+                Resp::Rendered { generation, page, scale, image, look, .. } => {
                     self.in_flight.remove(&page);
                     if generation != doc.generation {
                         continue;
@@ -1158,10 +1159,11 @@ impl App {
                             t.tex.set(image, opts);
                             t.scale = scale;
                             t.generation = generation;
+                            t.look = look;
                         }
                         None => {
                             let tex = ctx.load_texture(format!("page{page}"), image, opts);
-                            self.tex.insert(page, PageTex { tex, scale, generation });
+                            self.tex.insert(page, PageTex { tex, scale, generation, look });
                         }
                     }
                 }
@@ -1175,15 +1177,16 @@ impl App {
 
     pub fn request_render(&mut self, page: usize, scale: f32) {
         let (Some(worker), Some(doc)) = (&self.worker, &self.doc) else { return };
-        if self.in_flight.get(&page) == Some(&(scale, doc.generation)) {
+        let look = self.cfg.page_look;
+        if self.in_flight.get(&page) == Some(&(scale, doc.generation, look)) {
             return;
         }
         // One request per page at a time keeps the queue short while zooming.
         if self.in_flight.contains_key(&page) {
             return;
         }
-        worker.send(Req::Render { generation: doc.generation, page, scale, thumb: false });
-        self.in_flight.insert(page, (scale, doc.generation));
+        worker.send(Req::Render { generation: doc.generation, page, scale, thumb: false, look });
+        self.in_flight.insert(page, (scale, doc.generation, look));
     }
 
     // ---------------------------------------------------------------- pages
@@ -1323,14 +1326,15 @@ impl App {
     pub fn request_thumb(&mut self, page: usize) {
         let (Some(worker), Some(doc)) = (&self.worker, &self.doc) else { return };
         let Some(g) = doc.pages.get(page) else { return };
-        let key = (doc.generation, doc.page_rev.get(page).copied().unwrap_or(0));
+        let look = self.cfg.page_look;
+        let key = (doc.generation, doc.page_rev.get(page).copied().unwrap_or(0), look);
         if self.pages_ui.thumbs.get(&page).is_some_and(|t| t.key == key)
             || self.pages_ui.in_flight.get(&page) == Some(&key)
         {
             return;
         }
         let scale = THUMB_WIDTH * self.ctx.pixels_per_point() / g.display_size().0.max(1.0);
-        worker.send(Req::Render { generation: doc.generation, page, scale, thumb: true });
+        worker.send(Req::Render { generation: doc.generation, page, scale, thumb: true, look });
         self.pages_ui.in_flight.insert(page, key);
     }
 
@@ -1367,6 +1371,14 @@ impl App {
             return;
         }
         worker.send(Req::Text { generation: doc.generation, page });
+    }
+
+    /// Switches the page colors; pages and thumbnails re-render in the new ones.
+    pub fn set_page_look(&mut self, look: PageLook) {
+        if self.cfg.page_look != look {
+            self.cfg.page_look = look;
+            self.cfg.save();
+        }
     }
 
     // ---------------------------------------------------------------- input
@@ -1425,6 +1437,11 @@ impl App {
             }
             if pressed(sc(Modifiers::NONE, Key::F9)) && self.doc.is_some() {
                 self.cfg.show_outline = !self.cfg.show_outline;
+            }
+            if pressed(sc(cmd, Key::I)) {
+                let look = self.cfg.page_look.next();
+                self.set_page_look(look);
+                self.set_status(ctx, format!("Page colors: {}", look.label()), false);
             }
             let none = Modifiers::NONE;
             if pressed(sc(none, Key::Delete)) || pressed(sc(none, Key::Backspace)) {
@@ -1642,7 +1659,7 @@ impl App {
 
 /// A page thumbnail with our annotations drawn on it (pdfium leaves them out:
 /// Ochre draws them itself).
-fn with_annotations(image: egui::ColorImage, doc: &Doc, page: usize) -> egui::ColorImage {
+pub(crate) fn with_annotations(image: egui::ColorImage, doc: &Doc, page: usize, look: PageLook) -> egui::ColorImage {
     let [w, h] = image.size;
     let Some(mut pm) = tiny_skia::Pixmap::new(w as u32, h as u32) else { return image };
     for (dst, src) in pm.pixels_mut().iter_mut().zip(&image.pixels) {
@@ -1652,7 +1669,7 @@ fn with_annotations(image: egui::ColorImage, doc: &Doc, page: usize) -> egui::Co
     let scale = w as f32 / g.display_size().0.max(1.0);
     let t = g.to_display().then_scale_translate(scale, 0.0, 0.0).to_skia();
     for a in doc.annots.iter().filter(|a| a.page == page) {
-        crate::annot::raster::draw(&mut pm.as_mut(), a, t);
+        crate::annot::raster::draw(&mut pm.as_mut(), &look.map_annot(a), t);
     }
     egui::ColorImage::from_rgba_premultiplied([w, h], pm.data())
 }

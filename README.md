@@ -39,6 +39,7 @@ A fast, lightweight PDF reader and annotator for Linux, written in Rust (egui + 
 - **Links** inside the document work with the Select and Hand tools. Web and email links open in your browser or mail app. Alt+← or the Back button returns to where you were.
 - **Tabs:** every file opens in its own tab, from the Open dialog, Recent files, drag and drop (several at once), or the command line (`ochre a.pdf b.pdf`). Opening a file that's already open switches to its tab. Each tab keeps its own zoom, position, selection and search.
 - **Remembers your place:** each file reopens at the page and zoom where you left it.
+- **Page colors** for reading comfort, from the status bar or Ctrl+I: **Sepia** (aged paper and dark brown ink, like an old photo) or **Dark** (lightness inverted, hue kept, so colored text and highlights keep their colors). Annotations follow along. It only changes the display: the saved PDF keeps its colors.
 - Zoom (fit width / fit page / Ctrl+wheel), recent files, and light and dark themes that follow the system.
 
 Highlights, notes, ink, a text box and shapes, with the contents in the sidebar:
@@ -139,6 +140,7 @@ Vim-style navigation works whenever you're not typing in a text field.
 | Ctrl+S, Ctrl+Shift+S | Save, save as |
 | Ctrl+O, Ctrl+F | Open, search (keeps the last query) |
 | F9 | Show or hide the contents sidebar |
+| Ctrl+I | Page colors: normal, sepia, dark |
 | Ctrl+Tab / Ctrl+Shift+Tab, Ctrl+PageDown / Ctrl+PageUp | Next / previous tab |
 | Ctrl+W, middle-click a tab | Close the tab |
 | Alt+←, mouse back button | Back (after following a link or a contents entry) |

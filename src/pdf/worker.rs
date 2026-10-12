@@ -10,6 +10,7 @@ use eframe::egui;
 use pdfium_render::prelude::*;
 
 use crate::annot::geometry::PageGeom;
+use crate::look::PageLook;
 
 pub enum Req {
     /// Load `bytes`, removing the given `/Annots` indices per page from the
@@ -25,6 +26,7 @@ pub enum Req {
         page: usize,
         scale: f32,
         thumb: bool,
+        look: PageLook,
     },
     Text {
         generation: u64,
@@ -71,7 +73,7 @@ pub struct Link {
 pub enum Resp {
     Loaded { generation: u64, pages: Vec<PageGeom>, outline: Vec<OutlineItem>, links: Vec<Vec<Link>> },
     Failed { generation: u64, message: String },
-    Rendered { generation: u64, page: usize, scale: f32, image: egui::ColorImage, thumb: bool },
+    Rendered { generation: u64, page: usize, scale: f32, image: egui::ColorImage, thumb: bool, look: PageLook },
     Text { generation: u64, page: usize, chars: Vec<TextChar> },
 }
 
@@ -229,10 +231,10 @@ fn run(pdfium: &Pdfium, rx: Receiver<Job>) {
                 }
                 Err(e) => Resp::Failed { generation, message: e.to_string() },
             },
-            Req::Render { generation, page, scale, thumb } => {
+            Req::Render { generation, page, scale, thumb, look } => {
                 let Some(d) = docs.get(&generation) else { continue };
-                match render(d, page, scale) {
-                    Ok(image) => Resp::Rendered { generation, page, scale, image, thumb },
+                match render(d, page, scale, look) {
+                    Ok(image) => Resp::Rendered { generation, page, scale, image, thumb, look },
                     Err(_) => continue,
                 }
             }
@@ -344,7 +346,7 @@ fn links(doc: &PdfDocument, page: usize) -> Vec<Link> {
         .collect()
 }
 
-fn render(doc: &PdfDocument, page: usize, scale: f32) -> Result<egui::ColorImage> {
+fn render(doc: &PdfDocument, page: usize, scale: f32, look: PageLook) -> Result<egui::ColorImage> {
     let page = doc.pages().get(page as PdfPageIndex)?;
     let cfg = PdfRenderConfig::new()
         .scale_page_by_factor(scale)
@@ -355,7 +357,9 @@ fn render(doc: &PdfDocument, page: usize, scale: f32) -> Result<egui::ColorImage
         .set_path_smoothing(true);
     let bitmap = page.render_with_config(&cfg)?;
     let (w, h) = (bitmap.width() as usize, bitmap.height() as usize);
-    Ok(egui::ColorImage::from_rgba_unmultiplied([w, h], &bitmap.as_rgba_bytes()))
+    let mut px = bitmap.as_rgba_bytes();
+    look.map_rgba(&mut px);
+    Ok(egui::ColorImage::from_rgba_unmultiplied([w, h], &px))
 }
 
 fn text(doc: &PdfDocument, page: usize) -> Result<Vec<TextChar>> {

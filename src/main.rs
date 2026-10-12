@@ -4,6 +4,7 @@ mod annot;
 mod app;
 mod config;
 mod doc;
+mod look;
 mod pdf;
 mod search;
 mod ui;

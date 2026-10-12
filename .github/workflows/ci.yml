@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Same build as vendor/pdfium/VERSION.
+  PDFIUM_TAG: chromium/8076
+
+jobs:
+  check:
+    name: Format, lint and test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Download pdfium
+        run: |
+          mkdir -p vendor/pdfium
+          curl -fsSL "https://github.com/bblanchon/pdfium-binaries/releases/download/${PDFIUM_TAG}/pdfium-linux-x64.tgz" \
+            | tar -xz -C vendor/pdfium
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      # The end-to-end tests skip themselves when pdfium can't be loaded; here
+      # that would hide failures, so it's an error.
+      - name: Test
+        run: |
+          cargo test --locked 2>&1 | tee test.log
+          if grep -q "pdfium not available" test.log; then
+            echo "::error::pdfium could not be loaded, so the end-to-end tests were skipped"
+            exit 1
+          fi

@@ -1,0 +1,16 @@
+name: Feature request
+description: Suggest something Ochre should do.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: What you'd like to do
+      description: What you're trying to get done, and what gets in the way today.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: How it could work
+      description: Optional. How you picture it, or another app that does it well.

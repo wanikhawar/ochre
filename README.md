@@ -5,6 +5,11 @@
   </picture>
 </h1>
 
+<p align="center">
+  <a href="https://github.com/wanikhawar/ochre/actions/workflows/ci.yml"><img src="https://github.com/wanikhawar/ochre/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/wanikhawar/ochre/releases/latest"><img src="https://img.shields.io/github/v/release/wanikhawar/ochre" alt="Latest release"></a>
+</p>
+
 A fast, lightweight PDF reader and annotator for Linux, written in Rust (egui + pdfium).
 
 *Ochre* is an earth pigment made of iron oxide (rust, more or less). Scribes and artists have marked up pages with it for centuries.
@@ -154,6 +159,8 @@ Search uses smartcase: an all-lowercase query ignores case, while a query contai
 ```sh
 cargo test
 ```
+
+CI also checks formatting (`cargo fmt --check`) and runs clippy with warnings as errors. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 The tests cover:
 

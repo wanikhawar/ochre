@@ -1,0 +1,22 @@
+version: 2
+updates:
+  # Most dependencies are 0.x, where a minor bump (0.36 -> 0.37) can break the
+  # build, so only patch updates are grouped; other updates get a pull request
+  # each. The egui crates have to move together, so they're grouped.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      egui:
+        patterns: ["eframe", "egui*"]
+      patch:
+        update-types: [patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]

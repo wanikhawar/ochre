@@ -22,7 +22,7 @@ pub fn bezier_path(curve: &[Pt]) -> Option<Path> {
     let mut pb = PathBuilder::new();
     let first = curve.first()?;
     pb.move_to(first.x, first.y);
-    for seg in curve[1..].chunks_exact(3) {
+    for seg in curve[1..].as_chunks::<3>().0 {
         pb.cubic_to(seg[0].x, seg[0].y, seg[1].x, seg[1].y, seg[2].x, seg[2].y);
     }
     pb.finish()

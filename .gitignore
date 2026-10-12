@@ -1,2 +1,4 @@
 target/
 vendor/
+/roadmap.md
+dist/

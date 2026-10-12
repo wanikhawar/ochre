@@ -111,7 +111,7 @@ pub fn text_string(s: &str) -> Object {
 /// Decodes a PDF text string (UTF-16BE with BOM, UTF-8 with BOM, or PDFDocEncoding ~ Latin-1).
 pub fn decode_text_string(b: &[u8]) -> String {
     if let Some(rest) = b.strip_prefix(&[0xFE, 0xFF]) {
-        let units: Vec<u16> = rest.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+        let units: Vec<u16> = rest.as_chunks::<2>().0.iter().map(|c| u16::from_be_bytes(*c)).collect();
         String::from_utf16_lossy(&units)
     } else if let Some(rest) = b.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
         String::from_utf8_lossy(rest).into_owned()
@@ -180,7 +180,7 @@ fn bezier_ops(curve: &[Pt], out: &mut String) {
     if curve.len() == 1 {
         let _ = writeln!(out, "{} {} l", num(p0.x), num(p0.y));
     }
-    for s in curve[1..].chunks_exact(3) {
+    for s in curve[1..].as_chunks::<3>().0 {
         let _ = writeln!(
             out,
             "{} {} {} {} {} {} c",

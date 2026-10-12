@@ -43,12 +43,8 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
 
-      # The end-to-end tests skip themselves when pdfium can't be loaded; here
-      # that would hide failures, so it's an error.
+      # Without pdfium the end-to-end tests would skip themselves; this makes it an error.
       - name: Test
-        run: |
-          cargo test --locked 2>&1 | tee test.log
-          if grep -q "pdfium not available" test.log; then
-            echo "::error::pdfium could not be loaded, so the end-to-end tests were skipped"
-            exit 1
-          fi
+        run: cargo test --locked
+        env:
+          OCHRE_REQUIRE_PDFIUM: "1"

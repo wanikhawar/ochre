@@ -191,6 +191,16 @@ pub struct PagesUi {
     pub seen_layout: Vec<crate::annot::model::PageSlot>,
 }
 
+impl PagesUi {
+    /// A thumbnail render for `generation` in `look` came back: it's no longer
+    /// pending, unless a newer request for the page (e.g. in other colors) is.
+    fn answered(&mut self, page: usize, generation: u64, look: PageLook) {
+        if self.in_flight.get(&page).is_some_and(|&(g, _, l)| g == generation && l == look) {
+            self.in_flight.remove(&page);
+        }
+    }
+}
+
 /// Width of page thumbnails, in points.
 pub const THUMB_WIDTH: f32 = 150.0;
 
@@ -1105,8 +1115,8 @@ impl App {
                         Resp::Text { page, chars, .. } => {
                             t.text_chars.insert(page, chars);
                         }
-                        Resp::Rendered { page, thumb: true, .. } => {
-                            t.pages_ui.in_flight.remove(&page);
+                        Resp::Rendered { generation, page, thumb: true, look, .. } => {
+                            t.pages_ui.answered(page, generation, look);
                         }
                         Resp::Rendered { page, .. } => {
                             t.in_flight.remove(&page);
@@ -1130,12 +1140,14 @@ impl App {
                     self.close_active_tab();
                 }
                 Resp::Rendered { generation, page, image, thumb: true, look, .. } => {
-                    let key = self.pages_ui.in_flight.remove(&page);
+                    self.pages_ui.answered(page, generation, look);
                     if generation != doc.generation || page >= doc.pages.len() {
                         continue;
                     }
                     let image = with_annotations(image, doc, page, look);
-                    let key = key.unwrap_or((generation, 0, look));
+                    // Keyed by what it shows: this render's colors (a request in other colors
+                    // may be pending) and the annotations as they are now.
+                    let key = (generation, doc.page_rev.get(page).copied().unwrap_or(0), look);
                     let opts = egui::TextureOptions::LINEAR;
                     match self.pages_ui.thumbs.get_mut(&page) {
                         Some(t) => {

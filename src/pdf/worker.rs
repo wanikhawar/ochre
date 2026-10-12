@@ -114,7 +114,15 @@ impl Worker {
     }
 
     pub fn spawn(ctx: egui::Context) -> Result<Worker> {
-        let tx = SERVICE.get_or_init(start_service).clone().map_err(|e| anyhow!(e))?;
+        let tx = SERVICE.get_or_init(start_service).clone().map_err(|e| anyhow!(e));
+        // Tests that need pdfium skip themselves without it; CI sets this so they fail instead.
+        #[cfg(test)]
+        if let Err(e) = &tx
+            && std::env::var_os("OCHRE_REQUIRE_PDFIUM").is_some()
+        {
+            panic!("OCHRE_REQUIRE_PDFIUM is set, but pdfium could not be loaded: {e}");
+        }
+        let tx = tx?;
         let (reply, rx) = unbounded::<Resp>();
         Ok(Worker { tx, reply, rx, ctx })
     }

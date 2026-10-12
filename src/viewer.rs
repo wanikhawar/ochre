@@ -4144,4 +4144,37 @@ mod tests {
         h.key(Key::I, Modifiers::COMMAND);
         assert_eq!(h.app.cfg.page_look, PageLook::Normal);
     }
+
+    #[test]
+    fn a_thumbnail_is_keyed_by_the_colors_it_was_drawn_in() {
+        use crate::config::SidebarTab;
+        let dir = std::env::temp_dir().join(format!("ochre-thumb-look-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("thumb-look.pdf");
+        text_pdf(&path);
+        let ctx = egui::Context::default();
+        let app = App::new(&ctx, Some(path));
+        if app.worker.is_none() {
+            eprintln!("pdfium not available, skipping: {:?}", app.worker_error);
+            return;
+        }
+        let mut h = Harness { ctx, app, t: 0.0, mods: Modifiers::NONE, size: vec2(1000.0, 1500.0) };
+        h.wait_until("pages", |a| a.doc.as_ref().is_some_and(|d| !d.pages.is_empty()));
+        h.app.cfg.show_outline = true;
+        h.app.cfg.sidebar_tab = SidebarTab::Pages;
+        h.wait_until("thumbnail", |a| a.pages_ui.thumbs.get(&0).is_some_and(|t| t.key.2 == PageLook::Normal));
+
+        // A sepia thumbnail is being drawn when the colors change again to dark, so a
+        // dark one is pending when the sepia one arrives (none is sent here, so
+        // nothing else can change the thumbnail).
+        h.app.set_page_look(PageLook::Sepia);
+        h.app.request_thumb(0);
+        let (generation, rev, _) = h.app.pages_ui.in_flight[&0];
+        h.app.set_page_look(PageLook::Dark);
+        h.app.pages_ui.in_flight.insert(0, (generation, rev, PageLook::Dark));
+        h.wait_until("the sepia thumbnail", |a| a.pages_ui.thumbs[&0].key.2 != PageLook::Normal);
+        // It's not taken for the dark one, which stays pending.
+        assert_eq!(h.app.pages_ui.thumbs[&0].key.2, PageLook::Sepia);
+        assert_eq!(h.app.pages_ui.in_flight.get(&0).map(|k| k.2), Some(PageLook::Dark));
+    }
 }

@@ -265,6 +265,10 @@ pub struct App {
     pub(crate) page_input: String,
     /// Time of the last lone `g` press (for `gg`).
     g_pressed_at: f64,
+    /// Fullscreen (F11): no chrome, the pages fill the screen.
+    pub fullscreen: bool,
+    /// Whether the window has reported being fullscreen since we asked for it.
+    fullscreen_seen: bool,
     /// Outline entries whose expanded state differs from the default (top level open).
     pub(crate) outline_toggled: HashSet<usize>,
     /// What the annotations list shows.
@@ -304,6 +308,7 @@ pub(crate) enum FileDialog {
 const CLIP_PREFIX: &str = "ochre-annotations:v1\n";
 /// How far a pasted or duplicated copy is offset (display points).
 const PASTE_OFFSET: f32 = 12.0;
+const FULLSCREEN_HINT: &str = "Press F11 or Esc to leave fullscreen";
 
 /// Annotations on the clipboard, with where they were copied from.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -354,6 +359,8 @@ impl App {
             title: String::new(),
             page_input: String::new(),
             g_pressed_at: f64::NEG_INFINITY,
+            fullscreen: false,
+            fullscreen_seen: false,
             outline_toggled: HashSet::new(),
             annot_filter: AnnotFilter::default(),
             tabs: Vec::new(),
@@ -379,6 +386,29 @@ impl App {
 
     pub fn set_status(&mut self, ctx: &egui::Context, msg: impl Into<String>, error: bool) {
         self.status = Some((msg.into(), ctx.input(|i| i.time), error));
+    }
+
+    pub fn set_fullscreen(&mut self, ctx: &egui::Context, on: bool) {
+        if self.fullscreen == on {
+            return;
+        }
+        self.fullscreen = on;
+        self.fullscreen_seen = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on));
+        if on {
+            self.set_status(ctx, FULLSCREEN_HINT, false);
+        } else if self.status.as_ref().is_some_and(|(msg, ..)| msg == FULLSCREEN_HINT) {
+            self.status = None;
+        }
+    }
+
+    /// Leaving fullscreen with the window manager's own key brings the chrome back.
+    fn sync_fullscreen(&mut self, ctx: &egui::Context) {
+        match ctx.input(|i| i.viewport().fullscreen) {
+            Some(true) if self.fullscreen => self.fullscreen_seen = true,
+            Some(false) if self.fullscreen && self.fullscreen_seen => self.set_fullscreen(ctx, false),
+            _ => {}
+        }
     }
 
     /// Drops the drag in progress. The eraser removes annotations as it goes, so a
@@ -1456,6 +1486,9 @@ impl App {
         if pressed(sc(cmd, Key::O)) {
             self.request_open(None);
         }
+        if pressed(sc(Modifiers::NONE, Key::F11)) {
+            self.set_fullscreen(ctx, !self.fullscreen);
+        }
         if pressed(sc(cmd, Key::P)) && self.doc.is_some() {
             self.open_print(ctx);
             return;
@@ -1588,6 +1621,14 @@ impl App {
                 }
             }
             if pressed(sc(none, Key::Escape)) {
+                // Esc leaves fullscreen once there's nothing else for it to cancel.
+                let busy = !matches!(self.gesture, Gesture::None)
+                    || self.selection.is_some()
+                    || self.text_sel.is_some()
+                    || self.search.open;
+                if !busy {
+                    self.set_fullscreen(ctx, false);
+                }
                 self.cancel_gesture();
                 self.select(None);
                 self.text_sel = None;
@@ -1812,8 +1853,11 @@ impl App {
             self.shortcuts(&ctx);
         }
 
-        self.app_bar(ui);
-        if self.doc.is_some() {
+        self.sync_fullscreen(&ctx);
+        if !self.fullscreen {
+            self.app_bar(ui);
+        }
+        if self.doc.is_some() && !self.fullscreen {
             self.status_bar(ui);
             self.tool_rail(ui);
             if self.cfg.show_outline {

@@ -3693,6 +3693,46 @@ mod tests {
     }
 
     #[test]
+    fn f11_fullscreen_hides_the_chrome_and_esc_leaves_once_nothing_else_is_open() {
+        let dir = std::env::temp_dir().join(format!("ochre-fullscreen-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("fullscreen.pdf");
+        text_pdf(&path);
+        let ctx = egui::Context::default();
+        let app = App::new(&ctx, Some(path));
+        if app.worker.is_none() {
+            eprintln!("pdfium not available, skipping: {:?}", app.worker_error);
+            return;
+        }
+        let mut h = Harness { ctx, app, t: 0.0, mods: Modifiers::NONE, size: vec2(1000.0, 800.0) };
+        h.wait_until("pages", |a| a.doc.as_ref().is_some_and(|d| !d.pages.is_empty()));
+        h.app.cfg.show_outline = true;
+        h.frame(vec![]);
+        let normal = h.app.view.viewport;
+        h.key(Key::F11, Modifiers::NONE);
+        assert!(h.app.fullscreen);
+        h.frame(vec![]);
+        let full = h.app.view.viewport;
+        assert!(full.width() > normal.width() + 200.0 && full.height() > normal.height(), "{normal:?} -> {full:?}");
+        assert!(full.top() < 1.0 && full.left() < 1.0, "pages from the corner: {full:?}");
+        assert!(h.app.cfg.show_outline, "the sidebar setting is kept");
+
+        // Esc first closes search, then leaves.
+        h.key(Key::F, Modifiers::COMMAND);
+        assert!(h.app.search.open);
+        h.key(Key::Escape, Modifiers::NONE);
+        assert!(!h.app.search.open && h.app.fullscreen, "Esc closed the search only");
+        h.key(Key::Escape, Modifiers::NONE);
+        assert!(!h.app.fullscreen);
+        h.frame(vec![]);
+        assert_eq!(h.app.view.viewport, normal, "the chrome is back");
+
+        h.key(Key::F11, Modifiers::NONE);
+        h.key(Key::F11, Modifiers::NONE);
+        assert!(!h.app.fullscreen, "F11 toggles");
+    }
+
+    #[test]
     fn jumps_land_after_the_layout_changes_and_back_restores_both_axes() {
         let dir = std::env::temp_dir().join(format!("ochre-jump-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

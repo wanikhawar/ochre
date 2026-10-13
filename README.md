@@ -38,8 +38,8 @@ A fast, lightweight PDF reader and annotator for Linux, written in Rust (egui + 
   - Annotations with a note show a badge; hover over it to read the note.
   - Notes are saved as standard `/Contents` comments, so Acrobat, Okular and others show them too. Notes on other apps' annotations are shown read-only.
 - **Vim-style navigation** and `/` search (smartcase, n / N).
-- **Page tools** in the sidebar's Pages tab: thumbnails (with your annotations) to go to a page, and to rotate, delete, reorder (drag) or extract pages to a new PDF. Select several with Ctrl+click / Shift+click; the tools act on the selection, or on the page in view. Annotations, the contents and links follow their pages, and it's all undoable, even after saving.
-- **Sidebar** (F9) with three tabs (contents, annotations, pages); the first two: the PDF's **contents**, with the section you're reading highlighted, and a list of all **annotations** by page (highlighted text, notes, other apps' annotations). Click one to go to it.
+- **Page tools** in the left sidebar's Pages tab: thumbnails (with your annotations) to go to a page, and to rotate, delete, reorder (drag) or extract pages to a new PDF. Select several with Ctrl+click / Shift+click; the tools act on the selection, or on the page in view. Annotations, the contents and links follow their pages, and it's all undoable, even after saving.
+- **Two sidebars**, open together or apart. On the left (F9), the PDF's **contents**, with the section you're reading highlighted, and the pages. On the right (F10), a list of all **annotations** by page (highlighted text, notes, other apps' annotations); click one to go to it. Filter the list by color, by type (highlights, drawings, shapes…) or to those with a note.
 - A **status bar** shows the active tool with a button for its settings (color, width, opacity), and the page and zoom controls, without covering the page.
 - **Links** inside the document work with the Select and Hand tools. Web and email links open in your browser or mail app. Alt+← or the Back button returns to where you were.
 - **Tabs:** every file opens in its own tab, from the Open dialog, Recent files, drag and drop (several at once), or the command line (`ochre a.pdf b.pdf`). Opening a file that's already open switches to its tab. Each tab keeps its own zoom, position, selection and search.
@@ -156,7 +156,8 @@ Vim-style navigation works whenever you're not typing in a text field.
 | Ctrl+S, Ctrl+Shift+S | Save, save as |
 | Ctrl+P | Print (in the print screen: print; Esc goes back, F9 hides the settings) |
 | Ctrl+O, Ctrl+F | Open, search (keeps the last query) |
-| F9 | Show or hide the contents sidebar |
+| F9 | Show or hide the left sidebar (contents, pages) |
+| F10 | Show or hide the annotations sidebar |
 | Ctrl+I | Page colors: normal, sepia, dark |
 | Ctrl+Tab / Ctrl+Shift+Tab, Ctrl+PageDown / Ctrl+PageUp | Next / previous tab |
 | Ctrl+W, middle-click a tab | Close the tab |

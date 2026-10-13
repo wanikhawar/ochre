@@ -15,7 +15,7 @@ use crate::config::SidebarTab;
 use crate::doc::Doc;
 use crate::look::PageLook;
 use crate::pdf::worker::Target;
-use crate::viewer::{Fit, Gesture};
+use crate::viewer::{AnnotEntry, AnnotFilter, EntryKind, Fit, Gesture};
 
 /// Vertical padding of the app bar; tabs extend over it to fill the bar's height.
 const APP_BAR_MARGIN_Y: f32 = 3.0;
@@ -24,6 +24,8 @@ const APP_BAR_MARGIN_Y: f32 = 3.0;
 /// frame), kept in egui's temporary data for tests.
 pub const STATUS_NAV_RECT: &str = "status-nav-rect";
 pub const STATUS_TOOL_END: &str = "status-tool-end";
+/// Where the annotations list's filters are, kept in egui's temporary data for tests.
+pub const ANNOT_FILTER_RECT: &str = "annot-filter-rect";
 
 const SHAPES: [ShapeKind; 6] =
     [ShapeKind::Check, ShapeKind::Cross, ShapeKind::Rect, ShapeKind::Ellipse, ShapeKind::Line, ShapeKind::Arrow];
@@ -128,13 +130,19 @@ impl App {
                     ui.add_space(4.0);
                     ui.separator();
                     let shown = has_doc && self.cfg.show_outline;
-                    if icon_button(ui, ph::SIDEBAR_SIMPLE, "Contents (F9)", has_doc, shown, 28.0).clicked() {
+                    if icon_button(ui, ph::SIDEBAR_SIMPLE, "Contents and pages (F9)", has_doc, shown, 28.0).clicked() {
                         self.cfg.show_outline = !self.cfg.show_outline;
                     }
                     left_end = ui.min_rect().right();
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let (can_undo, can_redo) =
                             self.doc.as_ref().map(|d| (d.can_undo(), d.can_redo())).unwrap_or_default();
+                        let shown = has_doc && self.cfg.show_review;
+                        if icon_button(ui, ph::CHAT_TEXT, "Annotations (F10)", has_doc, shown, 28.0).clicked() {
+                            self.cfg.show_review = !self.cfg.show_review;
+                        }
+                        ui.add_space(4.0);
+                        ui.separator();
                         if icon_button(
                             ui,
                             ph::MAGNIFYING_GLASS,
@@ -430,75 +438,96 @@ impl App {
             });
     }
 
-    // ------------------------------------------------------------ contents
+    // ------------------------------------------------------------ sidebars
 
-    /// Sidebar with the document's table of contents. The entry for the part being
-    /// read is highlighted; top-level entries start expanded.
-    /// Sidebar (F9) with two tabs: the document's table of contents and a list of
-    /// its annotations. At most about a third of the window wide; in a narrow
-    /// window it closes again after you pick an entry.
-    pub fn sidebar(&mut self, ui: &mut egui::Ui) {
-        let p = theme::current(ui.ctx());
-        let window = ui.ctx().content_rect().width();
+    /// How wide a sidebar may be: about a third of the window, and with both
+    /// sidebars open, little enough that the pages keep some room.
+    fn sidebar_max(&self, window: f32) -> f32 {
         let max = (window * 0.36).max(170.0);
-        egui::Panel::left("outline")
+        if self.cfg.show_outline && self.cfg.show_review { max.min((window - 420.0) / 2.0).max(160.0) } else { max }
+    }
+
+    /// A resizable sidebar, at most `max` wide.
+    fn sidebar_panel(panel: egui::Panel, max: f32, fill: Color32) -> egui::Panel {
+        panel
             .resizable(true)
             .default_size(260f32.min(max))
             .size_range(160f32.min(max)..=max.min(520.0))
-            .frame(egui::Frame::new().fill(p.bar).inner_margin(egui::Margin::symmetric(6, 8)))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 2.0;
-                    let tabs = [
-                        (SidebarTab::Contents, ph::LIST_BULLETS, "Contents"),
-                        (SidebarTab::Annotations, ph::CHAT_TEXT, "Annotations"),
-                        (SidebarTab::Pages, ph::FILES, "Pages"),
-                    ];
-                    // Names when they fit next to the close button, else icons.
-                    let names_width: f32 = tabs
-                        .iter()
-                        .map(|(_, _, l)| {
-                            ui.fonts_mut(|f| {
-                                f.layout_no_wrap(l.to_string(), FontId::proportional(14.0), p.text).size().x
-                            }) + 18.0
-                        })
-                        .sum();
-                    let with_names = names_width + 30.0 <= ui.available_width();
-                    for (tab, icon, label) in tabs {
-                        let on = self.cfg.sidebar_tab == tab;
-                        let text = RichText::new(if with_names { label } else { icon }).color(if on {
-                            p.text
-                        } else {
-                            p.weak
-                        });
-                        let text = if on { text.strong() } else { text };
-                        let resp = ui.add(
-                            egui::Button::new(text)
-                                .fill(if on { p.hover } else { Color32::TRANSPARENT })
-                                .corner_radius(5),
-                        );
-                        let resp = if with_names { resp } else { resp.on_hover_text(label) };
-                        if resp.clicked() {
-                            self.cfg.sidebar_tab = tab;
-                        }
-                    }
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if icon_button(ui, ph::X, "Close (F9)", true, false, 22.0).clicked() {
-                            self.cfg.show_outline = false;
-                        }
-                    });
-                });
-                ui.add_space(4.0);
-                let picked = match self.cfg.sidebar_tab {
-                    SidebarTab::Contents => self.contents_list(ui),
-                    SidebarTab::Annotations => self.annotations_list(ui),
-                    SidebarTab::Pages => self.pages_list(ui),
-                };
-                if picked && window < 760.0 {
-                    self.cfg.show_outline = false;
-                }
-            });
+            .frame(egui::Frame::new().fill(fill).inner_margin(egui::Margin::symmetric(6, 8)))
     }
+
+    /// Left sidebar (F9), for finding your way: the document's table of contents
+    /// and its pages. In a narrow window it closes again after you pick an entry.
+    pub fn sidebar(&mut self, ui: &mut egui::Ui) {
+        let p = theme::current(ui.ctx());
+        let window = ui.ctx().content_rect().width();
+        Self::sidebar_panel(egui::Panel::left("outline"), self.sidebar_max(window), p.bar).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                let tabs =
+                    [(SidebarTab::Contents, ph::LIST_BULLETS, "Contents"), (SidebarTab::Pages, ph::FILES, "Pages")];
+                // Names when they fit next to the close button, else icons.
+                let names_width: f32 = tabs
+                    .iter()
+                    .map(|(_, _, l)| {
+                        ui.fonts_mut(|f| f.layout_no_wrap(l.to_string(), FontId::proportional(14.0), p.text).size().x)
+                            + 18.0
+                    })
+                    .sum();
+                let with_names = names_width + 30.0 <= ui.available_width();
+                for (tab, icon, label) in tabs {
+                    let on = self.cfg.sidebar_tab == tab;
+                    let text =
+                        RichText::new(if with_names { label } else { icon }).color(if on { p.text } else { p.weak });
+                    let text = if on { text.strong() } else { text };
+                    let resp = ui.add(
+                        egui::Button::new(text).fill(if on { p.hover } else { Color32::TRANSPARENT }).corner_radius(5),
+                    );
+                    let resp = if with_names { resp } else { resp.on_hover_text(label) };
+                    if resp.clicked() {
+                        self.cfg.sidebar_tab = tab;
+                    }
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if icon_button(ui, ph::X, "Close (F9)", true, false, 22.0).clicked() {
+                        self.cfg.show_outline = false;
+                    }
+                });
+            });
+            ui.add_space(4.0);
+            let picked = match self.cfg.sidebar_tab {
+                SidebarTab::Contents | SidebarTab::Annotations => self.contents_list(ui),
+                SidebarTab::Pages => self.pages_list(ui),
+            };
+            if picked && window < 760.0 {
+                self.cfg.show_outline = false;
+            }
+        });
+    }
+
+    /// Right sidebar (F10), for what you've marked: the list of annotations. In a
+    /// narrow window it closes again after you pick one.
+    pub fn review_sidebar(&mut self, ui: &mut egui::Ui) {
+        let p = theme::current(ui.ctx());
+        let window = ui.ctx().content_rect().width();
+        Self::sidebar_panel(egui::Panel::right("review"), self.sidebar_max(window), p.bar).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.add_space(6.0);
+                ui.label(RichText::new("Annotations").color(p.text).strong());
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if icon_button(ui, ph::X, "Close (F10)", true, false, 22.0).clicked() {
+                        self.cfg.show_review = false;
+                    }
+                });
+            });
+            ui.add_space(4.0);
+            if self.annotations_list(ui) && window < 760.0 {
+                self.cfg.show_review = false;
+            }
+        });
+    }
+
+    // ------------------------------------------------------------ contents
 
     /// The table of contents; returns whether an entry was picked.
     fn contents_list(&mut self, ui: &mut egui::Ui) -> bool {
@@ -624,23 +653,49 @@ impl App {
         for page in need_text {
             self.request_text(page);
         }
-        ui.label(
-            weak(
-                ui,
-                format!(
-                    "{} on {} pages",
-                    entries.len(),
-                    entries.iter().map(|e| e.page).collect::<std::collections::BTreeSet<_>>().len()
-                ),
-            )
-            .small(),
-        );
+        let colors = AnnotFilter::offered_colors(&entries);
+        self.annot_filter.prune(&entries, &colors);
+        let shown: Vec<&AnnotEntry> = entries.iter().filter(|e| self.annot_filter.matches(e)).collect();
+        let filtered = self.annot_filter.is_active();
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            ui.add_space(6.0);
+            if filtered {
+                ui.label(weak(ui, format!("{} of {} shown ·", shown.len(), entries.len())).small());
+                if ui.link(RichText::new("Clear").small()).clicked() {
+                    self.annot_filter.clear();
+                }
+            } else {
+                let pages = entries.iter().map(|e| e.page).collect::<std::collections::BTreeSet<_>>().len();
+                ui.label(weak(ui, format!("{} on {pages} pages", entries.len())).small());
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let open = self.annot_filter.open;
+                let tip = if open { "Hide filters" } else { "Filter by color or type" };
+                if icon_button(ui, ph::FUNNEL_SIMPLE, tip, true, open || filtered, 22.0).clicked() {
+                    self.annot_filter.open = !open;
+                }
+            });
+        });
+        if self.annot_filter.open {
+            self.annot_filter_row(ui, &entries, colors);
+        }
         ui.add_space(2.0);
+        if shown.is_empty() {
+            ui.add_space(8.0);
+            ui.vertical_centered(|ui| {
+                ui.label(weak(ui, "No annotations match."));
+                if ui.link("Clear filters").clicked() {
+                    self.annot_filter.clear();
+                }
+            });
+            return false;
+        }
         let mut picked = None;
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 1.0;
             let mut last_page = None;
-            for e in &entries {
+            for &e in &shown {
                 if last_page != Some(e.page) {
                     last_page = Some(e.page);
                     ui.add_space(4.0);
@@ -685,6 +740,76 @@ impl App {
         let Some(e) = picked else { return false };
         self.go_to_annotation(e.page, e.bounds, e.sel);
         true
+    }
+
+    /// The annotations list's filters: a dot for each of `colors` (the most used
+    /// ones, see [`AnnotFilter::offered_colors`]), a menu of the kinds of
+    /// annotation there are, and "With a note". Only what the document has is
+    /// offered.
+    fn annot_filter_row(&mut self, ui: &mut egui::Ui, entries: &[AnnotEntry], colors: Vec<(Color32, usize)>) {
+        let p = theme::current(ui.ctx());
+        let kinds: Vec<(EntryKind, usize)> = EntryKind::ALL
+            .into_iter()
+            .map(|k| (k, entries.iter().filter(|e| e.kind == k).count()))
+            .filter(|&(_, n)| n > 0)
+            .collect();
+        let notes = entries.iter().filter(|e| e.note.is_some()).count();
+        let filter = &mut self.annot_filter;
+        let pill = |on: bool, text: String| {
+            egui::Button::new(RichText::new(text).small().color(if on { p.text } else { p.weak }))
+                .fill(if on { p.accent_tint } else { Color32::TRANSPARENT })
+                .stroke(Stroke::new(1.0, if on { p.accent_tint } else { p.border }))
+                .corner_radius(10)
+        };
+        let shown = ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = vec2(2.0, 4.0);
+            ui.add_space(2.0);
+            for (c, n) in colors {
+                let on = filter.colors.contains(&c);
+                let (r, resp) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::click());
+                let painter = ui.painter();
+                if on {
+                    painter.circle_stroke(r.center(), 9.5, Stroke::new(2.0, ACCENT));
+                } else if resp.hovered() {
+                    painter.circle_stroke(r.center(), 9.5, Stroke::new(2.0, p.border));
+                }
+                painter.circle_filled(r.center(), 6.5, c);
+                painter.circle_stroke(r.center(), 6.5, Stroke::new(1.0, p.weak.gamma_multiply(0.6)));
+                let tip = if n == 1 { "1 annotation in this color".to_string() } else { format!("{n} in this color") };
+                if resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip).clicked() {
+                    if on {
+                        filter.colors.retain(|x| *x != c);
+                    } else {
+                        filter.colors.push(c);
+                    }
+                }
+            }
+            ui.add_space(4.0);
+            let label = match filter.kinds.len() {
+                0 => "All types".to_string(),
+                1 => filter.kinds.first().map(|k| k.label()).unwrap_or_default().to_string(),
+                n => format!("{n} types"),
+            };
+            let resp = ui.add(pill(!filter.kinds.is_empty(), format!("{label} {}", ph::CARET_DOWN)));
+            Popup::menu(&resp).close_behavior(PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+                for (k, n) in &kinds {
+                    let mut on = filter.kinds.contains(k);
+                    if ui.checkbox(&mut on, format!("{}  ({n})", k.label())).changed() {
+                        if on {
+                            filter.kinds.insert(*k);
+                        } else {
+                            filter.kinds.remove(k);
+                        }
+                    }
+                }
+            });
+            if notes > 0 && ui.add(pill(filter.with_note, format!("{} With a note", ph::CHAT_TEXT))).clicked() {
+                filter.with_note = !filter.with_note;
+            }
+        });
+        ui.data_mut(|d| d.insert_temp(Id::new(ANNOT_FILTER_RECT), shown.response.rect));
+        ui.add_space(2.0);
+        ui.separator();
     }
 
     /// Page thumbnails with page tools: click to go to a page (Ctrl/Shift+click to

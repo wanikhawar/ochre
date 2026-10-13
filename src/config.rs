@@ -20,11 +20,13 @@ pub struct ReadPos {
     pub fit: Option<Fit>,
 }
 
-/// Which list the sidebar shows.
+/// Which list the left sidebar shows.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SidebarTab {
     #[default]
     Contents,
+    /// Only in settings from before annotations got their own sidebar on the
+    /// right; [`Config::load`] turns it into that sidebar being shown.
     Annotations,
     Pages,
 }
@@ -42,9 +44,11 @@ pub struct Config {
     pub recent: Vec<PathBuf>,
     /// Custom colors added to the palette.
     pub palette: Vec<[f32; 3]>,
-    /// Whether the sidebar is shown (the name predates its Annotations tab).
+    /// Whether the left sidebar (contents, pages) is shown.
     pub show_outline: bool,
     pub sidebar_tab: SidebarTab,
+    /// Whether the right sidebar (annotations) is shown.
+    pub show_review: bool,
     /// Reading position per file, most recent first.
     pub positions: Vec<ReadPos>,
     /// Page colors (normal, sepia or dark), for every file.
@@ -60,6 +64,7 @@ impl Default for Config {
             palette: Vec::new(),
             show_outline: false,
             sidebar_tab: SidebarTab::Contents,
+            show_review: false,
             positions: Vec::new(),
             page_look: PageLook::Normal,
         }
@@ -92,13 +97,22 @@ impl Config {
         path()
             .and_then(|p| std::fs::read_to_string(p).ok())
             .or_else(|| legacy_path().and_then(|p| std::fs::read_to_string(p).ok()))
-            .and_then(|s| toml::from_str::<Config>(&s).ok())
-            .map(|mut c| {
-                // Older versions allowed weaker smoothing; 9 px is now the minimum.
-                c.stabilizer = c.stabilizer.max(crate::ui::chrome::MIN_STABILIZER);
-                c
-            })
+            .and_then(|s| Self::parse(&s))
             .unwrap_or_default()
+    }
+
+    /// Settings from `toml`, brought up to date.
+    fn parse(toml: &str) -> Option<Self> {
+        let mut c = toml::from_str::<Config>(toml).ok()?;
+        // Older versions allowed weaker smoothing; 9 px is now the minimum.
+        c.stabilizer = c.stabilizer.max(crate::ui::chrome::MIN_STABILIZER);
+        // Annotations used to be a tab of the left sidebar.
+        if c.sidebar_tab == SidebarTab::Annotations {
+            c.show_review = c.show_outline;
+            c.show_outline = false;
+            c.sidebar_tab = SidebarTab::Contents;
+        }
+        Some(c)
     }
 
     pub fn save(&self) {
@@ -125,5 +139,23 @@ impl Config {
         self.recent.retain(|r| *r != p);
         self.recent.insert(0, p);
         self.recent.truncate(10);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_old_annotations_tab_becomes_the_right_sidebar() {
+        let old = "recent = [\"/tmp/a.pdf\"]\nshow_outline = true\nsidebar_tab = \"Annotations\"\n";
+        let c = Config::parse(old).unwrap();
+        assert_eq!(c.recent, [PathBuf::from("/tmp/a.pdf")], "nothing else is lost");
+        assert!(c.show_review && !c.show_outline);
+        assert_eq!(c.sidebar_tab, SidebarTab::Contents);
+
+        let c = Config::parse("show_outline = true\nsidebar_tab = \"Pages\"\n").unwrap();
+        assert!(c.show_outline && !c.show_review);
+        assert_eq!(c.sidebar_tab, SidebarTab::Pages);
     }
 }

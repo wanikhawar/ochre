@@ -697,8 +697,119 @@ pub struct AnnotEntry {
     pub sel: Selection,
     pub icon: &'static str,
     pub color: Color32,
+    pub kind: EntryKind,
     pub title: String,
     pub note: Option<String>,
+}
+
+/// What sort of annotation an entry of the list is, for filtering it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum EntryKind {
+    /// Highlighted text and highlighter pen strokes.
+    Highlight,
+    /// Underlined and struck-out text.
+    LineMarkup,
+    Drawing,
+    TextBox,
+    Shape,
+    /// Another app's annotation.
+    Foreign,
+}
+
+impl EntryKind {
+    pub const ALL: [EntryKind; 6] = [
+        EntryKind::Highlight,
+        EntryKind::LineMarkup,
+        EntryKind::Drawing,
+        EntryKind::TextBox,
+        EntryKind::Shape,
+        EntryKind::Foreign,
+    ];
+
+    fn of(a: &Annotation) -> Self {
+        match &a.kind {
+            Kind::Ink { highlighter: true, .. } | Kind::Markup { markup: MarkupKind::Highlight, .. } => {
+                EntryKind::Highlight
+            }
+            Kind::Markup { .. } => EntryKind::LineMarkup,
+            Kind::Ink { .. } => EntryKind::Drawing,
+            Kind::Text { .. } => EntryKind::TextBox,
+            Kind::Shape { .. } => EntryKind::Shape,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            EntryKind::Highlight => "Highlights",
+            EntryKind::LineMarkup => "Underline & strike-out",
+            EntryKind::Drawing => "Drawings",
+            EntryKind::TextBox => "Text boxes",
+            EntryKind::Shape => "Shapes",
+            EntryKind::Foreign => "From other apps",
+        }
+    }
+}
+
+/// Most colors the annotations list offers to filter by.
+pub const MAX_FILTER_COLORS: usize = 15;
+
+/// Which entries the annotations list shows: those in any of `colors`, of any
+/// of `kinds` and, with `with_note`, that have a note. An empty set doesn't
+/// filter. Other apps' annotations have no color of their own, so picking a
+/// color hides them.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AnnotFilter {
+    pub colors: Vec<Color32>,
+    pub kinds: std::collections::BTreeSet<EntryKind>,
+    pub with_note: bool,
+    /// Whether the row of filters is shown.
+    pub open: bool,
+}
+
+impl AnnotFilter {
+    pub fn is_active(&self) -> bool {
+        !self.colors.is_empty() || !self.kinds.is_empty() || self.with_note
+    }
+
+    pub fn matches(&self, e: &AnnotEntry) -> bool {
+        (self.colors.is_empty() || (e.kind != EntryKind::Foreign && self.colors.contains(&e.color)))
+            && (self.kinds.is_empty() || self.kinds.contains(&e.kind))
+            && (!self.with_note || e.note.is_some())
+    }
+
+    /// The colors to offer, with how many entries have each: the most used ones,
+    /// at most [`MAX_FILTER_COLORS`], in the order they first appear.
+    pub fn offered_colors(entries: &[AnnotEntry]) -> Vec<(Color32, usize)> {
+        let mut colors: Vec<(Color32, usize)> = Vec::new();
+        let mut index = std::collections::HashMap::new();
+        for e in entries.iter().filter(|e| e.kind != EntryKind::Foreign) {
+            let i = *index.entry(e.color).or_insert_with(|| {
+                colors.push((e.color, 0));
+                colors.len() - 1
+            });
+            colors[i].1 += 1;
+        }
+        if colors.len() > MAX_FILTER_COLORS {
+            let mut by_use = colors.clone();
+            by_use.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+            by_use.truncate(MAX_FILTER_COLORS);
+            colors.retain(|c| by_use.contains(c));
+        }
+        colors
+    }
+
+    /// Forgets colors and kinds that aren't offered any more (the last one was
+    /// deleted, or recolored), so they can't hide everything without being shown.
+    /// `offered` is [`Self::offered_colors`] of `entries`.
+    pub fn prune(&mut self, entries: &[AnnotEntry], offered: &[(Color32, usize)]) {
+        self.colors.retain(|c| offered.iter().any(|(o, _)| o == c));
+        self.kinds.retain(|k| entries.iter().any(|e| e.kind == *k));
+        self.with_note &= entries.iter().any(|e| e.note.is_some());
+    }
+
+    pub fn clear(&mut self) {
+        *self = AnnotFilter { open: self.open, ..Default::default() };
+    }
 }
 
 /// Groups the selected characters into one quad per text line.
@@ -1731,6 +1842,7 @@ impl App {
                     sel: Selection::Ours(a.id.clone()),
                     icon: crate::ui::chrome::tool_icon(tool),
                     color: crate::app::rgb(a.style.color),
+                    kind: EntryKind::of(a),
                     title,
                     note: (!a.note.is_empty()).then(|| a.note.clone()),
                 }
@@ -1746,6 +1858,7 @@ impl App {
                 sel: Selection::Foreign(i),
                 icon: egui_phosphor::regular::INFO,
                 color: crate::ui::theme::WARN,
+                kind: EntryKind::Foreign,
                 title: match &f.text {
                     Some(t) => format!("{}: {}  · other app", f.kind_name(), t.lines().next().unwrap_or_default()),
                     None => format!("{}  · other app", f.kind_name()),
@@ -3361,6 +3474,40 @@ mod tests {
         h.app.go_to_annotation(e.page, e.bounds, e.sel.clone());
         assert_eq!((h.app.tool, h.app.selection.clone()), (Tool::Select, Some(Selection::Ours(rect.id.clone()))));
         assert_eq!(h.app.view.back.len(), 1, "Back returns from it");
+
+        // Filtering the list by kind, by color (other apps' annotations have none of
+        // their own) and to those with a note.
+        let shown = |h: &Harness| -> Vec<String> {
+            h.app.annotation_entries().into_iter().filter(|e| h.app.annot_filter.matches(e)).map(|e| e.title).collect()
+        };
+        let filter = |h: &mut Harness, f: &dyn Fn(&mut AnnotFilter)| {
+            h.app.annot_filter.clear();
+            f(&mut h.app.annot_filter);
+            shown(h)
+        };
+        let red = entries[2].color;
+        let titles = filter(&mut h, &|f| {
+            f.kinds.insert(EntryKind::Highlight);
+        });
+        assert!(titles.len() == 1 && titles[0].starts_with("“Hello"), "{titles:?}");
+        assert_eq!(filter(&mut h, &|f| f.colors.push(red)), ["Rectangle"]);
+        assert_eq!(
+            filter(&mut h, &|f| {
+                f.kinds.insert(EntryKind::Foreign);
+            }),
+            ["Rectangle  · other app"]
+        );
+        assert_eq!(filter(&mut h, &|f| f.with_note = true), ["Rectangle"]);
+        // Drawn with the filters showing; deleting the last red annotation forgets
+        // the red filter, so it can't hide everything.
+        filter(&mut h, &|f| f.colors.push(red));
+        h.app.cfg.show_review = true;
+        h.app.annot_filter.open = true;
+        h.frame(vec![]);
+        assert_eq!(h.app.annot_filter.colors, [red]);
+        h.app.delete_selection();
+        h.frame(vec![]);
+        assert!(!h.app.annot_filter.is_active(), "{:?}", h.app.annot_filter);
     }
 
     #[test]
@@ -3421,6 +3568,131 @@ mod tests {
     }
 
     #[test]
+    fn annotation_filters_combine_and_forget_what_is_gone() {
+        use EntryKind::*;
+        let entry = |kind, color, note: Option<&str>| AnnotEntry {
+            page: 0,
+            bounds: [0.0; 4],
+            sel: Selection::Foreign(0),
+            icon: "",
+            color,
+            kind,
+            title: String::new(),
+            note: note.map(str::to_string),
+        };
+        let (yellow, red, warn) = (Color32::YELLOW, Color32::RED, crate::ui::theme::WARN);
+        let entries = [
+            entry(Highlight, yellow, Some("note")),
+            entry(Highlight, red, None),
+            entry(Shape, red, None),
+            entry(Foreign, warn, None),
+        ];
+        let count = |f: &AnnotFilter| entries.iter().filter(|e| f.matches(e)).count();
+        let mut f = AnnotFilter::default();
+        assert!(!f.is_active());
+        assert_eq!(count(&f), 4, "nothing picked shows everything");
+        f.colors.push(red);
+        assert_eq!(count(&f), 2);
+        f.colors.push(yellow);
+        assert_eq!(count(&f), 3, "any of the colors");
+        f.kinds.insert(Highlight);
+        assert_eq!(count(&f), 2, "and of the kind");
+        f.with_note = true;
+        assert_eq!(count(&f), 1);
+        f.clear();
+        f.colors.push(warn);
+        assert_eq!(count(&f), 0, "other apps' annotations have no color to pick");
+
+        f.open = true;
+        f.colors = vec![yellow, red, Color32::BLUE];
+        f.kinds = [Shape, TextBox].into();
+        f.with_note = true;
+        f.prune(&entries[1..], &AnnotFilter::offered_colors(&entries[1..]));
+        assert_eq!(f, AnnotFilter { colors: vec![red], kinds: [Shape].into(), with_note: false, open: true });
+
+        // Only the most used colors are offered, in the order they first appear;
+        // a picked color that drops out of them stops filtering.
+        let rare = |i: u8| entry(Shape, Color32::from_rgb(i, 0, 0), None);
+        let mut many: Vec<AnnotEntry> = (1..=MAX_FILTER_COLORS as u8).map(rare).collect();
+        many.push(entry(Shape, yellow, None));
+        many.push(entry(Shape, yellow, None));
+        let offered: Vec<Color32> = AnnotFilter::offered_colors(&many).into_iter().map(|(c, _)| c).collect();
+        assert_eq!(offered.len(), MAX_FILTER_COLORS);
+        assert_eq!(offered[0], Color32::from_rgb(1, 0, 0));
+        assert_eq!(offered.last(), Some(&yellow), "used most, so offered though it came last");
+        let last_rare = Color32::from_rgb(MAX_FILTER_COLORS as u8, 0, 0);
+        assert!(!offered.contains(&last_rare));
+        f.colors = vec![last_rare, yellow];
+        f.prune(&many, &AnnotFilter::offered_colors(&many));
+        assert_eq!(f.colors, [yellow]);
+    }
+
+    #[test]
+    fn many_colors_leave_room_for_the_rest_of_the_filters_and_the_list() {
+        let dir = std::env::temp_dir().join(format!("ochre-colors-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("colors.pdf");
+        text_pdf(&path);
+        let ctx = egui::Context::default();
+        let app = App::new(&ctx, Some(path));
+        if app.worker.is_none() {
+            eprintln!("pdfium not available, skipping: {:?}", app.worker_error);
+            return;
+        }
+        let mut h = Harness { ctx, app, t: 0.0, mods: Modifiers::NONE, size: vec2(1000.0, 500.0) };
+        h.wait_until("pages", |a| a.doc.as_ref().is_some_and(|d| !d.pages.is_empty()));
+        let adds = (0..150)
+            .map(|i| {
+                let t = i as f32 / 150.0;
+                let a = Pt::new(100.0 + t * 300.0, 100.0);
+                Cmd::Add(Annotation::new(
+                    0,
+                    Style::new([t, 0.5, 1.0 - t], 2.0, 1.0),
+                    Kind::Shape { shape: ShapeKind::Rect, a, b: a.add(Pt::new(10.0, 10.0)) },
+                ))
+            })
+            .collect();
+        h.app.exec(adds);
+        h.app.cfg.show_review = true;
+        h.app.annot_filter.open = true;
+        h.frame(vec![]);
+        h.frame(vec![]);
+        let filters: Rect = h.ctx.data(|d| d.get_temp(egui::Id::new(crate::ui::chrome::ANNOT_FILTER_RECT))).unwrap();
+        let entries = h.app.annotation_entries();
+        assert_eq!(AnnotFilter::offered_colors(&entries).len(), MAX_FILTER_COLORS);
+        assert!(filters.bottom() < 500.0 - 150.0, "the list keeps most of the sidebar: {filters:?}");
+    }
+
+    #[test]
+    fn f9_and_f10_toggle_the_two_sidebars() {
+        let dir = std::env::temp_dir().join(format!("ochre-sidebars-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sidebars.pdf");
+        text_pdf(&path);
+        let ctx = egui::Context::default();
+        let app = App::new(&ctx, Some(path));
+        if app.worker.is_none() {
+            eprintln!("pdfium not available, skipping: {:?}", app.worker_error);
+            return;
+        }
+        let mut h = Harness { ctx, app, t: 0.0, mods: Modifiers::NONE, size: vec2(1000.0, 800.0) };
+        h.wait_until("pages", |a| a.doc.as_ref().is_some_and(|d| !d.pages.is_empty()));
+        h.frame(vec![]);
+        let full = h.app.view.viewport.width();
+        h.key(Key::F9, Modifiers::NONE);
+        h.key(Key::F10, Modifiers::NONE);
+        assert!(h.app.cfg.show_outline && h.app.cfg.show_review, "both open at once");
+        h.frame(vec![]);
+        let both = h.app.view.viewport.width();
+        assert!(both < full - 300.0, "{full} -> {both}");
+        assert!(both > 360.0, "the pages keep room: {both}");
+        h.key(Key::F9, Modifiers::NONE);
+        assert!(!h.app.cfg.show_outline && h.app.cfg.show_review, "each on its own");
+        h.key(Key::F10, Modifiers::NONE);
+        assert!(!h.app.cfg.show_review);
+    }
+
+    #[test]
     fn jumps_land_after_the_layout_changes_and_back_restores_both_axes() {
         let dir = std::env::temp_dir().join(format!("ochre-jump-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -3460,12 +3732,12 @@ mod tests {
 
         // In a narrow window the sidebar closes after picking, so Fit Width rescales
         // the pages while the jump is under way: it still lands on the annotation.
-        h.app.cfg.show_outline = true;
+        h.app.cfg.show_review = true;
         settle(&mut h);
         let zoom_with_sidebar = h.app.view.zoom;
         let e = entry(&h);
         h.app.go_to_annotation(e.page, e.bounds, e.sel.clone());
-        h.app.cfg.show_outline = false;
+        h.app.cfg.show_review = false;
         settle(&mut h);
         assert!(h.app.view.zoom > zoom_with_sidebar, "the pages got wider");
         let (shown, at, vp) = visible(&h);
@@ -3521,13 +3793,13 @@ mod tests {
             h.frame(vec![]);
         };
         // Sidebar open, scrolled to the very bottom, then pick it (the sidebar closes).
-        h.app.cfg.show_outline = true;
+        h.app.cfg.show_review = true;
         settle(&mut h);
         h.key(Key::G, Modifiers::SHIFT);
         settle(&mut h);
         let e = h.app.annotation_entries().into_iter().find(|e| e.title == "Rectangle").unwrap();
         h.app.go_to_annotation(e.page, e.bounds, e.sel.clone());
-        h.app.cfg.show_outline = false;
+        h.app.cfg.show_review = false;
         settle(&mut h);
         let g = h.doc().pages[page];
         let at = pos(h.app.view.to_screen(&g, page).apply(Pt::new(150.0, 60.0)));

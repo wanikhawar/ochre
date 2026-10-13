@@ -15,7 +15,9 @@ use crate::pdf::worker::{Req, Resp, Target, TextChar, Worker};
 use crate::search::Search;
 use crate::ui::print::{Outcome, PrintScreen};
 use crate::ui::theme;
-use crate::viewer::{Fit, Gesture, Jump, JumpX, Motion, NoteEdit, Overlay, PageTex, TextEditState, TextSel, View};
+use crate::viewer::{
+    AnnotFilter, Fit, Gesture, Jump, JumpX, Motion, NoteEdit, Overlay, PageTex, TextEditState, TextSel, View,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tool {
@@ -169,6 +171,7 @@ pub struct Tab {
     text_sel: Option<TextSel>,
     search: Search,
     outline_toggled: HashSet<usize>,
+    annot_filter: AnnotFilter,
 }
 
 /// A page thumbnail, and what it was made from.
@@ -264,6 +267,8 @@ pub struct App {
     g_pressed_at: f64,
     /// Outline entries whose expanded state differs from the default (top level open).
     pub(crate) outline_toggled: HashSet<usize>,
+    /// What the annotations list shows.
+    pub(crate) annot_filter: AnnotFilter,
     /// Open tabs, in order. The active one (`tabs[active]`) is an empty placeholder:
     /// its state is in the fields above. Empty when no file is open.
     pub tabs: Vec<Tab>,
@@ -350,6 +355,7 @@ impl App {
             page_input: String::new(),
             g_pressed_at: f64::NEG_INFINITY,
             outline_toggled: HashSet::new(),
+            annot_filter: AnnotFilter::default(),
             tabs: Vec::new(),
             active: 0,
             reveal_tab: false,
@@ -758,6 +764,7 @@ impl App {
             text_sel: self.text_sel.take(),
             search: std::mem::take(&mut self.search),
             outline_toggled: std::mem::take(&mut self.outline_toggled),
+            annot_filter: std::mem::take(&mut self.annot_filter),
         }
     }
 
@@ -776,6 +783,7 @@ impl App {
         self.text_sel = t.text_sel;
         self.search = t.search;
         self.outline_toggled = t.outline_toggled;
+        self.annot_filter = t.annot_filter;
         self.gesture = Gesture::None;
         self.editing = None;
         self.note_edit = None;
@@ -1497,6 +1505,9 @@ impl App {
             if pressed(sc(Modifiers::NONE, Key::F9)) && self.doc.is_some() {
                 self.cfg.show_outline = !self.cfg.show_outline;
             }
+            if pressed(sc(Modifiers::NONE, Key::F10)) && self.doc.is_some() {
+                self.cfg.show_review = !self.cfg.show_review;
+            }
             if pressed(sc(cmd, Key::I)) {
                 let look = self.cfg.page_look.next();
                 self.set_page_look(look);
@@ -1807,6 +1818,9 @@ impl App {
             self.tool_rail(ui);
             if self.cfg.show_outline {
                 self.sidebar(ui);
+            }
+            if self.cfg.show_review {
+                self.review_sidebar(ui);
             }
         }
         let canvas = egui::CentralPanel::default()

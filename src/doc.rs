@@ -1223,6 +1223,60 @@ mod tests {
     }
 
     #[test]
+    fn sticky_notes_are_standard_text_annotations() {
+        let path = tmp("sticky.pdf");
+        std::fs::write(&path, sample_pdf()).unwrap();
+        let mut doc = Doc::open(&path).unwrap();
+        let (right, down) = (Pt::new(1.0, 0.0), Pt::new(0.0, -1.0));
+        let mut pin = Annotation::new(
+            0,
+            Style::new([1.0, 0.8, 0.2], 1.0, 1.0),
+            Kind::Note { origin: Pt::new(200.0, 500.0), right, down },
+        );
+        pin.note = "Check this ✓\nSecond line".into();
+        doc.exec(vec![Cmd::Add(pin.clone())]);
+        doc.save_to(&path).unwrap();
+
+        // Ochre's own, and editable, after reopening.
+        let reopened = Doc::open(&path).unwrap();
+        assert_eq!(reopened.annots, [pin.clone()]);
+        assert_eq!(reopened.foreign.len(), 1);
+
+        // Other viewers see a sticky note: a /Text annotation with the note as its
+        // comment, over the icon, that isn't printed.
+        let d = lopdf::Document::load(&path).unwrap();
+        let dict = d
+            .objects
+            .values()
+            .filter_map(|o| o.as_dict().ok())
+            .find(|d| d.get(b"NM").and_then(|n| n.as_str()).ok() == Some(pin.id.as_bytes()))
+            .unwrap();
+        assert_eq!(dict.get(b"Subtype").unwrap().as_name().unwrap(), b"Text");
+        assert_eq!(dict.get(b"Name").unwrap().as_name().unwrap(), b"Comment");
+        assert_eq!(dict.get(b"F").unwrap().as_i64().unwrap() & 4, 0);
+        let contents = crate::pdf::write::decode_text_string(dict.get(b"Contents").unwrap().as_str().unwrap());
+        assert_eq!(contents, pin.note);
+        let rect = crate::pdf::write::dict_rect(dict).unwrap();
+        let size = crate::annot::geometry::NOTE_ICON_SIZE;
+        assert_eq!(rect, [200.0, 500.0 - size, 200.0 + size, 500.0]);
+        assert!(dict.get(b"AP").is_ok());
+
+        // Its note edited in another app: it's that app's sticky note now.
+        let mut d = d;
+        for obj in d.objects.values_mut() {
+            let Ok(dict) = obj.as_dict_mut() else { continue };
+            if dict.get(b"NM").and_then(|n| n.as_str()).ok() == Some(pin.id.as_bytes()) {
+                dict.set("Contents", crate::pdf::write::text_string("edited elsewhere"));
+            }
+        }
+        d.save(&path).unwrap();
+        let reopened = Doc::open(&path).unwrap();
+        assert!(reopened.annots.is_empty());
+        let theirs = reopened.foreign.iter().find(|f| f.subtype == "Text").unwrap();
+        assert_eq!((theirs.kind_name(), theirs.note.as_deref()), ("Sticky note", Some("edited elsewhere")));
+    }
+
+    #[test]
     fn a_program_rewriting_the_whole_file_doesnt_take_our_annotations() {
         let path = tmp("rewritten.pdf");
         std::fs::write(&path, sample_pdf()).unwrap();

@@ -7,8 +7,8 @@ use lopdf::{Dictionary, Document, Object, ObjectId, Stream, StringFormat, dictio
 use serde::{Deserialize, Serialize};
 
 use crate::annot::geometry::{
-    TEXT_ASCENT, TEXT_LINE_HEIGHT, TEXT_PAD, arrow_head, bounds, box_corners, flatten_bezier, mark_lines, mark_strokes,
-    text_lines,
+    NOTE_LINE_WIDTH, TEXT_ASCENT, TEXT_LINE_HEIGHT, TEXT_PAD, arrow_head, bounds, box_corners, flatten_bezier,
+    mark_lines, mark_strokes, note_icon, note_ink, text_lines,
 };
 use crate::annot::model::{Annotation, Kind, MarkupKind, Pt, ShapeKind};
 use crate::annot::raster::{markup_line, markup_thickness};
@@ -437,6 +437,26 @@ pub fn add_annotation(doc: &mut Document, a: &Annotation, page: ObjectId) -> Obj
             }
             bytes.extend(b"ET\n");
             ops = String::from_utf8(bytes).unwrap_or_default();
+        }
+        Kind::Note { origin, right, down } => {
+            annot.set("Subtype", "Text");
+            annot.set("Name", "Comment");
+            annot.set("Open", false);
+            annot.set("C", reals(a.style.color));
+            // Comment pins stay on screen: printed pages show what's on the page.
+            annot.set("F", 0);
+            let (outline, lines) = note_icon(*origin, *right, *down);
+            let [ir, ig, ib] = note_ink(a.style.color);
+            let _ =
+                writeln!(ops, "{color} rg {} {} {} RG {} w 1 J 1 j", num(ir), num(ig), num(ib), num(NOTE_LINE_WIDTH));
+            for (i, p) in outline.iter().enumerate() {
+                let _ = writeln!(ops, "{} {} {}", num(p.x), num(p.y), if i == 0 { "m" } else { "l" });
+            }
+            ops.push_str("b\n");
+            for [s, e] in &lines {
+                line_ops(*s, *e, &mut ops);
+            }
+            ops.push_str("S\n");
         }
     }
     ops.push_str("Q\n");

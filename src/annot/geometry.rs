@@ -271,6 +271,49 @@ pub fn text_corners(
     [origin, origin.add(r), origin.add(r).add(d), origin.add(d)]
 }
 
+/// Width and height (points) of a sticky note's icon.
+pub const NOTE_ICON_SIZE: f32 = 20.0;
+
+/// The four corners (user space) of a sticky note's icon, in order around it.
+pub fn note_corners(origin: Pt, right: Pt, down: Pt) -> [Pt; 4] {
+    let r = right.scale(NOTE_ICON_SIZE);
+    let d = down.scale(NOTE_ICON_SIZE);
+    [origin, origin.add(r), origin.add(r).add(d), origin.add(d)]
+}
+
+/// A sticky note's icon (user space): the outline of a speech bubble, and the
+/// lines of "text" inside it.
+pub fn note_icon(origin: Pt, right: Pt, down: Pt) -> (Vec<Pt>, Vec<[Pt; 2]>) {
+    // Drawn on a 20 x 20 grid (x right, y down on screen), scaled to the icon size.
+    let k = NOTE_ICON_SIZE / 20.0;
+    let at = |x: f32, y: f32| origin.add(right.scale(x * k)).add(down.scale(y * k));
+    let (x0, y0, x1, y1, r) = (1.5, 1.5, 18.5, 14.5, 3.0);
+    let mut outline = Vec::new();
+    // Rounded corners, clockwise on screen from the top-left one.
+    for (cx, cy, from) in [(x0 + r, y0 + r, 180.0f32), (x1 - r, y0 + r, 270.0), (x1 - r, y1 - r, 0.0)] {
+        for i in 0..=4 {
+            let t = (from + 90.0 * i as f32 / 4.0).to_radians();
+            outline.push(at(cx + r * t.cos(), cy + r * t.sin()));
+        }
+    }
+    // The tail, below the bottom-left corner.
+    outline.extend([at(9.0, y1), at(5.0, 18.5), at(5.5, y1)]);
+    for i in 0..=4 {
+        let t = (90.0 + 90.0 * i as f32 / 4.0).to_radians();
+        outline.push(at(x0 + r + r * t.cos(), y1 - r + r * t.sin()));
+    }
+    let lines = [(5.5, 14.5), (8.0, 14.5), (10.5, 11.0)].map(|(y, x)| [at(5.5, y), at(x, y)]).to_vec();
+    (outline, lines)
+}
+
+/// Color of a sticky note's outline and lines: its color, darkened.
+pub fn note_ink(color: [f32; 3]) -> [f32; 3] {
+    color.map(|c| c * 0.45)
+}
+
+/// Line width (points) of a sticky note's outline and lines.
+pub const NOTE_LINE_WIDTH: f32 = 1.2;
+
 /// Corners of a box shape's (rotated) box, in order around it.
 pub fn box_corners(a: &Annotation) -> [Pt; 4] {
     let (p, q) = match a.kind {
@@ -313,9 +356,10 @@ pub fn bounds(a: &Annotation) -> [f32; 4] {
             v
         }
         Kind::Markup { quads, .. } => quads.iter().flatten().copied().collect(),
+        Kind::Note { origin, right, down } => note_corners(*origin, *right, *down).to_vec(),
     };
     let pad = match a.kind {
-        Kind::Text { .. } | Kind::Markup { .. } => 0.0,
+        Kind::Text { .. } | Kind::Markup { .. } | Kind::Note { .. } => 0.0,
         _ => a.style.width / 2.0 + 1.0,
     };
     let mut r = [f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];
@@ -359,19 +403,20 @@ fn point_in_quad(p: Pt, q: &[Pt; 4]) -> bool {
     inside
 }
 
+/// Distance from `p` to the box with corners `c` (in order around it); 0 if inside.
+fn box_distance(p: Pt, c: [Pt; 4]) -> f32 {
+    if point_in_quad(p, &[c[0], c[1], c[3], c[2]]) { 0.0 } else { dist_to_polyline(p, &[c[0], c[1], c[2], c[3], c[0]]) }
+}
+
 /// Distance (user space) from `p` to the visible part of the annotation; 0 if inside.
 pub fn distance(a: &Annotation, p: Pt) -> f32 {
     let half = a.style.width / 2.0;
     match &a.kind {
         Kind::Ink { curve, .. } => (dist_to_polyline(p, &flatten_bezier(curve, 8)) - half).max(0.0),
         Kind::Text { origin, right, down, text, width, height } => {
-            let c = text_corners(*origin, *right, *down, text, a.style.width, *width, *height);
-            if point_in_quad(p, &[c[0], c[1], c[3], c[2]]) {
-                0.0
-            } else {
-                dist_to_polyline(p, &[c[0], c[1], c[2], c[3], c[0]])
-            }
+            box_distance(p, text_corners(*origin, *right, *down, text, a.style.width, *width, *height))
         }
+        Kind::Note { origin, right, down } => box_distance(p, note_corners(*origin, *right, *down)),
         Kind::Shape { a: s, b: e, .. } if a.angle != 0.0 && a.is_box() => {
             // Measure in the shape's own (unrotated) frame.
             let c = s.lerp(*e, 0.5);

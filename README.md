@@ -37,6 +37,7 @@ A fast, lightweight PDF reader and annotator for Linux, written in Rust (egui + 
 - **Notes** on any annotation: select it and choose "Add note", press Enter, or double-click it.
   - Annotations with a note show a badge; hover over it to read the note.
   - Notes are saved as standard `/Contents` comments, so Acrobat, Okular and others show them too. Notes on other apps' annotations are shown read-only.
+- **Sticky notes** anywhere on the page (C): click to place a comment pin and type the note. Hover over a pin to read it, click it with the tool (or double-click it with Select) to edit it, and drag it with Select to move it. They're saved as standard `/Text` notes that other viewers show, and they aren't printed.
 - **Vim-style navigation** and `/` search (smartcase, n / N).
 - **Page tools** in the left sidebar's Pages tab: thumbnails (with your annotations) to go to a page, and to rotate, delete, reorder (drag) or extract pages to a new PDF. Select several with Ctrl+click / Shift+click; the tools act on the selection, or on the page in view. Annotations, the contents and links follow their pages, and it's all undoable, even after saving.
 - **Two sidebars**, open together or apart. On the left (F9), the PDF's **contents**, with the section you're reading highlighted, and the pages. On the right (F10), a list of all **annotations** by page (highlighted text, notes, other apps' annotations); click one to go to it. Filter the list by color, by type (highlights, drawings, shapes…) or to those with a note.
@@ -139,7 +140,7 @@ Vim-style navigation works whenever you're not typing in a text field.
 | gg / G | First page / end of document |
 | / | Search (Enter to confirm, Esc to cancel). Ctrl+F reopens it with the last query selected |
 | n / N | Next / previous match (wraps around) |
-| V / P / Shift+H / T / S / M / E | Select / Pen / Highlighter / Text / Shape / Text markup / Eraser |
+| V / P / Shift+H / T / C / S / M / E | Select / Pen / Highlighter / Text / Sticky note / Shape / Text markup / Eraser |
 | Space + drag, middle drag | Pan |
 | Shift while drawing a shape | Square / circle / 45° lines |
 | Alt while highlighting | Freehand even over text |

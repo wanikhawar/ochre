@@ -3,7 +3,7 @@
 
 use tiny_skia::{Color, FillRule, LineCap, LineJoin, Paint, Path, PathBuilder, PixmapMut, Stroke, Transform};
 
-use super::geometry::{arrow_head, ellipse_points, mark_strokes};
+use super::geometry::{NOTE_LINE_WIDTH, arrow_head, ellipse_points, mark_strokes, note_icon, note_ink};
 use super::model::{Annotation, Kind, MarkupKind, Pt, ShapeKind, Style};
 
 fn paint(style: &Style) -> Paint<'static> {
@@ -124,6 +124,23 @@ pub fn draw(pm: &mut PixmapMut, a: &Annotation, t: Transform) {
                     let width = quads.first().map(markup_thickness).unwrap_or(1.0);
                     pm.stroke_path(&path, &paint, &stroke(width, LineCap::Butt, LineJoin::Miter), t, None)
                 }
+            }
+        }
+        Kind::Note { origin, right, down } => {
+            let (outline, lines) = note_icon(*origin, *right, *down);
+            let ink = self::paint(&Style::new(note_ink(a.style.color), 0.0, a.style.opacity));
+            let line = stroke(NOTE_LINE_WIDTH, LineCap::Round, LineJoin::Round);
+            if let Some(path) = polyline_path(&outline, true) {
+                pm.fill_path(&path, &paint, FillRule::Winding, t, None);
+                pm.stroke_path(&path, &ink, &line, t, None);
+            }
+            let mut pb = PathBuilder::new();
+            for [s, e] in lines {
+                pb.move_to(s.x, s.y);
+                pb.line_to(e.x, e.y);
+            }
+            if let Some(path) = pb.finish() {
+                pm.stroke_path(&path, &ink, &line, t, None);
             }
         }
         Kind::Text { .. } => {}

@@ -132,6 +132,15 @@ pub enum Kind {
         markup: MarkupKind,
         quads: Vec<[Pt; 4]>,
     },
+    /// Sticky note: a comment pin on its own, written as a PDF `/Text` annotation.
+    /// Its comment is [`Annotation::note`]. The icon is a square
+    /// [`crate::annot::geometry::NOTE_ICON_SIZE`] points wide with its top-left
+    /// corner at `origin`; `right`/`down` are as for a text box, so it stays upright.
+    Note {
+        origin: Pt,
+        right: Pt,
+        down: Pt,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -140,7 +149,8 @@ pub struct Annotation {
     pub page: usize,
     pub style: Style,
     pub kind: Kind,
-    /// Comment attached to the annotation (written as `/Contents`). Unused for text boxes.
+    /// Comment attached to the annotation (written as `/Contents`). Unused for text
+    /// boxes; a sticky note's is its text.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub note: String,
     /// Rotation (radians, counter-clockwise on screen) of a rectangle, ellipse, tick or
@@ -164,7 +174,7 @@ impl Annotation {
         let mv = |p: &mut Pt| *p = f(*p);
         match &mut self.kind {
             Kind::Ink { curve, .. } => curve.iter_mut().for_each(mv),
-            Kind::Text { origin, .. } => mv(origin),
+            Kind::Text { origin, .. } | Kind::Note { origin, .. } => mv(origin),
             Kind::Shape { a, b, .. } => {
                 mv(a);
                 mv(b);
@@ -212,7 +222,7 @@ impl Annotation {
         } else {
             out.map_points(|p| p.rotate_about(c, delta));
         }
-        if let Kind::Text { right, down, .. } = &mut out.kind {
+        if let Kind::Text { right, down, .. } | Kind::Note { right, down, .. } = &mut out.kind {
             *right = right.rotate(delta);
             *down = down.rotate(delta);
         }
@@ -222,6 +232,11 @@ impl Annotation {
     /// Whether a note can be attached (text boxes are text already).
     pub fn takes_note(&self) -> bool {
         !matches!(self.kind, Kind::Text { .. })
+    }
+
+    /// Whether its note is shown as a badge beside it (a sticky note is the badge).
+    pub fn takes_badge(&self) -> bool {
+        self.takes_note() && !matches!(self.kind, Kind::Note { .. })
     }
 }
 

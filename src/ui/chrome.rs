@@ -38,6 +38,7 @@ pub fn tool_icon(tool: Tool) -> &'static str {
         Tool::Pen => ph::PEN_NIB,
         Tool::Highlighter => ph::HIGHLIGHTER,
         Tool::Text => ph::TEXT_T,
+        Tool::Note => ph::CHAT_TEXT,
         Tool::Shape(ShapeKind::Rect) => ph::RECTANGLE,
         Tool::Shape(ShapeKind::Ellipse) => ph::CIRCLE,
         Tool::Shape(ShapeKind::Line) => ph::LINE_SEGMENT,
@@ -383,6 +384,7 @@ impl App {
                     self.rail_tool(ui, Tool::Pen, &[]);
                     self.rail_tool(ui, Tool::Highlighter, &[]);
                     self.rail_tool(ui, Tool::Text, &[]);
+                    self.rail_tool(ui, Tool::Note, &[]);
                     self.rail_tool(ui, Tool::Shape(self.last_shape), &SHAPES.map(Tool::Shape));
                     self.rail_tool(ui, Tool::Markup(self.last_markup), &MARKUPS.map(Tool::Markup));
                     rail_separator(ui);
@@ -1219,6 +1221,12 @@ impl App {
 
     /// Editor for the selected annotation's note, under the annotation.
     fn note_editor(&mut self, ctx: &egui::Context, canvas: Rect, r: Rect) {
+        let pin = match &self.note_edit {
+            Some(n) => {
+                n.pending.is_some() || self.doc.as_ref().and_then(|d| d.get(&n.id)).is_some_and(|a| !a.takes_badge())
+            }
+            None => return,
+        };
         let Some(n) = &mut self.note_edit else { return };
         let mut done = false;
         let mut remove = false;
@@ -1238,7 +1246,7 @@ impl App {
                     ui.set_width(280.0);
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(ph::CHAT_TEXT).color(ACCENT));
-                        ui.label(RichText::new("Note").strong());
+                        ui.label(RichText::new(if pin { "Sticky note" } else { "Note" }).strong());
                     });
                     ui.add_space(4.0);
                     let id = Id::new("note-edit");
@@ -1267,7 +1275,8 @@ impl App {
                         if primary_button(ui, "Done").on_hover_text("Ctrl+Enter").clicked() {
                             done = true;
                         }
-                        if !n.text.trim().is_empty() && ui.button("Remove note").clicked() {
+                        let remove_label = if pin { "Delete" } else { "Remove note" };
+                        if !n.text.trim().is_empty() && ui.button(remove_label).clicked() {
                             remove = true;
                         }
                     });

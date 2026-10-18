@@ -91,6 +91,9 @@ pub struct NoteEdit {
     pub id: String,
     pub text: String,
     pub focus: bool,
+    /// A sticky note just placed: it's added (with its text, as one undo step)
+    /// only when the note is finished with some text.
+    pub pending: Option<Annotation>,
 }
 
 /// How a selected annotation is being changed by dragging.
@@ -712,17 +715,19 @@ pub enum EntryKind {
     Drawing,
     TextBox,
     Shape,
+    Note,
     /// Another app's annotation.
     Foreign,
 }
 
 impl EntryKind {
-    pub const ALL: [EntryKind; 6] = [
+    pub const ALL: [EntryKind; 7] = [
         EntryKind::Highlight,
         EntryKind::LineMarkup,
         EntryKind::Drawing,
         EntryKind::TextBox,
         EntryKind::Shape,
+        EntryKind::Note,
         EntryKind::Foreign,
     ];
 
@@ -735,6 +740,7 @@ impl EntryKind {
             Kind::Ink { .. } => EntryKind::Drawing,
             Kind::Text { .. } => EntryKind::TextBox,
             Kind::Shape { .. } => EntryKind::Shape,
+            Kind::Note { .. } => EntryKind::Note,
         }
     }
 
@@ -745,6 +751,7 @@ impl EntryKind {
             EntryKind::Drawing => "Drawings",
             EntryKind::TextBox => "Text boxes",
             EntryKind::Shape => "Shapes",
+            EntryKind::Note => "Sticky notes",
             EntryKind::Foreign => "From other apps",
         }
     }
@@ -1331,7 +1338,8 @@ impl App {
         let aff = self.view.to_screen(&doc.pages[a.page], a.page);
         let outlined = screen_bounds(a, &aff).expand(4.0);
         let mut handles: Vec<(Handle, Pos2)> = match &a.kind {
-            Kind::Markup { .. } => return Vec::new(),
+            // A sticky note's icon has a fixed size and stays upright: it's only moved.
+            Kind::Markup { .. } | Kind::Note { .. } => return Vec::new(),
             Kind::Shape { shape: ShapeKind::Line | ShapeKind::Arrow, a: p, b: q, .. } => {
                 vec![(Handle::Endpoint(0), pos(aff.apply(*p))), (Handle::Endpoint(1), pos(aff.apply(*q)))]
             }
@@ -1405,6 +1413,11 @@ impl App {
     fn paint_selection(&mut self, painter: &Painter) {
         let accent = crate::ui::theme::ACCENT;
         let handle_stroke = Stroke::new(1.25, accent);
+        // A sticky note being placed: its note editor goes beside it.
+        if let (Some(pin), Some(doc)) = (self.note_edit.as_ref().and_then(|n| n.pending.as_ref()), &self.doc) {
+            let aff = self.view.to_screen(&doc.pages[pin.page], pin.page);
+            self.view.annot_rect = Some(screen_bounds(pin, &aff).expand(4.0));
+        }
         match &self.selection {
             Some(Selection::Ours(_)) => {
                 let Some(a) = self.selected_ours() else { return };
@@ -1477,7 +1490,8 @@ impl App {
     fn note_badges(&self, page: usize) -> Vec<(Pos2, Selection, String)> {
         let Some(doc) = &self.doc else { return Vec::new() };
         let aff = self.view.to_screen(&doc.pages[page], page);
-        let ours = doc.annots.iter().filter(|a| a.page == page && !a.note.is_empty()).map(|a| {
+        // A sticky note is a badge of its own.
+        let ours = doc.annots.iter().filter(|a| a.page == page && !a.note.is_empty() && a.takes_badge()).map(|a| {
             let a = self.edited(&a.id).unwrap_or(a);
             (badge_center(screen_bounds(a, &aff)), Selection::Ours(a.id.clone()), a.note.clone())
         });
@@ -1518,19 +1532,20 @@ impl App {
             .map(|(_, sel, note)| (sel, note))
     }
 
-    /// Note to show when hovering `p`: a badge, or (Select tool) an annotation with a note.
+    /// Note to show when hovering `p`: a badge or a sticky note, or (Select tool) an
+    /// annotation with a note.
     fn note_at(&self, p: Pos2) -> Option<String> {
         if let Some((_, note)) = self.badge_at(p) {
             return Some(note);
         }
-        if self.tool != Tool::Select {
-            return None;
-        }
         let doc = self.doc.as_ref()?;
+        let select = self.tool == Tool::Select;
         match self.hit(p)? {
-            Selection::Ours(id) => Some(doc.get(&id)?.note.clone()).filter(|n| !n.is_empty()),
-            Selection::Foreign(i) => doc.foreign.get(i)?.note.clone(),
-            Selection::Many(_) => None,
+            Selection::Ours(id) => {
+                Some(doc.get(&id).filter(|a| select || !a.takes_badge())?.note.clone()).filter(|n| !n.is_empty())
+            }
+            Selection::Foreign(i) if select => doc.foreign.get(i)?.note.clone(),
+            _ => None,
         }
     }
 
@@ -1590,6 +1605,9 @@ impl App {
             }
             _ => live.into_iter().collect(),
         };
+        // A sticky note being written, not added yet.
+        let live: Vec<Annotation> =
+            live.into_iter().chain(self.note_edit.as_ref().and_then(|n| n.pending.clone())).collect();
         let affs: Vec<Affine> = live.iter().map(|a| self.view.to_screen(&doc.pages[a.page], a.page)).collect();
         let Some(bounds) = live.iter().zip(&affs).map(|(a, aff)| screen_bounds(a, aff)).reduce(|x, y| x.union(y))
         else {
@@ -1707,7 +1725,7 @@ impl App {
                     Some(p) if self.over_text(p) && !ctx.input(|i| i.modifiers.alt) => CursorIcon::Text,
                     _ => CursorIcon::Crosshair,
                 },
-                (_, Tool::Pen | Tool::Shape(_)) => CursorIcon::Crosshair,
+                (_, Tool::Pen | Tool::Shape(_) | Tool::Note) => CursorIcon::Crosshair,
                 (_, Tool::Text | Tool::Markup(_)) => CursorIcon::Text,
                 (_, Tool::Eraser) => CursorIcon::None,
                 (Gesture::SelectText { .. }, _) => CursorIcon::Text,
@@ -1959,6 +1977,7 @@ impl App {
             return;
         }
         let was_editing = self.editing.is_some();
+        let was_noting = self.note_edit.is_some();
         self.commit_edits();
         // A note badge opens (ours) or selects (other apps') the annotation's note.
         if let Some((sel, _)) = self.badge_at(p) {
@@ -2030,6 +2049,17 @@ impl App {
                     }
                     // A click starts a box that fits its text; a drag sets its width.
                     _ => self.gesture = Gesture::TextBox { page, start: u, end: u, style },
+                }
+            }
+            Tool::Note => {
+                if was_editing || was_noting {
+                    return; // the click just finished the text box or note being written
+                }
+                match self.hit(p) {
+                    Some(Selection::Ours(id)) if matches!(doc.get(&id).map(|a| &a.kind), Some(Kind::Note { .. })) => {
+                        self.open_note(&id);
+                    }
+                    _ => self.place_note(page, u, style),
                 }
             }
             Tool::Eraser => {
@@ -2382,19 +2412,47 @@ impl App {
         let Some(a) = self.doc.as_ref().and_then(|d| d.get(id)).filter(|a| a.takes_note()) else { return };
         let (id, text) = (a.id.clone(), a.note.clone());
         self.select(Some(Selection::Ours(id.clone())));
-        self.note_edit = Some(NoteEdit { id, text, focus: true });
+        self.note_edit = Some(NoteEdit { id, text, focus: true, pending: None });
+    }
+
+    /// Opens the note editor for a new sticky note centered on `at` (user space),
+    /// upright on screen. It's added once its note has some text.
+    fn place_note(&mut self, page: usize, at: Pt, style: Style) {
+        let Some(g) = self.doc.as_ref().and_then(|d| d.pages.get(page)).copied() else { return };
+        let inv = g.to_user();
+        let (right, down) = (inv.apply_vec(Pt::new(1.0, 0.0)), inv.apply_vec(Pt::new(0.0, 1.0)));
+        let origin = at.sub(right.add(down).scale(geometry::NOTE_ICON_SIZE / 2.0));
+        let pin = Annotation::new(page, style, Kind::Note { origin, right, down });
+        self.select(None);
+        self.note_edit = Some(NoteEdit { id: pin.id.clone(), text: String::new(), focus: true, pending: Some(pin) });
     }
 
     /// Saves the note being edited (as one undo step) and closes the editor.
     pub fn commit_note(&mut self) {
         let Some(n) = self.note_edit.take() else { return };
+        let note = n.text.trim().to_string();
+        if let Some(pin) = n.pending {
+            if !note.is_empty() {
+                self.exec(vec![Cmd::Add(Annotation { note, ..pin })]);
+            }
+            return;
+        }
         let Some(doc) = &self.doc else { return };
         let Some(before) = doc.get(&n.id).cloned() else { return };
-        let note = n.text.trim().to_string();
-        if note != before.note {
-            let after = Annotation { note, ..before.clone() };
-            self.exec(vec![Cmd::Modify { before, after }]);
+        if note == before.note {
+            return;
         }
+        // A sticky note is nothing without its text.
+        if note.is_empty()
+            && !before.takes_badge()
+            && let Some(index) = doc.index_of(&n.id)
+        {
+            self.exec(vec![Cmd::Remove { annot: before, index }]);
+            self.select(None);
+            return;
+        }
+        let after = Annotation { note, ..before.clone() };
+        self.exec(vec![Cmd::Modify { before, after }]);
     }
 
     fn commit_text(&mut self) {
@@ -3173,6 +3231,95 @@ mod tests {
         h.key(Key::W, Modifiers::COMMAND);
         assert!(h.app.doc.is_none() && h.app.tabs.is_empty());
         h.frame(vec![]);
+    }
+
+    #[test]
+    fn sticky_notes() {
+        let dir = std::env::temp_dir().join(format!("ochre-sticky-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sticky.pdf");
+        reading_pdf(&path);
+        let ctx = egui::Context::default();
+        let app = App::new(&ctx, Some(path.clone()));
+        if app.worker.is_none() {
+            eprintln!("pdfium not available, skipping: {:?}", app.worker_error);
+            return;
+        }
+        let mut h = Harness { ctx, app, t: 0.0, mods: Modifiers::NONE, size: vec2(1000.0, 900.0) };
+        h.wait_until("pages", |a| a.doc.as_ref().is_some_and(|d| !d.pages.is_empty()));
+        h.frame(vec![]);
+        let pins = |h: &Harness| -> Vec<Annotation> {
+            h.doc().annots.iter().filter(|a| matches!(a.kind, Kind::Note { .. })).cloned().collect()
+        };
+        let center =
+            |h: &Harness, a: &Annotation| screen_bounds(a, &h.app.view.to_screen(&h.doc().pages[0], 0)).center();
+
+        // C, then a click on empty page space: the note editor opens for a pin that
+        // isn't in the document until it has some text.
+        h.key(Key::C, Modifiers::NONE);
+        assert_eq!(h.app.tool, Tool::Note);
+        h.click(h.at(300.0, 400.0));
+        assert!(h.app.note_edit.as_ref().is_some_and(|n| n.pending.is_some()));
+        assert!(h.app.view.annot_rect.is_some(), "the editor has somewhere to go");
+        assert!(pins(&h).is_empty());
+        h.frame(vec![]);
+        h.frame(vec![Event::Text("Look here".into())]);
+        h.key(Key::Escape, Modifiers::NONE);
+        assert!(h.app.note_edit.is_none());
+        let pin = pins(&h).pop().expect("added when finished");
+        assert_eq!(pin.note, "Look here");
+        assert!(center(&h, &pin).distance(h.at(300.0, 400.0)) < 1.0, "centered on the click");
+
+        // Placing and writing it is one undo step.
+        h.key(Key::Z, Modifiers::COMMAND);
+        assert!(pins(&h).is_empty());
+        h.key(Key::Z, Modifiers::COMMAND | Modifiers::SHIFT);
+        assert_eq!(pins(&h), std::slice::from_ref(&pin));
+
+        // A pin left empty is dropped, and the click that closes its editor doesn't
+        // place another one.
+        h.click(h.at(150.0, 300.0));
+        assert!(h.app.note_edit.is_some());
+        h.click(h.at(450.0, 300.0));
+        assert!(h.app.note_edit.is_none());
+        assert_eq!(pins(&h).len(), 1);
+
+        // It's its own badge, and hovering it shows the note with any tool.
+        assert!(h.app.note_badges(0).is_empty());
+        assert_eq!(h.app.note_at(center(&h, &pin)).as_deref(), Some("Look here"));
+        assert!(h.app.annotation_entries().iter().any(|e| e.kind == EntryKind::Note && e.title == "Sticky note"));
+
+        // Select: no handles (it's only moved), and dragging moves it.
+        h.app.set_tool(Tool::Select);
+        h.click(center(&h, &pin));
+        assert_eq!(h.app.selection, Some(Selection::Ours(pin.id.clone())));
+        assert!(h.app.handles(&pin).is_empty());
+        let c = center(&h, &pin);
+        h.t += 1.0; // not a double click
+        h.drag(&[c, c + vec2(20.0, 0.0), c + vec2(40.0, 0.0)]);
+        let moved = h.doc().get(&pin.id).unwrap().clone();
+        assert!((center(&h, &moved).x - c.x - 40.0).abs() < 1.0);
+
+        // Clicking it with the tool opens its note; clearing the note deletes it.
+        h.app.set_tool(Tool::Note);
+        h.click(center(&h, &moved));
+        assert!(h.app.note_edit.as_ref().is_some_and(|n| n.pending.is_none() && n.text == "Look here"));
+        h.app.note_edit.as_mut().unwrap().text.clear();
+        h.app.commit_note();
+        assert!(pins(&h).is_empty());
+        h.key(Key::Z, Modifiers::COMMAND);
+        assert_eq!(pins(&h).len(), 1);
+
+        // On a turned page the icon is still upright on screen.
+        let ctx = h.ctx.clone();
+        h.app.rotate_pages(&ctx, true);
+        h.frame(vec![]);
+        h.click(h.at(300.0, 200.0));
+        let Some(NoteEdit { pending: Some(rotated), .. }) = &h.app.note_edit else { panic!("no pending pin") };
+        let Kind::Note { right, down, .. } = rotated.kind else { panic!() };
+        let aff = h.app.view.to_screen(&h.doc().pages[0], 0);
+        let (r, d) = (aff.apply_vec(right).normalized(), aff.apply_vec(down).normalized());
+        assert!(r.dist(Pt::new(1.0, 0.0)) < 1e-3 && d.dist(Pt::new(0.0, 1.0)) < 1e-3, "{r:?} {d:?}");
     }
 
     #[test]

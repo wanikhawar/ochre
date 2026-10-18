@@ -26,6 +26,8 @@ pub enum Tool {
     Pen,
     Highlighter,
     Text,
+    /// Sticky note: a comment pin placed anywhere on the page.
+    Note,
     Shape(ShapeKind),
     Markup(MarkupKind),
     Eraser,
@@ -41,6 +43,7 @@ impl Tool {
             Tool::Pen => Style::new([0.08, 0.08, 0.1], 2.0, 1.0),
             Tool::Highlighter => Style::new([1.0, 0.86, 0.0], 14.0, 0.4),
             Tool::Text => Style::new([0.08, 0.08, 0.1], 14.0, 1.0),
+            Tool::Note => Style::new([1.0, 0.8, 0.2], 1.0, 1.0),
             Tool::Shape(ShapeKind::Check) => Style::new([0.15, 0.62, 0.25], 2.5, 1.0),
             Tool::Shape(ShapeKind::Cross) => Style::new([0.86, 0.15, 0.15], 2.5, 1.0),
             Tool::Shape(_) => Style::new([0.86, 0.15, 0.15], 2.0, 1.0),
@@ -59,6 +62,7 @@ impl Tool {
             Tool::Pen => "Pen",
             Tool::Highlighter => "Highlighter pen",
             Tool::Text => "Text",
+            Tool::Note => "Sticky note",
             Tool::Shape(ShapeKind::Rect) => "Rectangle",
             Tool::Shape(ShapeKind::Ellipse) => "Ellipse",
             Tool::Shape(ShapeKind::Line) => "Line",
@@ -79,6 +83,7 @@ impl Tool {
             Tool::Pen => "P",
             Tool::Highlighter => "Shift+H",
             Tool::Text => "T",
+            Tool::Note => "C",
             Tool::Shape(_) => "S",
             Tool::Markup(_) => "M",
             Tool::Eraser => "E",
@@ -106,6 +111,7 @@ pub(crate) fn tool_of(a: &Annotation) -> Tool {
         Kind::Ink { highlighter: true, .. } => Tool::Highlighter,
         Kind::Ink { .. } => Tool::Pen,
         Kind::Text { .. } => Tool::Text,
+        Kind::Note { .. } => Tool::Note,
         Kind::Shape { shape, .. } => Tool::Shape(*shape),
         Kind::Markup { markup, .. } => Tool::Markup(*markup),
     }
@@ -121,7 +127,7 @@ fn width_applies(a: &Annotation, text_size: bool) -> bool {
     match a.kind {
         Kind::Text { .. } => text_size,
         Kind::Ink { .. } | Kind::Shape { .. } => !text_size,
-        Kind::Markup { .. } => false,
+        Kind::Markup { .. } | Kind::Note { .. } => false,
     }
 }
 
@@ -1624,11 +1630,14 @@ impl App {
                 // Esc leaves fullscreen once there's nothing else for it to cancel.
                 let busy = !matches!(self.gesture, Gesture::None)
                     || self.selection.is_some()
+                    || self.note_edit.is_some()
                     || self.text_sel.is_some()
                     || self.search.open;
                 if !busy {
                     self.set_fullscreen(ctx, false);
                 }
+                // Finishes a note being written (a new sticky note has nothing selected).
+                self.commit_note();
                 self.cancel_gesture();
                 self.select(None);
                 self.text_sel = None;
@@ -1697,6 +1706,7 @@ impl App {
                 (Key::V, false) => self.set_tool(Tool::Select),
                 (Key::P, false) => self.set_tool(Tool::Pen),
                 (Key::T, false) => self.set_tool(Tool::Text),
+                (Key::C, false) => self.set_tool(Tool::Note),
                 (Key::S, false) => self.set_tool(Tool::Shape(self.last_shape)),
                 (Key::M, false) => self.set_tool(Tool::Markup(self.last_markup)),
                 (Key::E, false) => self.set_tool(Tool::Eraser),

@@ -17,7 +17,7 @@ path = "src/main.rs"
 anyhow = "1.0.104"
 crossbeam-channel = "0.5.17"
 directories = "6.0.0"
-eframe = { version = "0.36", default-features = false, features = ["glow", "wayland", "x11", "default_fonts"] }
+eframe = { version = "0.37", default-features = false, features = ["glow", "wayland", "x11", "default_fonts"] }
 egui-phosphor = "0.14"
 egui_extras = { version = "0.36", default-features = false, features = ["svg"] }
 lopdf = { version = "0.45", default-features = false }

@@ -26,6 +26,12 @@ fn main() -> eframe::Result {
             .with_min_inner_size([480.0, 360.0])
             .with_drag_and_drop(true),
         multisampling: 4,
+        // With vsync, a buffer swap waits for the compositor's next frame callback.
+        // Wayland compositors send none to a window that isn't on screen, so a repaint
+        // while hidden (a page finishing rendering, a fading toast) blocked the UI thread
+        // until the window came back, and pings went unanswered: "not responding".
+        // egui only paints when asked, so this doesn't spin.
+        glow_options: eframe::egui_glow::GlowConfiguration { vsync: false, ..Default::default() },
         ..Default::default()
     };
     eframe::run_native("Ochre", options, Box::new(|cc| Ok(Box::new(app::App::new(&cc.egui_ctx, paths)))))
